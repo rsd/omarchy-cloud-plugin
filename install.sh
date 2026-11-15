@@ -22,16 +22,17 @@
 # ~/Cloud/<remote> a symlink to them. The setting is the one line
 # OMARCHY_CLOUD_ROOT=<path> in ~/.config/omarchy-cloud/cloud.env (absent:
 # /mnt/cloud). After installing, with no setting yet: a /mnt/cloud you own
-# and can write to is adopted (one line says so); else, on a terminal, you
-# are asked for the root (Enter takes /mnt/cloud) and, when it does not exist
-# or you cannot write to it, shown the one sudo command that creates it (to
-# run yourself: install.sh never runs sudo). Without a terminal, or with
-# --no-prompt, nothing is written and the instructions are printed.
-# --mount-root PATH saves PATH (an existing directory you can write to,
-# outside $HOME) without asking; it refuses while a rclone-mount@ instance is
-# enabled or active, and it moves no mount and no ~/Cloud link (links into
-# the old root are listed). An existing cloud.env is never rewritten except
-# by --mount-root, and --uninstall keeps it.
+# and can write to and search is adopted (one line says so); else, on a
+# terminal, you are asked for the root (Enter takes /mnt/cloud) and, when it
+# does not exist or you cannot write to and search it, shown the one sudo
+# command that creates it (to run yourself: install.sh never runs sudo).
+# Without a terminal, or with --no-prompt, nothing is written and the
+# instructions are printed.
+# --mount-root PATH saves PATH (an existing directory you can write to and
+# search, outside $HOME) without asking; it refuses while a rclone-mount@
+# instance is enabled or active, and it moves no mount and no ~/Cloud link
+# (links into the old root are listed). An existing cloud.env is never
+# rewritten except by --mount-root, and --uninstall keeps it.
 #
 # All paths are HOME-fixed: ~/.config, ~/.local/state, ~/.cache; the XDG_*
 # variables are not followed (the services run under the user manager, whose
@@ -98,7 +99,7 @@ FROM_SOURCE=0
 UNINSTALL=0
 FORCE=0
 NO_PROMPT=0
-MOUNT_ROOT= SET_ROOT=0
+MOUNT_ROOT='' SET_ROOT=0
 while (($#)); do
   arg=$1
   shift
@@ -193,16 +194,52 @@ sq() {
   printf "'%s'" "${1//\'/$q}"
 }
 
-# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, install.sh; tests/fixtures/roots.tsv) ---
+# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---
 # valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
 # empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
-# backquote, not $HOME nor inside it, at most 255 bytes.
+# backquote, not $HOME nor inside it (every trailing / of $HOME ignored; a
+# $HOME of only / is no home: the rule is skipped), at most 255 bytes; valid
+# UTF-8 (valid_utf8) without U+FFFD (EF BF BD, what a lossy decoder puts in
+# place of a bad byte), so a reader that decodes the path as text and one
+# that reads bytes reach the same verdict.
 valid_root() {
-  local LC_ALL=C p=$1 home=${HOME%/}
+  local LC_ALL=C p=$1 home=$HOME
+  home=${home%"${home##*[!/]}"}
   [[ $p == /?* && ${#p} -le 255 ]] || return 1
   [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
   [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
   [[ -n $home && ($p == "$home" || $p == "$home"/*) ]] && return 1
+  [[ $p == *$'\xef\xbf\xbd'* ]] && return 1
+  valid_utf8 "$p"
+}
+# valid_utf8 STRING: 0 when STRING is well-formed UTF-8, checked byte by byte
+# (C locale): no stray continuation byte, no truncated sequence, no overlong
+# form (C0, C1, E0 80-9F, F0 80-8F), no surrogate (ED A0-BF), nothing past
+# U+10FFFF (F4 90-BF, F5-FF).
+valid_utf8() {
+  local LC_ALL=C
+  local s=$1 i=0 n=${#1} b need lo hi
+  while ((i < n)); do
+    printf -v b '%d' "'${s:i:1}"
+    ((b < 0)) && b=$((b + 256))
+    i=$((i + 1))
+    if ((b < 0x80)); then continue
+    elif ((b >= 0xc2 && b <= 0xdf)); then need=1 lo=0x80 hi=0xbf
+    elif ((b == 0xe0)); then need=2 lo=0xa0 hi=0xbf
+    elif ((b == 0xed)); then need=2 lo=0x80 hi=0x9f
+    elif ((b >= 0xe1 && b <= 0xef)); then need=2 lo=0x80 hi=0xbf
+    elif ((b == 0xf0)); then need=3 lo=0x90 hi=0xbf
+    elif ((b >= 0xf1 && b <= 0xf3)); then need=3 lo=0x80 hi=0xbf
+    elif ((b == 0xf4)); then need=3 lo=0x80 hi=0x8f
+    else return 1; fi
+    while ((need > 0)); do
+      ((i < n)) || return 1
+      printf -v b '%d' "'${s:i:1}"
+      ((b < 0)) && b=$((b + 256))
+      ((b >= lo && b <= hi)) || return 1
+      need=$((need - 1)) lo=0x80 hi=0xbf i=$((i + 1))
+    done
+  done
   return 0
 }
 # --- end valid_root ---
@@ -216,8 +253,13 @@ read_root_setting() {
   local line text
   ROOT_STATE=absent ROOT_VALUE=
   [[ -e $CLOUD_ENV || -L $CLOUD_ENV ]] || return 0
-  # A regular file only: a FIFO (or a device) would block the read.
-  if [[ ! -f $CLOUD_ENV ]] || ! text=$(head -c 4096 -- "$CLOUD_ENV" 2>/dev/null); then
+  # A regular file only: a FIFO (or a device) would block the read. A NUL
+  # becomes \x01 (after the cap: same bytes): bash would drop it, and the
+  # other readers see a control character, so the value is invalid.
+  if [[ ! -f $CLOUD_ENV ]] || ! text=$(
+    set -o pipefail
+    head -c 4096 -- "$CLOUD_ENV" 2>/dev/null | tr '\0' '\1'
+  ); then
     ROOT_STATE=invalid
     return 0
   fi
@@ -231,8 +273,10 @@ read_root_setting() {
   fi
 }
 
-# usable_root <path>: an existing directory this user can write to.
-usable_root() { [[ -d $1 && -w $1 ]]; }
+# usable_root <path>: an existing directory this user can write to and
+# search (x: without it nothing inside can be reached, the mount point
+# included).
+usable_root() { [[ -d $1 && -w $1 && -x $1 ]]; }
 
 # mkroot_hint <path>: the one command that creates <path> for this user (run
 # by the user: install.sh never runs sudo).
@@ -469,11 +513,12 @@ if ((SET_ROOT)); then
   if ! valid_root "$MOUNT_ROOT"; then
     echo "$PROG: stopping, nothing was changed: --mount-root $(sq "$MOUNT_ROOT") cannot be the mount root." >&2
     echo "  It must be an absolute path outside your home ($HOME), not /, with no empty, . or .." >&2
-    echo "  component, no space, control character, \$ % \\ \" ' or backquote, at most 255 bytes." >&2
+    echo "  component, no space, control character, \$ % \\ \" ' or backquote, valid UTF-8" >&2
+    echo "  (no U+FFFD), at most 255 bytes." >&2
     exit 1
   fi
   if ! usable_root "$MOUNT_ROOT"; then
-    echo "$PROG: stopping, nothing was changed: $(sq "$MOUNT_ROOT") is not a directory you can write to;" >&2
+    echo "$PROG: stopping, nothing was changed: $(sq "$MOUNT_ROOT") is not a directory you can write to and search;" >&2
     mkroot_hint "$MOUNT_ROOT" >&2
     echo "  then run $PROG --mount-root $(sq "$MOUNT_ROOT") again" >&2
     exit 1
@@ -704,9 +749,9 @@ fi
 root_not_set_up() {
   echo "$PROG: the mount root is not set up, so no mount can start yet. Mounts go to <root>/<remote>"
   echo "(outside your home; ~/Cloud/<remote> links to them), and $(sq "$1") is not a directory you"
-  echo "own and can write to. Nothing was written."
+  echo "own and can write to and search. Nothing was written."
   mkroot_hint "$1"
-  echo "  then run $PROG again; or choose a folder outside your home you can write to:"
+  echo "  then run $PROG again; or choose a folder outside your home you can write to and search:"
   echo "    $PROG --mount-root PATH"
 }
 # ask_root: on a terminal, until a root is saved or the input ends.
@@ -723,7 +768,7 @@ ask_root() {
     [[ -n $ans ]] && proposed=$ans
     if ! valid_root "$proposed"; then
       echo "  $(sq "$proposed") cannot be the mount root: it must be an absolute path outside your home,"
-      echo "  not /, with no space, \$ % \\ \" ' or backquote and no . or .. component."
+      echo "  not /, with no space, \$ % \\ \" ' or backquote, no . or .. component, valid UTF-8."
       proposed=$DEFAULT_ROOT
       continue
     fi
@@ -733,7 +778,7 @@ ask_root() {
       echo "$PROG: mount root set to $proposed (in $CLOUD_ENV)"
       return 0
     fi
-    echo "  $(sq "$proposed") is not a directory you can write to;"
+    echo "  $(sq "$proposed") is not a directory you can write to and search;"
     mkroot_hint "$proposed"
     echo "  Run it in another terminal, then press Enter to check again, or type another path."
   done
@@ -755,7 +800,7 @@ if ((SET_ROOT)); then
   fi
 elif [[ $ROOT_STATE == valid ]]; then
   if ! usable_root "$ROOT_VALUE"; then
-    echo "$PROG: the mount root $(sq "$ROOT_VALUE") (from $CLOUD_ENV) is not a directory you can write to;"
+    echo "$PROG: the mount root $(sq "$ROOT_VALUE") (from $CLOUD_ENV) is not a directory you can write to and search;"
     mkroot_hint "$ROOT_VALUE"
   fi
 # A cloud.env without the line is not set up either (the TUI and the panel
@@ -763,7 +808,7 @@ elif [[ $ROOT_STATE == valid ]]; then
 elif [[ $ROOT_STATE == invalid || -e $CLOUD_ENV || -L $CLOUD_ENV ]]; then
   echo "$PROG: $CLOUD_ENV holds no usable OMARCHY_CLOUD_ROOT=<path> line; it was left as it is."
   echo "  Edit it, or set the root with: $PROG --mount-root PATH"
-elif valid_root "$DEFAULT_ROOT" && [[ -d $DEFAULT_ROOT && -O $DEFAULT_ROOT && -w $DEFAULT_ROOT ]]; then
+elif valid_root "$DEFAULT_ROOT" && [[ -d $DEFAULT_ROOT && -O $DEFAULT_ROOT && -w $DEFAULT_ROOT && -x $DEFAULT_ROOT ]]; then
   save_root "$DEFAULT_ROOT" || exit 1
   ROOT_WRITTEN=1
   echo "$PROG: mount root: adopted your existing $DEFAULT_ROOT (saved in $CLOUD_ENV)"

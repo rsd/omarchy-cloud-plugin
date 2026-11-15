@@ -77,16 +77,52 @@ valid_name() {
   [[ $1 =~ $NAME_RE ]]
 }
 
-# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, install.sh; tests/fixtures/roots.tsv) ---
+# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---
 # valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
 # empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
-# backquote, not $HOME nor inside it, at most 255 bytes.
+# backquote, not $HOME nor inside it (every trailing / of $HOME ignored; a
+# $HOME of only / is no home: the rule is skipped), at most 255 bytes; valid
+# UTF-8 (valid_utf8) without U+FFFD (EF BF BD, what a lossy decoder puts in
+# place of a bad byte), so a reader that decodes the path as text and one
+# that reads bytes reach the same verdict.
 valid_root() {
-  local LC_ALL=C p=$1 home=${HOME%/}
+  local LC_ALL=C p=$1 home=$HOME
+  home=${home%"${home##*[!/]}"}
   [[ $p == /?* && ${#p} -le 255 ]] || return 1
   [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
   [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
   [[ -n $home && ($p == "$home" || $p == "$home"/*) ]] && return 1
+  [[ $p == *$'\xef\xbf\xbd'* ]] && return 1
+  valid_utf8 "$p"
+}
+# valid_utf8 STRING: 0 when STRING is well-formed UTF-8, checked byte by byte
+# (C locale): no stray continuation byte, no truncated sequence, no overlong
+# form (C0, C1, E0 80-9F, F0 80-8F), no surrogate (ED A0-BF), nothing past
+# U+10FFFF (F4 90-BF, F5-FF).
+valid_utf8() {
+  local LC_ALL=C
+  local s=$1 i=0 n=${#1} b need lo hi
+  while ((i < n)); do
+    printf -v b '%d' "'${s:i:1}"
+    ((b < 0)) && b=$((b + 256))
+    i=$((i + 1))
+    if ((b < 0x80)); then continue
+    elif ((b >= 0xc2 && b <= 0xdf)); then need=1 lo=0x80 hi=0xbf
+    elif ((b == 0xe0)); then need=2 lo=0xa0 hi=0xbf
+    elif ((b == 0xed)); then need=2 lo=0x80 hi=0x9f
+    elif ((b >= 0xe1 && b <= 0xef)); then need=2 lo=0x80 hi=0xbf
+    elif ((b == 0xf0)); then need=3 lo=0x90 hi=0xbf
+    elif ((b >= 0xf1 && b <= 0xf3)); then need=3 lo=0x80 hi=0xbf
+    elif ((b == 0xf4)); then need=3 lo=0x80 hi=0x8f
+    else return 1; fi
+    while ((need > 0)); do
+      ((i < n)) || return 1
+      printf -v b '%d' "'${s:i:1}"
+      ((b < 0)) && b=$((b + 256))
+      ((b >= lo && b <= hi)) || return 1
+      need=$((need - 1)) lo=0x80 hi=0xbf i=$((i + 1))
+    done
+  done
   return 0
 }
 # --- end valid_root ---
@@ -99,11 +135,13 @@ valid_root() {
 cloud_root() {
   local line v=
   [[ -f $CLOUD_ENV && -r $CLOUD_ENV ]] || return 0
+  # A NUL becomes \x01 (after the cap: same bytes): bash would drop it, and
+  # the other readers see a control character, so the value is invalid.
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line%$'\r'}
     [[ -z $line || $line == '#'* ]] && continue
     [[ $line == OMARCHY_CLOUD_ROOT=* ]] && v=${line#OMARCHY_CLOUD_ROOT=}
-  done < <(head -c 4096 -- "$CLOUD_ENV" 2>/dev/null)
+  done < <(head -c 4096 -- "$CLOUD_ENV" 2>/dev/null | tr '\0' '\1')
   [[ -n $v ]] && valid_root "$v" && printf '%s' "$v"
   return 0
 }

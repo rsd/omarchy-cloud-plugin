@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.rsd.cloud-mounts",
-  "name": "Cloud Mounts",
+  "name": "Omarchy Cloud",
   "version": "0.3.5",
   "author": "Raul Dias",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Cloud Mounts",
+    "displayName": "Omarchy Cloud",
     "description": "Cloud icon showing whether every rclone mount is up and flagging sync conflicts; click for one row per remote (mount toggle, open folder, cache size, log), each offline folder (last sync, Sync now, conflict copies) and each backup (last and next run), and Configure… to open the omarchy-cloud TUI.",
     "category": "Files",
     "allowMultiple": false,

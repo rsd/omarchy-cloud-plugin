@@ -8,7 +8,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Cloud Mounts: the rclone-mount@<remote> systemd user mounts, the offline
+// Omarchy Cloud: the rclone-mount@<remote> systemd user mounts, the offline
 // folders (rclone-bisync@<pair>) and the backups (rclone-backup@<job>), as a
 // cloud in the bar and a panel on click.
 //
@@ -540,7 +540,7 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: "Cloud Mounts"
+            title: "Omarchy Cloud"
             meta: Model.summary(root.rows, root.polled, root.pairRows, root.jobRows)
             foreground: root.foreground
             fontFamily: root.fontFamily

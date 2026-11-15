@@ -666,9 +666,9 @@ test("rows, aggregate state, icon and tooltip", () => {
   const pairs = [{ name: "vault-A", conflictCount: 1, conflictsTruncated: false }, { name: "notes", conflictCount: 0 },
     { name: "big", conflictCount: 200, conflictsTruncated: true }, { name: "a;b", conflictCount: 3 }]
   const tip = model.tooltipText(rows, pairs, [], true, "")
-  assert.strictEqual(tip, "Cloud Mounts: 1 of 2 mounted · 1 mount failed · 204+ conflict copies\nMount failed: onedrive\n"
+  assert.strictEqual(tip, "Omarchy Cloud: 1 of 2 mounted · 1 mount failed · 204+ conflict copies\nMount failed: onedrive\n"
     + "vault-A: 1 conflict copy\nbig: 200+ conflict copies\nClick to manage")
-  assert.strictEqual(model.tooltipText([], null, null, true, ""), "Cloud Mounts: No rclone-mount units found\nClick to manage")
+  assert.strictEqual(model.tooltipText([], null, null, true, ""), "Omarchy Cloud: No rclone-mount units found\nClick to manage")
   assert.strictEqual(model.summary([], true), "No rclone-mount units found")
   assert.strictEqual(model.summary([], false), "Checking mounts…")
   // Failed offline folders and backups are named in the tooltip and counted
@@ -679,7 +679,7 @@ test("rows, aggregate state, icon and tooltip", () => {
   const ok3 = model.remoteRows(["gdrive"], units, {})
   assert.strictEqual(model.summary(ok3, true, fp, fj), "1 of 1 mounted · 2 syncs failed · 1 backup failed")
   assert.strictEqual(model.tooltipText(ok3, fp, fj, true, ""),
-    "Cloud Mounts: 1 of 1 mounted · 2 syncs failed · 1 backup failed\nSync failed: vault-A, notes\nBackup failed: archive-vaults\nClick to manage")
+    "Omarchy Cloud: 1 of 1 mounted · 2 syncs failed · 1 backup failed\nSync failed: vault-A, notes\nBackup failed: archive-vaults\nClick to manage")
   assert.strictEqual(model.summary([], true, [{ name: "p", conflictCount: 1 }], []), "No rclone-mount units found · 1 conflict copy")
   assert.strictEqual(model.summary(rows, true, [], [{ name: "a", failed: true }, { name: "b", failed: true }]),
     "1 of 2 mounted · 1 mount failed · 2 backups failed")
@@ -781,7 +781,7 @@ test("offline folders: last sync, disabled sync, Sync now, conflicts", () => {
   assert.strictEqual(model.aggregate([], [r], [], true), "error")
   assert.strictEqual(model.summary([], true, [r], []), "No rclone-mount units found · 1 sync watch stopped")
   assert.strictEqual(model.tooltipText([], [r], [], true, ""),
-    "Cloud Mounts: No rclone-mount units found · 1 sync watch stopped\nSync watch stopped: vault-A\nClick to manage")
+    "Omarchy Cloud: No rclone-mount units found · 1 sync watch stopped\nSync watch stopped: vault-A\nClick to manage")
   assert.ok(!/sync failed|Sync failed/.test(model.tooltipText([], [r], [], true, "")))
   assert.strictEqual(model.summary([], true, [r, Object.assign({}, r, { name: "notes" })], []), "No rclone-mount units found · 2 sync watches stopped")
   // No Show log for it (its note says how to restart); a failed run keeps one.
@@ -1079,16 +1079,16 @@ test("installed parts: the plugin folder, the read argv and the install argv", (
 test("installed parts: the tooltip carries the notice and the right-click hint", () => {
   const notice = "Installed parts are 0.3.2, plugin is 0.3.3 — run install.sh"
   assert.strictEqual(model.tooltipText([], null, null, true, "", notice, true),
-    "Cloud Mounts: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage · Right-click: Configure…")
+    "Omarchy Cloud: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage · Right-click: Configure…")
   assert.strictEqual(model.tooltipText([], null, null, true, "", "Installed parts are older than 0.3.3 (no version recorded) — run install.sh", false),
-    "Cloud Mounts: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage")
+    "Omarchy Cloud: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage")
   assert.strictEqual(model.tooltipText([], null, null, true, "", model.installNotice({ ok: true, plugin: "0.3.3", installedPresent: false, legacy: false, installedVersion: "" }), false),
-    "Cloud Mounts: No rclone-mount units found\nInstalled parts: not installed — open the panel\nClick to manage")
+    "Omarchy Cloud: No rclone-mount units found\nInstalled parts: not installed — open the panel\nClick to manage")
   assert.strictEqual(model.installTipLine(""), "")
   assert.strictEqual(model.installTipLine(undefined), "")
   // Without the TUI a right-click opens the panel: no hint.
-  assert.strictEqual(model.tooltipText([], null, null, true, "", "", false), "Cloud Mounts: No rclone-mount units found\nClick to manage")
-  assert.strictEqual(model.tooltipText([], null, null, true, ""), "Cloud Mounts: No rclone-mount units found\nClick to manage")
+  assert.strictEqual(model.tooltipText([], null, null, true, "", "", false), "Omarchy Cloud: No rclone-mount units found\nClick to manage")
+  assert.strictEqual(model.tooltipText([], null, null, true, ""), "Omarchy Cloud: No rclone-mount units found\nClick to manage")
   // The cursor: Update installed parts is a footer stop before Configure….
   assert.deepStrictEqual(model.cursorGroups([], { canInstall: true, canConfigure: true }).map(x => x.keys), [["install"], ["configure"]])
   assert.ok(!model.cursorGroups([], { canInstall: false }).some(x => x.keys.includes("install")))
@@ -1284,7 +1284,7 @@ test("panel: stable rows, theme tokens, capped height, dim hero, no dead tooltip
   assert.ok(/Qt\.callLater\(root\.rescan\)/.test(state))
   assert.ok(/root\.polls\+\+[\s\S]{0,300}if \(key !== root\.scanKey\) \{\s*root\.scanKey = key\s*root\.rescan\(\)/.test(state))
   assert.ok(/function holdOpen[\s\S]{0,250}root\.rescan\(\)/.test(state))
-  assert.ok(/onStreamFinished: root\.applyScan\(text, scan\.token\)/.test(state), "read against the token it was armed with")
+  assert.ok(/onStreamFinished: root\.applyScan\(text, scan\.token, scan\.seq\)/.test(state), "read against the token it was armed with")
   assert.ok(/!Object\.prototype\.hasOwnProperty\.call\(parsed, Model\.SENTINEL_UNIT\)/.test(state), "a poll without the sentinel failed")
   assert.ok(!/FileView|conflictListing/.test(state + bar), "no whole-file reads, no conflict listing")
 })
@@ -1446,19 +1446,71 @@ test("#14 the pending script says unknown, never 0, when the cache cannot be rea
 
 // ------------------------------------------------------- 0.3.5: mount root
 
+// tests/fixtures/roots.tsv, read as BYTES (some cases are not UTF-8): each
+// case's verdict, its raw bytes, and the text a Quickshell FileView/Process
+// gives for them (a non-fatal UTF-8 decode, a bad byte becoming U+FFFD).
+const rootCases = () => {
+  const raw = fs.readFileSync(path.join(pluginDir, "tests/fixtures/roots.tsv"))
+  const out = []
+  let start = 0
+  while (start < raw.length) {
+    let end = raw.indexOf(0x0a, start)
+    if (end < 0) end = raw.length
+    const line = raw.subarray(start, end)
+    start = end + 1
+    if (line.length === 0 || line[0] === 0x23) continue
+    const tab = line.indexOf(0x09)
+    assert.ok(tab > 0, JSON.stringify(line.toString("latin1")))
+    const kind = line.subarray(0, tab).toString("latin1")
+    assert.ok(kind === "valid" || kind === "invalid", kind)
+    const bytes = line.subarray(tab + 1)
+    out.push({ kind, bytes, text: new TextDecoder("utf-8").decode(bytes) })
+  }
+  return out
+}
+
+// The bytes of a scan (or, `alone`, a SETTING_SCRIPT run) whose cloud.env is
+// `content` (a Buffer), exactly as the scripts print it, decoded as the
+// panel's Process decodes its stdout.
+const settingOutput = (content, alone) => new TextDecoder("utf-8").decode(Buffer.concat([
+  Buffer.from((alone ? "" : TOKEN + " app\n") + TOKEN + " setting " + content.length + "\n"),
+  content, Buffer.from("\n" + TOKEN + " eof\n" + TOKEN + " end\n")]))
+
 test("D1 roots: every line of tests/fixtures/roots.tsv, HOME=/home/tester", () => {
-  let n = 0
-  for (const line of fs.readFileSync(path.join(pluginDir, "tests/fixtures/roots.tsv"), "utf8").split("\n")) {
-    if (line === "" || line.startsWith("#")) continue
-    const tab = line.indexOf("\t")
-    assert.ok(tab > 0, JSON.stringify(line))
-    const kind = line.slice(0, tab), root = line.slice(tab + 1)
-    assert.ok(kind === "valid" || kind === "invalid", line)
-    assert.strictEqual(model.isValidRoot(root, "/home/tester"), kind === "valid", JSON.stringify(line))
-    assert.strictEqual(model.isValidRoot(root, "/home/tester/"), kind === "valid", "trailing slash on HOME: " + JSON.stringify(line))
+  let n = 0, valid = 0, nonUtf8 = 0
+  for (const c of rootCases()) {
+    const want = c.kind === "valid"
+    const shown = JSON.stringify(c.text)
+    assert.strictEqual(model.isValidRoot(c.text, "/home/tester"), want, shown)
+    assert.strictEqual(model.isValidRoot(c.text, "/home/tester/"), want, "trailing slash on HOME: " + shown)
+    // The panel's real path: cloud.env's bytes through the scan, and through
+    // the setting re-read, to rootSetting. Nothing trimmed.
+    const env = Buffer.concat([Buffer.from("OMARCHY_CLOUD_ROOT="), c.bytes, Buffer.from("\n")])
+    const dirs = model.scanDirs("/home/tester", "/home/tester/.local/state")
+    const scan = model.parseScan(settingOutput(env, false), TOKEN, dirs)
+    assert.ok(scan.ok, shown)
+    const fromScan = model.rootSetting(scan, "/home/tester")
+    assert.strictEqual(fromScan.state, want ? "valid" : "invalid", "scan " + shown)
+    if (want) assert.strictEqual(fromScan.path, c.text, shown)
+    else assert.strictEqual(fromScan.path, model.DEFAULT_MOUNT_ROOT, shown)
+    const read = model.parseSettingRead(settingOutput(env, true), TOKEN)
+    assert.ok(read.ok, shown)
+    assert.strictEqual(read.setting.value, c.text, "verbatim " + shown)
+    const fromRead = model.rootSetting(model.withSetting(scan, read.setting), "/home/tester")
+    assert.deepStrictEqual(fromRead, fromScan, "re-read " + shown)
+    if (!Buffer.from(c.text, "utf8").equals(c.bytes)) {
+      assert.ok(!want, "a non-UTF-8 case must be invalid: " + shown)
+      nonUtf8++
+    }
+    if (want) valid++
     n++
   }
-  assert.ok(n >= 30, "fixture read: " + n)
+  assert.ok(n >= 49 && valid >= 13 && n - valid >= 36 && nonUtf8 >= 5,
+    "fixture read: " + n + " (" + valid + " valid, " + nonUtf8 + " non-UTF-8)")
+  // A lone surrogate has no UTF-8 form; U+FFFD is a bad byte, decoded.
+  for (const bad of ["/mnt/\ud800", "/mnt/a\udc00b", "/mnt/\ud800\ud800", "/mnt/\udc00\ud800", "/mnt/\ufffd", "/\ufffd"])
+    assert.strictEqual(model.isValidRoot(bad, "/home/tester"), false, JSON.stringify(bad))
+  assert.ok(model.isValidRoot("/mnt/\ud83d\ude00", "/home/tester"), "a paired surrogate (U+1F600) is fine")
   for (const v of [null, undefined, 1, {}, ["/mnt/cloud"]]) assert.strictEqual(model.isValidRoot(v, "/home/tester"), false, String(v))
   // Byte length, not characters; non-ASCII allowed; every control byte refused.
   assert.ok(model.isValidRoot("/mnt/é", "/home/tester"))
@@ -1542,11 +1594,10 @@ test("D1 the root check: the root as its own argument, never in the script", () 
   assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.ROOT_CHECK_SCRIPT, "cloud-mounts-root", "/srv/cloud"])
   assert.ok(/^if \[ -d "\$1" \] && \[ -w "\$1" \] && \[ -x "\$1" \]; then echo root-ok; else echo root-missing; fi$/.test(model.ROOT_CHECK_SCRIPT), model.ROOT_CHECK_SCRIPT)
   // Only a valid root (the home rule included) is ever checked.
-  for (const line of fs.readFileSync(path.join(pluginDir, "tests/fixtures/roots.tsv"), "utf8").split("\n")) {
-    if (line === "" || line.startsWith("#")) continue
-    const root = line.slice(line.indexOf("\t") + 1)
+  for (const c of rootCases()) {
+    const root = c.text
     const a = model.rootCheckArgv(root, "/home/tester")
-    if (line.startsWith("valid\t")) {
+    if (c.kind === "valid") {
       assert.strictEqual(a[a.length - 1], root, root)
       assert.strictEqual(a.filter(x => x.includes(root)).length, 1, "the root is one element: " + root)
       assert.ok(!model.ROOT_CHECK_SCRIPT.includes(root))
@@ -1628,7 +1679,7 @@ test("D5 the notice: not installed, mount root not set up, out of date; Set up�
   const hostile = { state: "valid", path: "/mnt/<b>x</b>", value: "/mnt/<b>x</b>" }
   assert.ok(model.isValidRoot(hostile.path, "/home/tester"))
   const tip = model.tooltipText([], null, null, true, "", model.setupNotice(vOk, "missing", hostile), false)
-  assert.strictEqual(tip, "Cloud Mounts: No rclone-mount units found\nMount root not set up — open the panel\nClick to manage")
+  assert.strictEqual(tip, "Omarchy Cloud: No rclone-mount units found\nMount root not set up — open the panel\nClick to manage")
   assert.strictEqual(model.installTipLine(model.setupNotice(vOk, "invalid", { state: "invalid", path: "/mnt/cloud", value: "<img src=x>" })),
     "Mount root not set up — open the panel")
   // The one-time command, as the user's shell reads it: "$USER" expanded
@@ -1728,9 +1779,105 @@ test("D5 the root notice clears on the next poll after Set up or the sudo comman
   const state = qmlCode("CloudState.qml")
   assert.ok(/root\.rescan\(\)\s*\} else if \(Model\.rootNeedsReread\(root\.rootStatus\)\) \{\s*root\.rereadSetting\(\)\s*\}/.test(state), "applyPoll re-reads while not set up")
   assert.ok(/function rereadSetting\(\) \{\s*if \(scan\.running \|\| settingProc\.running\) return\s*var token = Model\.scanToken\(\)\s*var argv = Model\.settingArgv\(root\.home, token\)/.test(state))
-  assert.ok(/var parsed = Model\.parseSettingRead\(text, token\)\s*if \(!parsed\.ok\) return\s*var next = Model\.withSetting\(root\.scanData, parsed\.setting\)[\s\S]{0,120}root\.recheckRoot\(\)/.test(state))
-  assert.ok(/id: settingProc[\s\S]{0,200}onStreamFinished: root\.applySetting\(text, settingProc\.token\)/.test(state))
+  assert.ok(/var parsed = Model\.parseSettingRead\(text, token\)\s*if \(!parsed\.ok\) return\s*var r = Model\.scanWithSettingRead\(root\.scanData, parsed\.setting, seq, root\.settingApplied\)[\s\S]{0,200}root\.recheckRoot\(\)/.test(state))
+  assert.ok(/id: settingProc[\s\S]{0,200}onStreamFinished: root\.applySetting\(text, settingProc\.token, settingProc\.seq\)/.test(state))
   assert.strictEqual((state.match(/root\.rereadSetting\(\)/g) || []).length, 1, "only from the poll")
+})
+
+test("D5 an older read of the setting never overwrites a newer one (scan and re-read, one counter)", () => {
+  const dirs = model.scanDirs("/home/tester", "/home/tester/.local/state")
+  const scanOf = (value, extra) => {
+    const sc = model.parseScan(settingOutput(Buffer.from("OMARCHY_CLOUD_ROOT=" + value + "\n"), false), TOKEN, dirs)
+    assert.ok(sc.ok)
+    return Object.assign(sc, extra || {})
+  }
+  const readOf = value => {
+    const r = model.parseSettingRead(settingOutput(Buffer.from("OMARCHY_CLOUD_ROOT=" + value + "\n"), true), TOKEN)
+    assert.ok(r.ok)
+    return r.setting
+  }
+  // A small model of the singleton: start() numbers a read when it starts,
+  // the answers go through the same two functions applyScan/applySetting call.
+  const panel = () => {
+    const st = { seq: 0, applied: 0, scan: model.emptyScan() }
+    st.start = () => (st.seq = model.nextSettingSeq(st.seq))
+    st.scanAnswers = (seq, parsed) => {
+      const r = model.scanWithFreshSetting(st.scan, parsed, seq, st.applied)
+      st.scan = r.scan; st.applied = r.applied
+    }
+    st.readAnswers = (seq, setting) => {
+      const r = model.scanWithSettingRead(st.scan, setting, seq, st.applied)
+      st.scan = r.scan; st.applied = r.applied
+    }
+    st.value = () => st.scan.setting.value
+    return st
+  }
+  assert.strictEqual(model.nextSettingSeq(0), 1)
+  assert.strictEqual(model.nextSettingSeq(41), 42)
+  for (const bad of [undefined, null, -3, NaN, "7"]) assert.strictEqual(model.nextSettingSeq(bad), 1, String(bad))
+
+  // Two re-reads: A starts, B starts, B answers, A answers late: A dropped.
+  let p = panel()
+  p.scanAnswers(p.start(), scanOf("/old"))
+  let a = p.start(), b = p.start()
+  p.readAnswers(b, readOf("/srv/new"))
+  p.readAnswers(a, readOf("/srv/stale"))
+  assert.strictEqual(p.value(), "/srv/new", "the later read wins")
+  assert.strictEqual(model.rootSetting(p.scan, "/home/tester").path, "/srv/new")
+  // In order, each one counts.
+  p.readAnswers(p.start(), readOf("/srv/third"))
+  assert.strictEqual(p.value(), "/srv/third")
+
+  // A re-read started, then a scan started (the scan does not wait for it);
+  // the scan answers first, the re-read late: the scan's setting stays.
+  p = panel()
+  p.scanAnswers(p.start(), scanOf("/srv/a"))
+  a = p.start()
+  b = p.start()
+  p.scanAnswers(b, scanOf("/srv/b", { more: true }))
+  p.readAnswers(a, readOf("/srv/stale"))
+  assert.strictEqual(p.value(), "/srv/b", "the newer scan's setting kept")
+  assert.strictEqual(p.scan.more, true)
+
+  // A scan older than the last applied re-read: everything else it read is
+  // taken, its setting is not.
+  p = panel()
+  p.scanAnswers(p.start(), scanOf("/srv/a"))
+  a = p.start()
+  b = p.start()
+  p.readAnswers(b, readOf("/srv/new"))
+  p.scanAnswers(a, scanOf("/srv/stale", { app: false, more: true }))
+  assert.strictEqual(p.value(), "/srv/new", "the stale scan's setting dropped")
+  assert.strictEqual(p.scan.more, true, "the rest of the stale scan taken")
+  assert.strictEqual(p.scan.app, false)
+  assert.strictEqual(p.applied, b)
+
+  // Two scans out of order: the newer one's setting stays.
+  p = panel()
+  a = p.start(); b = p.start()
+  p.scanAnswers(b, scanOf("/srv/new"))
+  p.scanAnswers(a, scanOf("/srv/stale"))
+  assert.strictEqual(p.value(), "/srv/new")
+
+  // A re-read before any good scan holds nothing and claims no number.
+  p = panel()
+  p.readAnswers(p.start(), readOf("/srv/early"))
+  assert.strictEqual(p.applied, 0)
+  assert.strictEqual(p.scan.ok, false)
+  p.scanAnswers(p.start(), scanOf("/srv/scan"))
+  assert.strictEqual(p.value(), "/srv/scan")
+
+  // The singleton: one counter, numbered at the start of each read, the
+  // number carried to the answer.
+  const state = qmlCode("CloudState.qml")
+  assert.strictEqual((state.match(/root\.settingSeq = Model\.nextSettingSeq\(root\.settingSeq\)/g) || []).length, 2, "both readers share one counter")
+  assert.ok(/root\.settingSeq = Model\.nextSettingSeq\(root\.settingSeq\)\s*scan\.seq = root\.settingSeq\s*scan\.command = argv\s*scan\.running = true/.test(state), "the scan numbered when it starts")
+  assert.ok(/root\.settingSeq = Model\.nextSettingSeq\(root\.settingSeq\)\s*settingProc\.seq = root\.settingSeq\s*settingProc\.command = argv\s*settingProc\.running = true/.test(state), "the re-read numbered when it starts")
+  assert.ok(/var r = Model\.scanWithFreshSetting\(root\.scanData, parsed, seq, root\.settingApplied\)\s*root\.settingApplied = r\.applied\s*var next = r\.scan\s*if \(JSON\.stringify\(next\) !== JSON\.stringify\(root\.scanData\)\) root\.scanData = next/.test(state))
+  assert.ok(/root\.settingApplied = r\.applied\s*var next = r\.scan\s*if \(JSON\.stringify\(next\) !== JSON\.stringify\(root\.scanData\)\) root\.scanData = next\s*root\.recheckRoot\(\)/.test(state))
+  // Nothing else writes scanData.
+  assert.strictEqual((state.match(/root\.scanData = /g) || []).length, 2)
+  assert.ok(!/Model\.withSetting\(/.test(state), "only through the guard")
 })
 
 // --------------------------------------------------- 0.3.5: bounded processes

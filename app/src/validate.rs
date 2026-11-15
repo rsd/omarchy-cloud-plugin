@@ -181,7 +181,10 @@ pub const MAX_ROOT: usize = 255;
 /// every component non-empty and not `.` or `..` (so no `//` and no trailing
 /// `/`), no ASCII whitespace or control byte (0x00-0x20, 0x7F), none of
 /// `$`, `%`, `\`, `"`, `'` or a backtick, not `home` and not inside it (component-wise), at most
-/// 255 bytes. The same rule as the helpers' and install.sh's `valid_root`
+/// 255 bytes, and no U+FFFD: a `&str` is valid UTF-8 already, and banning the
+/// replacement character makes a lossy decoder (the bar reads cloud.env as
+/// text, a bad byte arriving as U+FFFD) reach the same verdict as a strict
+/// one (envfile::parse_root rejects a non-UTF-8 value). The same rule as the helpers' and install.sh's `valid_root`
 /// and the bar's `isValidRoot`; the cases every validator is tested
 /// against: tests/fixtures/roots.tsv.
 pub fn is_valid_root(path: &str, home: &Path) -> bool {
@@ -192,6 +195,7 @@ pub fn is_valid_root(path: &str, home: &Path) -> bool {
         && !b.iter().any(|&c| {
             c <= 0x20 || c == 0x7f || matches!(c, b'$' | b'%' | b'\\' | b'"' | b'\'' | b'`')
         })
+        && !path.contains(char::REPLACEMENT_CHARACTER)
         && path[1..]
             .split('/')
             .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
@@ -200,7 +204,7 @@ pub fn is_valid_root(path: &str, home: &Path) -> bool {
 
 /// True when `path` is inside `home`. A home of "/" or "" (after trimming
 /// trailing `/`) is no home: the rule is skipped, like the helpers'
-/// `valid_root` (`home=${HOME%/}`; `[[ -n $home && ... ]]`).
+/// `valid_root` (every trailing `/` of HOME stripped; `[[ -n $home && ... ]]`).
 fn inside_home(path: &str, home: &Path) -> bool {
     let h = home.to_string_lossy();
     let h = h.trim_end_matches('/');
@@ -336,23 +340,44 @@ mod tests {
     }
 
     /// The one list of mount-root cases shared with the helpers, install.sh
-    /// and the bar, all run with HOME=/home/tester.
+    /// and the bar, all run with HOME=/home/tester. Read as BYTES (some
+    /// cases are not UTF-8): every line goes through the real cloud.env
+    /// reader, and every UTF-8 line through `is_valid_root` too.
     #[test]
     fn roots_fixture() {
-        let text = include_str!("../../tests/fixtures/roots.tsv");
+        use crate::envfile::{RootSetting, parse_root};
+        let bytes: &[u8] = include_bytes!("../../tests/fixtures/roots.tsv");
         let home = Path::new("/home/tester");
-        let (mut n, mut valid, mut invalid) = (0, 0, 0);
-        for line in text.split('\n') {
-            if line.is_empty() || line.starts_with('#') {
+        let (mut n, mut valid, mut invalid, mut non_utf8) = (0, 0, 0, 0);
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.is_empty() || line[0] == b'#' {
                 continue;
             }
-            let (want, path) = line.split_once('\t').expect("<valid|invalid><TAB><path>");
+            let tab = line.iter().position(|&b| b == b'\t');
+            let tab = tab.expect("<valid|invalid><TAB><path>");
+            let (want, path) = (&line[..tab], &line[tab + 1..]);
             let expect = match want {
-                "valid" => true,
-                "invalid" => false,
+                b"valid" => true,
+                b"invalid" => false,
                 other => panic!("bad fixture verdict {other:?}"),
             };
-            assert_eq!(is_valid_root(path, home), expect, "{want} {path:?}");
+            let shown = String::from_utf8_lossy(path);
+            match std::str::from_utf8(path) {
+                Ok(p) => assert_eq!(is_valid_root(p, home), expect, "{shown:?}"),
+                Err(_) => {
+                    assert!(!expect, "a non-UTF-8 case must be invalid: {shown:?}");
+                    non_utf8 += 1;
+                }
+            }
+            let mut env = b"OMARCHY_CLOUD_ROOT=".to_vec();
+            env.extend_from_slice(path);
+            env.push(b'\n');
+            let got = parse_root(&env, home);
+            assert_eq!(
+                matches!(got, RootSetting::Valid(_)),
+                expect,
+                "cloud.env {shown:?}: {got:?}"
+            );
             if expect {
                 valid += 1;
             } else {
@@ -361,8 +386,8 @@ mod tests {
             n += 1;
         }
         assert!(
-            n >= 35 && valid >= 10 && invalid >= 25,
-            "only {n} cases read"
+            n >= 49 && valid >= 13 && invalid >= 36 && non_utf8 >= 5,
+            "only {n} cases read ({valid} valid, {invalid} invalid, {non_utf8} non-UTF-8)"
         );
     }
 
@@ -374,6 +399,9 @@ mod tests {
             assert!(!is_valid_root(bad, home), "{bad:?}");
         }
         assert!(is_valid_root("/mnt/caf\u{e9}", home));
+        // U+FFFD is what a lossy decoder makes of a bad byte: refused.
+        assert!(!is_valid_root("/mnt/a\u{fffd}b", home));
+        assert!(!is_valid_root("/\u{fffd}", home));
         let e255 = format!("/{}", "\u{e9}".repeat(127)); // 255 bytes
         assert!(is_valid_root(&e255, home));
         let e256 = format!("/{}a", "\u{e9}".repeat(127));

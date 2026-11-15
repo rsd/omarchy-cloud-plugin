@@ -26,26 +26,34 @@ EnvironmentFile=-%h/.config/rclone-mount/%i.env
 # (~/Cloud/<remote> is a symlink to it), so tools that walk the home
 # directory do not crawl the network mount. The Environment= below is the
 # default; the setting in %h/.config/omarchy-cloud/cloud.env (one
-# OMARCHY_CLOUD_ROOT=<path> line, written by install.sh) wins. Nothing here
-# creates the root: it must already be a directory the user can write to
-# (created once, by the user, when it is a place like /mnt). Without it the
-# ExecCondition= checks skip the start (a skipped unit is neither failed nor
-# restarted) instead of retrying every RestartSec forever. Change the setting
-# only while no mount runs (install.sh --mount-root refuses otherwise):
-# ExecStop= must unmount the path ExecStart= mounted.
-# The first ExecCondition= skips a root that install.sh, the TUI and the
-# panel refuse: not absolute, "/", an empty, "." or ".." component, or the
-# home directory or inside it. The script gets the root and %h as $1 and $2
-# ($$ is a literal $ to systemd); a missing value arrives as "" and is refused.
-# The others: an existing directory the user can write to and search.
+# OMARCHY_CLOUD_ROOT=<path> line, written by install.sh) wins. Change the
+# setting only while no mount runs (install.sh --mount-root refuses
+# otherwise): ExecStop= must unmount the path ExecStart= mounted.
+# %h/.local/bin/rclone-mount guards both steps. It reads cloud.env itself,
+# as install.sh, the TUI and the panel do (raw: no quote stripping, no
+# whitespace trimming, no backslash processing), and holds the root to their
+# rule (tests/fixtures/roots.tsv): absolute, not "/", no empty, "." or ".."
+# component, no whitespace, control character, $ % \ " ' or backquote, not
+# the home directory (%h, trailing / dropped) nor inside it, at most 255
+# bytes, valid UTF-8 without U+FFFD. The root systemd read (passed as
+# ${OMARCHY_CLOUD_ROOT}, one word) must be the same one: systemd parses an
+# EnvironmentFile its own way (quotes, whitespace, backslashes, indented
+# lines; a line that is not valid UTF-8 is skipped and the default wins),
+# and a root the other readers do not see is never mounted.
+# A refused root (or remote name) FAILS the unit: ExecStart= exits 78 with
+# one line in the journal (the remote, the path, the reason, the fix), and
+# RestartPreventExitStatus=78 keeps it from restarting until the setting is
+# fixed. A valid root that is not yet an existing directory the user can
+# write to and search SKIPS the start: ExecCondition= exits 1 with one line
+# in the journal (a skipped unit is neither failed nor restarted). Nothing
+# here creates the root (created once, by the user, when it is a place like
+# /mnt): ExecStart= creates only <root>/<remote>, then execs rclone (the
+# same PID, so Type=notify works).
 Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud
 EnvironmentFile=-%h/.config/omarchy-cloud/cloud.env
-ExecCondition=/usr/bin/sh -c 'case $$1 in /?*) ;; *) exit 1 ;; esac; case $$1/ in *//* | */./* | */../*) exit 1 ;; esac; case $$1 in "$$2" | "$$2"/*) exit 1 ;; esac' _ ${OMARCHY_CLOUD_ROOT} %h
-ExecCondition=/usr/bin/test -d ${OMARCHY_CLOUD_ROOT}
-ExecCondition=/usr/bin/test -w ${OMARCHY_CLOUD_ROOT}
-ExecCondition=/usr/bin/test -x ${OMARCHY_CLOUD_ROOT}
-ExecStartPre=/usr/bin/mkdir -p ${OMARCHY_CLOUD_ROOT}/%i
-ExecStart=/usr/bin/rclone mount %i: ${OMARCHY_CLOUD_ROOT}/%i \
+ExecCondition=%h/.local/bin/rclone-mount check %i ${OMARCHY_CLOUD_ROOT} %h
+ExecStart=%h/.local/bin/rclone-mount start %i ${OMARCHY_CLOUD_ROOT} %h -- \
+    /usr/bin/rclone mount %i: ${OMARCHY_CLOUD_ROOT}/%i \
     --cache-dir %h/.cache/rclone \
     --vfs-cache-mode full \
     --vfs-read-chunk-size 8M \
@@ -54,6 +62,7 @@ ExecStart=/usr/bin/rclone mount %i: ${OMARCHY_CLOUD_ROOT}/%i \
     --buffer-size 4M
 ExecStop=/usr/bin/fusermount3 -uz ${OMARCHY_CLOUD_ROOT}/%i
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=15
 
 [Install]

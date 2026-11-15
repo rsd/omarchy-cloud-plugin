@@ -40,7 +40,10 @@ import "Model.js" as Model
 //     on a poll that starts no scan, and only while the root is not set up
 //     (Model.rootNeedsReread: absent, invalid or missing), followed by the
 //     root check; so Set up or the one-time sudo command clears the notice on
-//     the next poll. Nothing extra runs while the root is ready.
+//     the next poll. Nothing extra runs while the root is ready. A scan can
+//     start while a setting read runs, so each read of the setting (scan or
+//     setting read) is numbered when it starts and an older answer never
+//     overwrites a newer one's setting (Model.nextSettingSeq).
 //   - versions (one `sh` reading the plugin's own manifest.json version, the
 //     header of install.sh's installed-files manifest and whether the legacy
 //     installed-binary.sha256 and the plugin's install.sh exist; see
@@ -117,6 +120,10 @@ Singleton {
   property bool scanPending: false
   property bool versionsPending: false
   property bool rootPending: false
+  // The setting's reads: the number of the last one started (scan or setting
+  // read, one counter) and of the last one whose setting was applied.
+  property int settingSeq: 0
+  property int settingApplied: 0
 
   // Each bounded run gets a fresh token, read back against the token it was
   // armed with (Model.parseBounded), like the scan's.
@@ -157,15 +164,20 @@ Singleton {
     var argv = Model.settingArgv(root.home, token)
     if (argv.length === 0) return
     settingProc.token = token
+    root.settingSeq = Model.nextSettingSeq(root.settingSeq)
+    settingProc.seq = root.settingSeq
     settingProc.command = argv
     settingProc.running = true
   }
 
-  // A read cut by the timeout keeps the last setting.
-  function applySetting(text, token) {
+  // A read cut by the timeout keeps the last setting; so does one older than
+  // the last applied (Model.scanWithSettingRead).
+  function applySetting(text, token, seq) {
     var parsed = Model.parseSettingRead(text, token)
     if (!parsed.ok) return
-    var next = Model.withSetting(root.scanData, parsed.setting)
+    var r = Model.scanWithSettingRead(root.scanData, parsed.setting, seq, root.settingApplied)
+    root.settingApplied = r.applied
+    var next = r.scan
     if (JSON.stringify(next) !== JSON.stringify(root.scanData)) root.scanData = next
     root.recheckRoot()
   }
@@ -178,6 +190,8 @@ Singleton {
     var argv = Model.scanArgv(root.home, root.stateDir, token)
     if (argv.length === 0) return
     scan.token = token
+    root.settingSeq = Model.nextSettingSeq(root.settingSeq)
+    scan.seq = root.settingSeq
     scan.command = argv
     scan.running = true
   }
@@ -201,14 +215,19 @@ Singleton {
   }
 
   // The poll never names a pair's or job's units (Model.showArgv), so a scan
-  // that changes the instance list has nothing to ask systemd again.
-  function applyScan(text, token) {
+  // that changes the instance list has nothing to ask systemd again. A scan
+  // older than the last applied setting read keeps that read's setting
+  // (Model.scanWithFreshSetting).
+  function applyScan(text, token, seq) {
     var parsed = Model.parseScan(text, token, Model.scanDirs(root.home, root.stateDir))
     if (!parsed.ok) {
       root.scanError = "Could not read the offline-folder and backup files"
       return
     }
-    if (JSON.stringify(parsed) !== JSON.stringify(root.scanData)) root.scanData = parsed
+    var r = Model.scanWithFreshSetting(root.scanData, parsed, seq, root.settingApplied)
+    root.settingApplied = r.applied
+    var next = r.scan
+    if (JSON.stringify(next) !== JSON.stringify(root.scanData)) root.scanData = next
     root.scanError = ""
     root.scanned = true
     root.recheckRoot()
@@ -322,9 +341,10 @@ Singleton {
   Process {
     id: scan
     property string token: ""
+    property int seq: 0
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyScan(text, scan.token)
+      onStreamFinished: root.applyScan(text, scan.token, scan.seq)
     }
     onRunningChanged: {
       if (scan.running || !root.scanPending) return
@@ -373,9 +393,10 @@ Singleton {
   Process {
     id: settingProc
     property string token: ""
+    property int seq: 0
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applySetting(text, settingProc.token)
+      onStreamFinished: root.applySetting(text, settingProc.token, settingProc.seq)
     }
   }
 

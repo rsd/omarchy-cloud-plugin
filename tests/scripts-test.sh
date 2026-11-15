@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# The helper scripts (bin/rclone-bisync, bin/rclone-backup), hermetic:
+# The helper scripts (bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount), hermetic:
 # stand-ins for rclone, systemctl, notify-send and date come first on PATH and record their argv (one line per call, each argument through
 # printf %q; notify-send also keeps its last argv NUL-separated); HOME and the
 # XDG_* dirs point into a scratch dir (the XDG_* ones away from HOME, which the
@@ -13,8 +13,10 @@
 #   2. Conf parsing: a valid pair, an unknown key, a bad name, a conf that would
 #      run code if sourced, a missing LOCAL, INTERVAL (at least 30s, s|min|h|d),
 #      a CRLF conf; every line of tests/fixtures/names.tsv through both scripts;
-#      the shared valid_root: its marker blocks in both scripts and install.sh
-#      byte-identical, every line of tests/fixtures/roots.tsv through each;
+#      the shared valid_root: its marker blocks in the three scripts and
+#      install.sh byte-identical, every line of tests/fixtures/roots.tsv
+#      (read as raw bytes) through each, and the UTF-8 forms a TSV line does
+#      not spell out (overlong, surrogate, past U+10FFFF, truncated);
 #      HOME-fixed paths (XDG_CONFIG_HOME / XDG_STATE_HOME ignored);
 #      backup FILES with .., an absolute path, duplicate copy names, empty.
 #   3. rclone-bisync: run passes exactly the safety flags and bisync's exit
@@ -43,6 +45,15 @@
 #      failure notification is stripped of < > &.
 #   5. The generated drop-ins against the repo's templates, through the real
 #      systemd (`systemd --test`, `systemd-analyze verify`), read-only.
+#   6. rclone-mount (the mount unit's guard): every line of roots.tsv end to
+#      end (a scratch cloud.env holding it: refused = exit 78 and nothing
+#      created, valid = mounted, or skipped when the root cannot exist
+#      here); systemd's value differing from the raw file (quotes, an
+#      indented line, invalid UTF-8, past 4096 bytes); %h with a trailing /;
+#      check's skip (exit 1 and one line) for a valid root that is missing,
+#      not writable or not searchable; start never creates the root, execs
+#      the command (same PID, argv intact, the environment's HOME); every
+#      line of names.tsv as the remote; usage errors.
 
 # The checks are eval'd single-quoted strings, expanded when they run: the
 # variables they read look unused to shellcheck, and the quotes are on purpose.
@@ -54,6 +65,7 @@ set -o pipefail
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BISYNC=$PLUGIN_DIR/bin/rclone-bisync
 BACKUP=$PLUGIN_DIR/bin/rclone-backup
+MOUNT=$PLUGIN_DIR/bin/rclone-mount
 NAMES_TSV=$PLUGIN_DIR/tests/fixtures/names.tsv
 ROOTS_TSV=$PLUGIN_DIR/tests/fixtures/roots.tsv
 FAILURES=0
@@ -211,17 +223,46 @@ rc_is() { ((RC == $1)); }
 no_rclone() { [[ ! -s $FAKE_LOG/rclone ]]; }
 
 # --- 1. syntax and lint -----------------------------------------------------
-for f in "$BISYNC" "$BACKUP" "${BASH_SOURCE[0]}"; do
+for f in "$BISYNC" "$BACKUP" "$MOUNT" "${BASH_SOURCE[0]}"; do
   check "bash -n ${f#"$PLUGIN_DIR"/}" bash -n "$f"
 done
-for f in "$BISYNC" "$BACKUP"; do
+for f in "$BISYNC" "$BACKUP" "$MOUNT"; do
   check "${f#"$PLUGIN_DIR"/} is executable" test -x "$f"
 done
-SHELLCHECK=$(command -v shellcheck)
-if [[ -n $SHELLCHECK ]] && "$SHELLCHECK" --version >/dev/null 2>&1; then
-  check "shellcheck" "$SHELLCHECK" "$BISYNC" "$BACKUP" "${BASH_SOURCE[0]}"
+# find_shellcheck: SHELLCHECK_BIN, a shellcheck that runs, found the way
+# tests/run.sh finds it: $SHELLCHECK if set, else `shellcheck` on PATH, else
+# the newest mise install; a candidate counts only if --version exits 0 (a
+# mise shim with no version set is on PATH and fails). Returns 1, with what
+# was tried in SHELLCHECK_TRIED, when none works.
+find_shellcheck() {
+  local c installs=()
+  SHELLCHECK_BIN='' SHELLCHECK_TRIED=''
+  if [[ -n ${SHELLCHECK:-} ]]; then
+    "$SHELLCHECK" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$SHELLCHECK && return 0
+    SHELLCHECK_TRIED="\$SHELLCHECK=$SHELLCHECK (--version failed)"
+    return 1
+  fi
+  if c=$(command -v shellcheck); then
+    "$c" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$c && return 0
+    SHELLCHECK_TRIED="$c (--version failed); "
+  else
+    SHELLCHECK_TRIED="shellcheck not on PATH; "
+  fi
+  mapfile -t installs < <(printf '%s\n' \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck | sort -V -r)
+  for c in "${installs[@]}"; do
+    [[ -x $c ]] || continue
+    "$c" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$c && return 0
+    SHELLCHECK_TRIED+="$c (--version failed); "
+  done
+  SHELLCHECK_TRIED+="no runnable ~/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck"
+  return 1
+}
+if find_shellcheck; then
+  check "shellcheck" "$SHELLCHECK_BIN" "$BISYNC" "$BACKUP" "$MOUNT" "${BASH_SOURCE[0]}"
 else
-  echo "skip shellcheck (not installed or not runnable)"
+  echo "skip shellcheck (none runs; set SHELLCHECK to one; tried: $SHELLCHECK_TRIED)"
 fi
 
 # --- pair fixture -----------------------------------------------------------
@@ -324,7 +365,7 @@ runc "$BISYNC" frobnicate x
 check "unknown command: exit 64" rc_is 64
 
 # Every case of the shared names list (tests/fixtures/names.tsv), through both
-# scripts: teardown checks only the name (exit 0 valid, 64 invalid), validate
+# sync scripts (and, as the remote, rclone-mount: section 6): teardown checks only the name (exit 0 valid, 64 invalid), validate
 # says which (an accepted name then fails on its missing conf).
 names_n=0
 while IFS=$'\t' read -r kind name; do
@@ -344,16 +385,27 @@ while IFS=$'\t' read -r kind name; do
 done < <(grep -v '^#' "$NAMES_TSV")
 check "names.tsv: read (at least 20 cases)" eval '((names_n >= 20))'
 
+# roots_cases: the cases of tests/fixtures/roots.tsv as "<kind>\t<path>"
+# lines, the path as raw bytes (the file holds non-UTF-8 bytes, so no grep,
+# which calls it binary in a UTF-8 locale, and no IFS splitting, which would
+# trim): # lines and lines without a tab skipped.
+roots_cases() {
+  local LC_ALL=C line
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == '#'* || $line != *$'\t'* ]] && continue
+    printf '%s\n' "$line"
+  done <"$ROOTS_TSV"
+}
 # The mount-root validator: one bash function, valid_root, copied byte for
-# byte between its marker lines into both scripts and install.sh; every case
-# of tests/fixtures/roots.tsv through each copy, with HOME=/home/tester.
-VR_BEGIN='# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, install.sh; tests/fixtures/roots.tsv) ---'
+# byte between its marker lines into the three scripts and install.sh; every
+# case of tests/fixtures/roots.tsv through each copy, with HOME=/home/tester.
+VR_BEGIN='# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---'
 VR_END='# --- end valid_root ---'
 # vr_block <file>: the marker block of the file, markers included.
 vr_block() { awk -v b="$VR_BEGIN" -v e="$VR_END" '$0 == b { p = 1 } p { print } p && $0 == e { exit }' "$1"; }
 # vr <block> <path>: the block's valid_root on path (status).
 vr() { HOME=/home/tester bash -c 'eval "$1"; valid_root "$2"' vr "$1" "$2"; }
-VR_FILES=("$BISYNC" "$BACKUP" "$PLUGIN_DIR/install.sh")
+VR_FILES=("$BISYNC" "$BACKUP" "$MOUNT" "$PLUGIN_DIR/install.sh")
 VR_REF=$(vr_block "$BISYNC")
 for f in "${VR_FILES[@]}"; do
   blk=$(vr_block "$f")
@@ -362,19 +414,38 @@ for f in "${VR_FILES[@]}"; do
   check "valid_root: ${f#"$PLUGIN_DIR"/}'s block is byte-identical to bin/rclone-bisync's" eval '[[ -n $blk && $blk == "$VR_REF" ]]'
   [[ -n $blk ]] || continue
   roots_n=0 roots_bad=()
-  while IFS=$'\t' read -r kind path; do
+  while IFS= read -r line; do
+    kind=${line%%$'\t'*} path=${line#*$'\t'}
     [[ $kind == valid || $kind == invalid ]] || continue
     roots_n=$((roots_n + 1))
     if vr "$blk" "$path"; then got=valid; else got=invalid; fi
-    [[ $got == "$kind" ]] || roots_bad+=("$kind '${path:0:40}'")
-  done < <(grep -v '^#' "$ROOTS_TSV")
+    [[ $got == "$kind" ]] || roots_bad+=("$kind $(printf %q "${path:0:40}")")
+  done < <(roots_cases)
   check "roots.tsv: ${f#"$PLUGIN_DIR"/} valid_root gives every verdict ($roots_n cases${roots_bad:+; wrong: ${roots_bad[*]}})" \
     eval '((roots_n >= 30 && ${#roots_bad[@]} == 0))'
   # Cases a TSV line cannot carry: control characters, and the 255-byte limit
   # counted in bytes (é is two), non-ASCII allowed.
   e127=$(printf 'é%.0s' {1..127})
+  # A HOME with trailing slashes is the same home (all of them dropped, as in
+  # Rust and the panel); a HOME of only slashes is no home (the rule skipped).
+  check "valid_root (${f##*/}): HOME=/home/tester// still refuses /home/tester/x and /home/tester; HOME=// skips the home rule" \
+    eval '! HOME=/home/tester// bash -c '"'"'eval "$1"; valid_root "$2"'"'"' vr "$blk" /home/tester/x && ! HOME=/home/tester/// bash -c '"'"'eval "$1"; valid_root "$2"'"'"' vr "$blk" /home/tester && HOME=// bash -c '"'"'eval "$1"; valid_root "$2"'"'"' vr "$blk" /home/x'
   check "valid_root (${f##*/}): tab, newline, DEL and ESC are invalid; é is valid; 255 bytes, not characters" \
     eval '! vr "$blk" /mnt/a$'"'"'\t'"'"'b && ! vr "$blk" /mnt/a$'"'"'\n'"'"'b && ! vr "$blk" /mnt/a$'"'"'\x7f'"'"'b && ! vr "$blk" /mnt/a$'"'"'\e'"'"'b && vr "$blk" /mnt/é && vr "$blk" "/$e127" && ! vr "$blk" "/${e127}a"'
+  # Every UTF-8 boundary, by bytes: the first and last of each length are
+  # valid; overlong forms, surrogates, past U+10FFFF, a lone lead or
+  # continuation byte, a truncated sequence and U+FFFD itself are not.
+  u8_bad=()
+  for b in '\xc2\x80' '\xdf\xbf' '\xe0\xa0\x80' '\xed\x9f\xbf' '\xee\x80\x80' '\xef\xbf\xbc' '\xf0\x90\x80\x80' '\xf0\x9f\x98\x80' '\xf4\x8f\xbf\xbf'; do
+    vr "$blk" "/mnt/a$(printf %b "$b")b" || u8_bad+=("valid $b")
+  done
+  for b in '\xc0\xaf' '\xc1\xbf' '\xe0\x80\xaf' '\xe0\x9f\xbf' '\xf0\x80\x80\xaf' '\xf0\x8f\xbf\xbf' '\xed\xa0\x80' '\xed\xbf\xbf' \
+    '\xf4\x90\x80\x80' '\xf5\x80\x80\x80' '\xf8\x88\x80\x80\x80' '\xff' '\x80' '\xbf' '\xc3' '\xe2\x82' '\xf0\x9f\x98' '\xe2\x82x' '\xef\xbf\xbd' '\xef\xbf\xbe\xef\xbf\xbd'; do
+    ! vr "$blk" "/mnt/a$(printf %b "$b")b" || u8_bad+=("invalid $b")
+    ! vr "$blk" "/mnt/a$(printf %b "$b")" || u8_bad+=("invalid $b at the end")
+  done
+  check "valid_root (${f##*/}): strict UTF-8 by bytes (overlong, surrogate, past U+10FFFF, stray, truncated, U+FFFD refused)${u8_bad:+; wrong: ${u8_bad[*]}}" \
+    eval '((${#u8_bad[@]} == 0))'
 done
 
 # HOME-fixed paths: XDG_CONFIG_HOME and XDG_STATE_HOME (pointed away from
@@ -925,6 +996,14 @@ check "bisync: cloud.env, the last key line wins, \\r stripped, # lines skipped"
 local_at "$T/srv/old"
 runc "$BISYNC" validate vault-A
 check "bisync: cloud.env, an earlier key line is overridden" eval 'rc_is 0'
+# A NUL in the value: invalid, as for the readers that keep it (bash would
+# drop it and read the existing $T/srv/ab).
+fresh
+mkdir -p "$T/srv/ab" "$HOME/.config/omarchy-cloud"
+printf 'OMARCHY_CLOUD_ROOT=%s/srv/a\0b\n' "$T" >"$HOME/.config/omarchy-cloud/cloud.env"
+local_at "$T/srv"
+runc "$BISYNC" validate vault-A
+check "bisync: a cloud.env value with a NUL byte is invalid, ignored (exit 0, not \$T/srv/ab)" eval 'rc_is 0 && [[ -z $OUT ]]'
 # A root setting inside HOME is invalid (valid_root): not used as a target.
 fresh
 cloud_env "OMARCHY_CLOUD_ROOT=$HOME/mnt"
@@ -1348,6 +1427,12 @@ cloud_env "OMARCHY_CLOUD_ROOT=\$(touch $T/canary)"
 dest_at "$T/srv"
 runc "$BACKUP" validate archive-vaults
 check "backup: an invalid cloud.env is ignored and never run (exit 0, no canary)" eval 'rc_is 0 && [[ -z $OUT && ! -e $T/canary ]]'
+fresh
+mkdir -p "$T/srv/ab" "$HOME/.config/omarchy-cloud"
+printf 'OMARCHY_CLOUD_ROOT=%s/srv/a\0b\n' "$T" >"$HOME/.config/omarchy-cloud/cloud.env"
+dest_at "$T/srv"
+runc "$BACKUP" validate archive-vaults
+check "backup: a cloud.env value with a NUL byte is invalid, ignored (exit 0, not \$T/srv/ab)" eval 'rc_is 0 && [[ -z $OUT ]]'
 
 # The failure notification strips < > & from the message (it carries paths)
 # and the job name; stderr (the journal) keeps the real text.
@@ -1460,6 +1545,264 @@ check "units: rclone-mount@.service has StartLimitIntervalSec=0" \
   grep -qx 'StartLimitIntervalSec=0' "$PLUGIN_DIR/systemd/rclone-mount@.service"
 check "units: no StartLimitBurst left in any unit" eval '! grep -q "^StartLimitBurst=" "$PLUGIN_DIR"/systemd/*'
 check "units: no network-online.target (a no-op in the user manager)" eval '! grep -q "^[^#]*network-online" "$PLUGIN_DIR"/systemd/*'
+
+# --- 6. rclone-mount: the mount unit's guard ------------------------------------------
+# The unit runs `rclone-mount check %i ${OMARCHY_CLOUD_ROOT} %h` (ExecCondition)
+# and `rclone-mount start %i ${OMARCHY_CLOUD_ROOT} %h -- <rclone mount ...>`
+# (ExecStart); here the command is a stand-in that records its PID, its HOME
+# and its argv. The scratch home MH ends in /home/tester, so a roots.tsv case
+# under /home/tester keeps its meaning once that prefix is mapped to MH.
+MOUNTED=$SCRATCH/mounted
+cat >"$MOUNTED" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$$" "$HOME" "$@" >"$FAKE_LOG/mounted"
+STUB
+chmod +x "$MOUNTED"
+mfresh() {
+  fresh
+  MH=$T/m/home/tester
+  MENV=$MH/.config/omarchy-cloud/cloud.env
+  MR=$T/m/srv/cloud
+  mkdir -p "${MENV%/*}" "$MR" "$T/cwd"
+}
+menv() { printf '%s\n' "$@" >"$MENV"; } # menv <line...>: cloud.env, raw
+# mstart <remote> <systemd root> [home]: start, from a scratch cwd (a
+# relative root wrongly accepted would land there).
+mstart() {
+  rm -f "$FAKE_LOG/mounted"
+  OUT=$(cd "$T/cwd" && "$MOUNT" start "$1" "$2" "${3-$MH}" -- "$MOUNTED" mount "$1:" "$2/$1" 2>&1)
+  RC=$?
+}
+mcheck() { OUT=$(cd "$T/cwd" && "$MOUNT" check "$1" "$2" "${3-$MH}" 2>&1); RC=$?; }
+mounted() { [[ -s $FAKE_LOG/mounted ]]; }
+one_line() { [[ -n $OUT && $OUT != *$'\n'* ]]; }
+# refused [reason]: exit 78, one line naming the remote, the reason and the
+# fix, the command never run.
+refused() {
+  rc_is 78 && one_line && [[ $OUT == "rclone-mount: "*": refusing to mount: "*"${1:-}"*". Fix: "* ]] && ! mounted
+}
+NOT_VALID="is not valid: it must be an absolute path outside your home"
+DIFFERS="the unit was given the mount root"
+# map_home <path>: /home/tester... -> MH...
+map_home() { if [[ $1 == /home/tester* ]]; then printf '%s' "$MH${1#/home/tester}"; else printf '%s' "$1"; fi; }
+
+# The verdict for every line, without writing anything: systemd's value is a
+# sentinel no case holds, so a valid setting is refused as "systemd read it
+# differently" and an invalid one as "not valid".
+mfresh
+mv_n=0 mv_bad=()
+while IFS= read -r line; do
+  kind=${line%%$'\t'*} path=$(map_home "${line#*$'\t'}")
+  [[ $kind == valid || $kind == invalid ]] || continue
+  mv_n=$((mv_n + 1))
+  menv "OMARCHY_CLOUD_ROOT=$path"
+  mstart od /nonexistent/sentinel
+  if [[ $kind == valid ]]; then refused "$DIFFERS" || mv_bad+=("valid $(printf %q "${path:0:40}")")
+  else refused "$NOT_VALID" || mv_bad+=("invalid $(printf %q "${path:0:40}")"); fi
+done < <(roots_cases)
+check "roots.tsv: rclone-mount refuses every invalid setting as invalid and judges every valid one ($mv_n cases${mv_bad:+; wrong: ${mv_bad[*]}})" \
+  eval '((mv_n >= 30 && ${#mv_bad[@]} == 0))'
+
+# End to end, systemd agreeing with the file: every absolute case moved
+# under the scratch dir ($T/m<path>; /home/tester is then MH) and created
+# there, so a valid one is mounted (its <root>/od made, the command run) and
+# an invalid one refused with nothing made, even though the directory
+# exists. Skipped: a valid case that the move makes longer than 255 bytes.
+# The relative cases run as they are, from the scratch cwd.
+mfresh
+me_n=0 me_bad=()
+while IFS= read -r line; do
+  kind=${line%%$'\t'*} path=${line#*$'\t'}
+  [[ $kind == valid || $kind == invalid ]] || continue
+  if [[ $path == /* ]]; then
+    path=$T/m$path
+    if [[ $kind == valid ]] && (($(LC_ALL=C; echo "${#path}") > 255)); then continue; fi
+    mkdir -p -- "$path" 2>/dev/null
+  fi
+  me_n=$((me_n + 1))
+  menv "OMARCHY_CLOUD_ROOT=$path"
+  before=$(find "$T/m" "$T/cwd" | LC_ALL=C sort)
+  mstart od "$path"
+  if [[ $kind == valid ]]; then
+    { rc_is 0 && [[ -z $OUT && -d $path/od ]] && mounted; } || me_bad+=("valid $(printf %q "${path#"$T"}") rc=$RC")
+  else
+    { refused && [[ $(find "$T/m" "$T/cwd" | LC_ALL=C sort) == "$before" ]]; } || me_bad+=("invalid $(printf %q "${path#"$T"}") rc=$RC")
+  fi
+done < <(roots_cases)
+check "roots.tsv: rclone-mount start, end to end: valid mounted, invalid exit 78 with nothing created ($me_n cases${me_bad:+; wrong: ${me_bad[*]}})" \
+  eval '((me_n >= 30 && ${#me_bad[@]} == 0))'
+
+# A valid setting systemd reads the same: mounted, exactly the command given
+# (argv intact, through exec: the same PID), with the environment's HOME (not %h).
+mfresh
+menv "# set by install.sh" "OMARCHY_CLOUD_ROOT=$MR"
+rm -f "$FAKE_LOG/mounted"
+(cd "$T/cwd" && exec "$MOUNT" start od "$MR" "$MH" -- "$MOUNTED" mount od: "$MR/od" "a b" "") >"$T/out" 2>&1 &
+mpid=$!
+wait "$mpid"
+RC=$?
+mapfile -t ml <"$FAKE_LOG/mounted"
+check "rclone-mount start: a valid, agreeing root: exit 0, <root>/od made, the command exec'd (same PID) with its argv as given and the environment's HOME" \
+  eval 'rc_is 0 && [[ ! -s $T/out && -d $MR/od && ${ml[0]} == "$mpid" && ${ml[1]} == "$HOME" && ${#ml[@]} == 7 && ${ml[2]} == mount && ${ml[3]} == od: && ${ml[4]} == "$MR/od" && ${ml[5]} == "a b" && ${ml[6]} == "" ]]'
+mstart od "$MR"
+check "rclone-mount start: <root>/od already there: mounted again (exit 0)" eval 'rc_is 0 && mounted'
+mcheck od "$MR"
+check "rclone-mount check: a valid, agreeing, usable root: exit 0, silent" eval 'rc_is 0 && [[ -z $OUT ]]'
+# The default: no cloud.env, or no OMARCHY_CLOUD_ROOT= line, is /mnt/cloud;
+# systemd's value must be that too (only judged here: check never writes).
+rm -f "$MENV"
+mstart od "$MR"
+check "rclone-mount: no cloud.env means /mnt/cloud; another systemd value is refused, blamed on another file (od.env), not on a cloud.env parse" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"the other readers use the built-in default /mnt/cloud (there is no "*"); systemd got it from another file the unit reads (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/od.env: remove it)"* && $OUT != *"its own way"* ]]'
+menv "# only a comment" "OMARCHY_CLOUD_ROOT_X=$MR"
+mstart od "$MR"
+check "rclone-mount: a cloud.env without the line means /mnt/cloud too; either cause named" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"the other readers use the built-in default /mnt/cloud ("*"has no OMARCHY_CLOUD_ROOT= line they see); systemd got it either from that file read its own way"*"or from another file the unit reads"*"rclone-mount/od.env"* ]]'
+
+# systemd's own parse differs from the raw one: refused, never mounted at
+# the root systemd made of it.
+mfresh
+menv "OMARCHY_CLOUD_ROOT=\"$MR\""
+mstart od "$MR"
+check "rclone-mount: a quoted value (systemd strips the quotes): refused as not valid, exit 78" \
+  eval 'refused "$NOT_VALID" && [[ $OUT == *"od: refusing"* && ! -e $MR/od ]]'
+menv "  OMARCHY_CLOUD_ROOT=$MR"
+mstart od "$MR"
+check "rclone-mount: an indented line (the readers skip it, systemd takes it): refused, says systemd read it differently" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"has no OMARCHY_CLOUD_ROOT= line"* && ! -e $MR/od ]]'
+menv "OMARCHY_CLOUD_ROOT=$MR "
+mstart od "$MR"
+check "rclone-mount: trailing whitespace (systemd trims it): refused" eval 'refused "$NOT_VALID" && [[ ! -e $MR/od ]]'
+menv "OMARCHY_CLOUD_ROOT=/mnt/caf"$'\xe9'
+mstart od /mnt/cloud
+check "rclone-mount: a value that is not UTF-8 (systemd skips the line, its default wins): refused, the bytes shown escaped" \
+  eval 'refused "$NOT_VALID" && [[ $OUT == *"\$'"'"'/mnt/caf\\351'"'"'"* && $OUT != *$'"'"'\xe9'"'"'* ]]'
+menv "#$(printf 'x%.0s' {1..4100})" "OMARCHY_CLOUD_ROOT=$MR"
+mstart od "$MR"
+check "rclone-mount: a line past 4096 bytes is not read (systemd reads it): refused" eval 'refused "$DIFFERS" && [[ ! -e $MR/od ]]'
+menv "OMARCHY_CLOUD_ROOT=$T/m/old" "OMARCHY_CLOUD_ROOT=$MR"$'\r'
+mstart od "$MR"
+check "rclone-mount: the last line wins, one trailing \\r dropped" eval 'rc_is 0 && mounted'
+menv "OMARCHY_CLOUD_ROOT=$MR"
+mstart od "$MR/"
+check "rclone-mount: systemd's value differs by a trailing / only: refused, naming the line's value and both causes" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"$DIFFERS $MR/, but the OMARCHY_CLOUD_ROOT= line of "*" says $MR; systemd got it either from that file read its own way"*"or from another file the unit reads"* ]]'
+# A NUL in the value: invalid (bash would drop it and mount at the existing
+# $T/m/srv/ab, the root systemd may well pass).
+mkdir -p "$T/m/srv/ab"
+printf 'OMARCHY_CLOUD_ROOT=%s/m/srv/a\0b\n' "$T" >"$MENV"
+mstart od "$T/m/srv/ab"
+check "rclone-mount start: a cloud.env value with a NUL byte is refused as not valid (exit 78), nothing created" \
+  eval 'refused "$NOT_VALID" && [[ ! -e $T/m/srv/ab/od ]]'
+mcheck od /nonexistent/sentinel
+check "rclone-mount check: a refused root goes on (exit 0, silent), so that start fails loudly" eval 'rc_is 0 && [[ -z $OUT ]]'
+mkfifo "$T/fifo"
+ln -sf "$T/fifo" "$MENV"
+OUT=$(cd "$T/cwd" && timeout 20 "$MOUNT" start od "$MR" "$MH" -- "$MOUNTED" 2>&1)
+RC=$?
+check "rclone-mount: a FIFO cloud.env is never read (no hang): refused" eval 'refused "not a readable regular file"'
+rm -f "$MENV"
+menv "OMARCHY_CLOUD_ROOT=$MR"
+chmod 000 "$MENV"
+if [[ ! -r $MENV ]]; then
+  mstart od "$MR"
+  check "rclone-mount: an unreadable cloud.env: refused" eval 'refused "not a readable regular file"'
+else
+  echo "skip rclone-mount: unreadable cloud.env (running as root)"
+fi
+chmod 600 "$MENV"
+
+# %h with trailing /: every trailing / dropped, so a root inside the home is still
+# inside it, even as an existing, writable directory.
+mfresh
+mkdir -p "$MH/mnt"
+menv "OMARCHY_CLOUD_ROOT=$MH/mnt"
+mstart od "$MH/mnt" "$MH/"
+check "rclone-mount: %h with a trailing /: a root inside the home is refused (exit 78), nothing created" \
+  eval 'refused "$NOT_VALID" && [[ ! -e $MH/mnt/od ]]'
+menv "OMARCHY_CLOUD_ROOT=$MH"
+mstart od "$MH" "$MH/"
+check "rclone-mount: %h with a trailing /: the home itself is refused" eval 'refused "$NOT_VALID" && [[ ! -e $MH/od ]]'
+mstart od "$MH/mnt" "$MH//"
+check "rclone-mount: %h with two trailing /: every / dropped, a root inside the home is refused" \
+  eval 'refused "$NOT_VALID" && [[ ! -e $MH/mnt/od ]]'
+mstart od /nonexistent/sentinel "$MH///"
+check "rclone-mount: %h with trailing /: cloud.env still found under the home" \
+  eval 'refused "$NOT_VALID" && [[ $OUT == *"$MH/.config/omarchy-cloud/cloud.env"* && $OUT != *"$MH//"* ]]'
+mstart od "$MR" ""
+check "rclone-mount: an empty %h is refused" eval 'refused "is not an absolute path"'
+# A home of "/" (no cloud.env there: the default) skips the home rule, as
+# every reader does; judged against a sentinel, so nothing is written.
+mstart od /nonexistent/sentinel /
+check "rclone-mount: %h \"/\": the home rule is skipped, the default /mnt/cloud is judged valid" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"default /mnt/cloud"* ]]'
+mstart od /nonexistent/sentinel //
+check "rclone-mount: %h \"//\" is \"/\": the home rule is skipped, cloud.env looked for at /.config" \
+  eval 'refused "$DIFFERS" && [[ $OUT == *"default /mnt/cloud (there is no /.config/omarchy-cloud/cloud.env)"* ]]'
+
+# A valid root that is not usable yet: check skips (exit 1, one line with
+# the sudo command), start refuses to create it (exit 1, the root untouched).
+mfresh
+for how in missing read-only unsearchable; do
+  r=$T/m/srv/$how
+  case $how in
+    read-only) mkdir -p "$r" && chmod 555 "$r" ;;
+    unsearchable) mkdir -p "$r" && chmod 600 "$r" ;;
+  esac
+  menv "OMARCHY_CLOUD_ROOT=$r"
+  mcheck od "$r"
+  check "rclone-mount check: a valid root that is $how: skip (exit 1), one line naming it and the sudo command" \
+    eval 'rc_is 1 && one_line && [[ $OUT == "rclone-mount: od: not started: the mount root $r is not an existing directory you can write to and search; create it once with: sudo install -d -o \"\$USER\" -m 755 '"'"'$r'"'"'"* ]]'
+  mstart od "$r"
+  check "rclone-mount start: a valid root that is $how: exit 1, not mounted, nothing created" \
+    eval 'rc_is 1 && ! mounted && [[ ! -e $r/od ]] && { [[ $how != missing ]] || [[ ! -e $r ]]; }'
+  [[ -d $r ]] && chmod 755 "$r"
+done
+
+# <root>/<remote> cannot be made (a regular file, a dangling link in the
+# way): exit 78 (not restarted), one line, nothing run.
+mfresh
+menv "OMARCHY_CLOUD_ROOT=$MR"
+: >"$MR/od"
+mstart od "$MR"
+check "rclone-mount start: <root>/od is a regular file: exit 78, one line naming it and why, not mounted" \
+  eval 'refused "cannot create the mount point $MR/od (File exists)" && [[ $OUT == *"Fix: remove or rename what is at $MR/od"* && -f $MR/od ]]'
+rm -f "$MR/od"
+ln -s "$T/nowhere" "$MR/od"
+mstart od "$MR"
+check "rclone-mount start: <root>/od is a dangling symlink: exit 78, one line, not mounted, the link kept" \
+  eval 'refused "cannot create the mount point $MR/od" && [[ -L $MR/od && ! -e $T/nowhere ]]'
+rm -f "$MR/od"
+
+# The remote: every case of names.tsv (valid: mounted; invalid: exit 78, its
+# name shown escaped, nothing created).
+mfresh
+menv "OMARCHY_CLOUD_ROOT=$MR"
+mn_bad=() mn_n=0
+while IFS=$'\t' read -r kind name; do
+  [[ $kind == valid || $kind == invalid ]] || continue
+  mn_n=$((mn_n + 1))
+  mstart "$name" "$MR"
+  if [[ $kind == valid ]]; then
+    { rc_is 0 && mounted && [[ -d $MR/$name ]]; } || mn_bad+=("valid '$name'")
+  else
+    { refused "invalid remote name" && [[ $OUT == *"Fix: rename the remote"* ]]; } || mn_bad+=("invalid '$name'")
+  fi
+done < <(grep -v '^#' "$NAMES_TSV")
+check "names.tsv: rclone-mount mounts every valid remote name and refuses every invalid one ($mn_n${mn_bad:+; wrong: ${mn_bad[*]}})" \
+  eval '((mn_n >= 20 && ${#mn_bad[@]} == 0)) && [[ $(find "$MR" -mindepth 1 -maxdepth 1 | wc -l) -le $mn_n ]]'
+
+# Usage: check defers (exit 0), start refuses (78: no restart), an unknown
+# mode is 64.
+mfresh
+runc "$MOUNT" check od "$MR"
+check "rclone-mount check, missing an argument: exit 0 (start then refuses)" rc_is 0
+runc "$MOUNT" start od "$MR" "$MH" "$MOUNTED"
+check "rclone-mount start without --: exit 78, usage, nothing run" eval 'rc_is 78 && [[ $OUT == "usage: "* ]] && ! mounted'
+runc "$MOUNT" start od "$MR" "$MH" --
+check "rclone-mount start, no command after --: exit 78" rc_is 78
+runc "$MOUNT" frobnicate od "$MR" "$MH"
+check "rclone-mount, unknown mode: exit 64" rc_is 64
 
 echo
 if ((FAILURES)); then

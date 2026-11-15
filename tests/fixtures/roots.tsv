@@ -6,6 +6,12 @@
 # Rule: absolute; not "/"; every component non-empty and not "." or ".." (so no
 # "//", no trailing "/"); no whitespace, control character, $ % \ " ' or `;
 # not $HOME, not inside $HOME (so never ~/Cloud); at most 255 bytes.
+# Encoding: the path must be valid UTF-8 and must not contain U+FFFD (the
+# replacement character a lossy decoder puts in place of a bad byte), so a
+# byte-reading reader and a text-decoding one reach the same verdict. The
+# cases below hold raw non-UTF-8 bytes: read this file as bytes.
+# The mount unit (systemd/rclone-mount@.service, via bin/rclone-mount) holds
+# the same rule and refuses a root outside it.
 valid	/mnt/cloud
 valid	/mnt/cloud-drives
 valid	/srv/cloud
@@ -43,3 +49,15 @@ invalid	//mnt/cloud
 invalid	/mnt//cloud
 invalid	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 valid	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+valid	/mnt/cafÃ©
+invalid	/mnt/café
+invalid	/mnt/ÿ
+invalid	/mnt/aÃ
+invalid	/mnt/À¯
+invalid	/mnt/í €
+invalid	/mnt/ï¿½
+invalid	"/mnt/cloud"
+invalid	'/mnt/cloud'
+invalid	/mnt/cloud 
+invalid	 /mnt/cloud
+invalid	/mnt/cloud\

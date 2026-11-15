@@ -3,7 +3,7 @@
 // Checks the plugin folder as a whole: the manifest, the entry points, the
 // relative imports between its files, the folder name against the id, and
 // that nothing in it is a symlink. `omarchy plugin validate` covers the schema;
-// this covers what is specific to Cloud Mounts.
+// this covers what is specific to Omarchy Cloud.
 
 const fs = require("fs")
 const os = require("os")
@@ -22,7 +22,7 @@ const test = (name, fn) => tests.push([name, fn])
 test("manifest identity", () => {
   assert.strictEqual(manifest.schemaVersion, 1)
   assert.strictEqual(manifest.id, "io.github.rsd.cloud-mounts")
-  assert.strictEqual(manifest.name, "Cloud Mounts")
+  assert.strictEqual(manifest.name, "Omarchy Cloud")
   assert.strictEqual(manifest.version, "0.3.5")
   assert.strictEqual(manifest.author, "Raul Dias")
   assert.strictEqual(manifest.license, "MIT")
@@ -71,7 +71,7 @@ test("manifest declares a single bar widget on the right", () => {
   assert.deepStrictEqual(manifest.kinds, ["bar-widget"])
   assert.strictEqual(manifest.barWidget.defaultSection, "right")
   assert.strictEqual(manifest.barWidget.allowMultiple, false)
-  assert.strictEqual(manifest.barWidget.displayName, "Cloud Mounts")
+  assert.strictEqual(manifest.barWidget.displayName, "Omarchy Cloud")
   assert.strictEqual(manifest.barWidget.category, "Files")
 })
 

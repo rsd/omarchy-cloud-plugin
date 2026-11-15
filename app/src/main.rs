@@ -1,6 +1,6 @@
 //! omarchy-cloud: a keyboard-driven TUI for rclone mounts, offline folders
 //! (bisync pairs) and backups, built on the rclone-bisync / rclone-backup
-//! helpers and the systemd user templates of the Cloud Mounts plugin.
+//! helpers and the systemd user templates of the Omarchy Cloud plugin.
 
 mod app;
 mod cmd;

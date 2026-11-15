@@ -42,6 +42,10 @@
 #
 # Nothing here touches the real cache, a mount, a unit or the real config.
 
+# The single-quoted strings below carry a literal $ on purpose: crafted names,
+# a HOME and file contents that must reach the code under test unexpanded.
+# shellcheck disable=SC2016
+
 set -o pipefail
 
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -138,7 +142,11 @@ for h in "${HOMES[@]}"; do
   expect_args "grep gets the directory as one literal argument (HOME=$home)" grep \
     -rlE -e "$PATTERN" -- "$home/.cache/rclone/vfsMeta/gdrive"
   expect_args "head and wc get only constants (HOME=$home)" head -n 100000
-  [[ $out == 2 ]] && pass "the count is the pipeline's output (HOME=$home)" || fail "count output '$out' (HOME=$home)"
+  if [[ $out == 2 ]]; then
+    pass "the count is the pipeline's output (HOME=$home)"
+  else
+    fail "count output '$out' (HOME=$home)"
+  fi
   if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then fail "a command in HOME ran (HOME=$home)"; rm -f "$SCRATCH/cwd/PWNED"; fi
 done
 mkdir -p "$SCRATCH/homes/tmp/x/.cache/rclone/vfsMeta/gdrive"
@@ -152,27 +160,47 @@ expect_args "wc counts lines" wc -l
 STANDIN_LOG=$SCRATCH/log.missing
 : >"$STANDIN_LOG"
 out=$(run_argv "$SCRATCH/homes/nonexistent" gdrive)
-[[ $out == 0 && ! -e $STANDIN_LOG.grep ]] && pass "a missing directory is 0 without running grep" || fail "missing dir: out '$out'"
+if [[ $out == 0 && ! -e $STANDIN_LOG.grep ]]; then
+  pass "a missing directory is 0 without running grep"
+else
+  fail "missing dir: out '$out'"
+fi
 for status in 2 3 126 127; do
   mkdir -p "$SCRATCH/failbin"
   printf '#!/bin/bash\nprintf "partial\\n"\nexit %s\n' "$status" >"$SCRATCH/failbin/grep"
   chmod +x "$SCRATCH/failbin/grep"
   mapfile -d '' -t argv < <(pending_argv "$SCRATCH/homes/tmp/x" gdrive)
   out=$(PATH=$SCRATCH/failbin:$PATH "${argv[@]}")
-  [[ $out == unknown ]] && pass "grep exit $status reads as unknown" || fail "grep exit $status gave '$out'"
+  if [[ $out == unknown ]]; then
+    pass "grep exit $status reads as unknown"
+  else
+    fail "grep exit $status gave '$out'"
+  fi
 done
 printf '#!/bin/bash\nexit 1\n' >"$SCRATCH/failbin/grep"
 out=$(PATH=$SCRATCH/failbin:$PATH "${argv[@]}")
-[[ $out == 0 ]] && pass "grep exit 1 (no match) is 0" || fail "grep exit 1 gave '$out'"
+if [[ $out == 0 ]]; then
+  pass "grep exit 1 (no match) is 0"
+else
+  fail "grep exit 1 gave '$out'"
+fi
 
 # --- 2. crafted names build nothing ------------------------------------------
 for name in 'a;rm -rf ~' '$(x)' '-x' '../x' $'a\nb' 'ドライブ' '' '..' 'a b' '`x`'; do
   n=$(pending_argv /home/u "$name" | tr -cd '\0' | wc -c)
-  ((n == 0)) && pass "no argv for crafted name $(printf '%q' "$name")" || fail "argv built for $(printf '%q' "$name")"
+  if ((n == 0)); then
+    pass "no argv for crafted name $(printf '%q' "$name")"
+  else
+    fail "argv built for $(printf '%q' "$name")"
+  fi
 done
 for home in "" "relative" "/a/../b" $'/a\nb'; do
   n=$(pending_argv "$home" gdrive | tr -cd '\0' | wc -c)
-  ((n == 0)) && pass "no argv for refused HOME $(printf '%q' "$home")" || fail "argv built for HOME $(printf '%q' "$home")"
+  if ((n == 0)); then
+    pass "no argv for refused HOME $(printf '%q' "$home")"
+  else
+    fail "argv built for HOME $(printf '%q' "$home")"
+  fi
 done
 
 # --- 3. real grep on rclone's metadata format --------------------------------
@@ -189,13 +217,29 @@ printf '{\n\t"Size": 10\n}\n' >"$META/other/d.txt"
 printf 'Dirty: true but not json key\n' >"$META/other/e.txt"
 mapfile -d '' -t argv < <(pending_argv "$FAKE_HOME" gdrive)
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $out =~ ^[[:space:]]*3[[:space:]]*$ ]] && pass "real grep counts the 3 dirty items" || fail "real grep counted '$out', want 3"
+if [[ $out =~ ^[[:space:]]*3[[:space:]]*$ ]]; then
+  pass "real grep counts the 3 dirty items"
+else
+  fail "real grep counted '$out', want 3"
+fi
 mapfile -d '' -t argv < <(pending_argv "$FAKE_HOME" onedrive)
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $out =~ ^[[:space:]]*0[[:space:]]*$ ]] && pass "a missing metadata directory counts 0" || fail "missing dir counted '$out'"
-[[ -e $SCRATCH/cwd/PWNED ]] && fail "a command in the fixture HOME ran" || pass "nothing in the fixture HOME ran"
+if [[ $out =~ ^[[:space:]]*0[[:space:]]*$ ]]; then
+  pass "a missing metadata directory counts 0"
+else
+  fail "missing dir counted '$out'"
+fi
+if [[ -e $SCRATCH/cwd/PWNED ]]; then
+  fail "a command in the fixture HOME ran"
+else
+  pass "nothing in the fixture HOME ran"
+fi
 # Counting never changed the cache.
-[[ $(find "$META" -type f | wc -l) == 6 ]] && pass "the fixture cache is untouched" || fail "the fixture cache changed"
+if [[ $(find "$META" -type f | wc -l) == 6 ]]; then
+  pass "the fixture cache is untouched"
+else
+  fail "the fixture cache changed"
+fi
 
 # --- 4. fuser's split streams arrive merged on stdout --------------------------
 # parse_fuser <remote>: Model.parseFuser over stdin, as JSON.
@@ -231,25 +275,48 @@ printf '%21s%-9s' "" alice >&2; printf ' 4242'; printf ' ..c.. sleep\n' >&2
 EOF
 chmod +x "$FUSER_BIN/fuser"
 mapfile -d '' -t argv < <(fuser_argv lake-s3)
-[[ ${argv[0]} == timeout && ${argv[4]} == sh ]] && pass "fuser runs under timeout -k through sh" || fail "fuser argv: ${argv[*]}"
+if [[ ${argv[0]} == timeout && ${argv[4]} == sh ]]; then
+  pass "fuser runs under timeout -k through sh"
+else
+  fail "fuser argv: ${argv[*]}"
+fi
 out=$(PATH=$FUSER_BIN:$PATH "${argv[@]}" 2>/dev/null)
-[[ $out == *"cloud-mounts-fuser-exit 0" ]] && pass "stdout ends with the exit line" || fail "no exit line: $out"
+if [[ $out == *"cloud-mounts-fuser-exit 0" ]]; then
+  pass "stdout ends with the exit line"
+else
+  fail "no exit line: $out"
+fi
 got=$(parse_fuser lake-s3 <<<"$out")
-[[ $got == '{"known":true,"procs":[{"pid":4242,"user":"alice","command":"sleep"}],"total":1} confirm' ]] &&
-  pass "stdout alone parses as busy (asks before stopping)" || fail "parsed: $got"
+if [[ $got == '{"known":true,"procs":[{"pid":4242,"user":"alice","command":"sleep"}],"total":1} confirm' ]]; then
+  pass "stdout alone parses as busy (asks before stopping)"
+else
+  fail "parsed: $got"
+fi
 # The stream the widget read before the fix: stderr only, never "stop".
 err=$(PATH=$FUSER_BIN:$PATH "${argv[@]}" 2>&1 >/dev/null)
 got=$(parse_fuser lake-s3 <<<"$err")
-[[ $got != *" stop" ]] && pass "stderr alone is not read as idle" || fail "stderr parsed as idle: $got"
+if [[ $got != *" stop" ]]; then
+  pass "stderr alone is not read as idle"
+else
+  fail "stderr parsed as idle: $got"
+fi
 # A hung fuser: a short timeout stands in for the 10 s one.
 hung=("${argv[@]}")
 hung[3]=1
 start=$SECONDS
 out=$(FUSER_MODE=hang PATH=$FUSER_BIN:$PATH "${hung[@]}" 2>/dev/null)
 status=$?
-((status == 124 && SECONDS - start < 5)) && pass "a hung fuser is cut by timeout (status $status)" || fail "hung fuser: status $status after $((SECONDS - start)) s"
+if ((status == 124 && SECONDS - start < 5)); then
+  pass "a hung fuser is cut by timeout (status $status)"
+else
+  fail "hung fuser: status $status after $((SECONDS - start)) s"
+fi
 got=$(parse_fuser lake-s3 <<<"$out")
-[[ $got == '{"known":false,"procs":[],"total":0} confirm' ]] && pass "a timed-out check could not check" || fail "timed out parsed: $got"
+if [[ $got == '{"known":false,"procs":[],"total":0} confirm' ]]; then
+  pass "a timed-out check could not check"
+else
+  fail "timed out parsed: $got"
+fi
 
 # --- 5. the config and state scan, through a real sh --------------------------
 # scan_argv <home> <state dir> <token>: Model.scanArgv, NUL-separated.
@@ -306,43 +373,88 @@ printf 'time=1794686996\nexit=0\nok=4\nfailed=0\n' >"$SSTATE/rclone-backup/archi
 { printf 'time=1794699700\nexit=0\n'; for ((i = 0; i < 1200; i++)); do printf 'conflict=c%04d\n' "$i"; done; } >"$SSTATE/rclone-bisync/big.state"
 
 mapfile -d '' -t argv < <(scan_argv "$SHOME" "$SSTATE" "$TOKEN")
-[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[11]} == "$SHOME/.local/bin/omarchy-cloud" ]] &&
-  pass "the scan runs under timeout -k through sh, values positional" || fail "scan argv: ${argv[*]}"
+if [[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[11]} == "$SHOME/.local/bin/omarchy-cloud" ]]; then
+  pass "the scan runs under timeout -k through sh, values positional"
+else
+  fail "scan argv: ${argv[*]}"
+fi
 start=$SECONDS
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 status=$?
-((status == 0 && SECONDS - start < 5)) && pass "the scan finishes (a FIFO is skipped, not read)" || fail "scan status $status after $((SECONDS - start)) s"
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the scanned HOME or files ran" || pass "nothing in HOME or the files ran"
+if ((status == 0 && SECONDS - start < 5)); then
+  pass "the scan finishes (a FIFO is skipped, not read)"
+else
+  fail "scan status $status after $((SECONDS - start)) s"
+fi
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command in the scanned HOME or files ran"
+else
+  pass "nothing in HOME or the files ran"
+fi
 got=$(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")
 want='{"ok":true,"app":false,"more":false,"pairs":["linked","vault-A"],"jobs":["archive-vaults"],"local":"~/Vaults","conflicts":["Personal.kdbx.conflict1","$(touch PWNED)"],"truncated":true,"jobOk":4,"linked":"/elsewhere","templates":{"bisync":true,"backup":false}}'
-[[ $got == "$want" ]] && pass "regular files and symlinks to one read; FIFO, directory, dangling skipped; forged markers are content" || {
+if [[ $got == "$want" ]]; then
+  pass "regular files and symlinks to one read; FIFO, directory, dangling skipped; forged markers are content"
+else
   fail "scan parsed"
   echo "     want: $want"
   echo "     got:  $got"
-}
-grep -q "^$TOKEN file [0-9]* .*/big.state$" <<<"$out" && (($(grep -c '^conflict=c' <<<"$out") < 1200)) &&
-  pass "a large file is cut at the byte bound" || fail "large file not bounded"
-grep -q "fifo.conf\|dir.conf\|dangling.conf" <<<"$out" && fail "a FIFO, directory or dangling symlink was listed" || pass "no FIFO, directory or dangling symlink listed"
-grep -q "^$TOKEN file [0-9]* .*/linked.conf$" <<<"$out" && pass "a symlink to a regular conf is read" || fail "symlinked conf skipped"
-[[ $(<"$SCRATCH/systemctl.argv") == "--user list-unit-files --no-legend --plain -- rclone-bisync@.service rclone-backup@.service" ]] &&
-  pass "the templates are listed by their constant names" || fail "systemctl argv: $(<"$SCRATCH/systemctl.argv")"
-(($(grep -c "^$TOKEN end$" <<<"$out") == 1)) && grep -q "^$TOKEN unitfile $TOKEN end$" <<<"$out" &&
-  pass "a forged end line from systemctl stays behind the unitfile marker" || fail "forged systemctl line"
+fi
+if grep -q "^$TOKEN file [0-9]* .*/big.state$" <<<"$out" && (($(grep -c '^conflict=c' <<<"$out") < 1200)); then
+  pass "a large file is cut at the byte bound"
+else
+  fail "large file not bounded"
+fi
+if grep -q "fifo.conf\|dir.conf\|dangling.conf" <<<"$out"; then
+  fail "a FIFO, directory or dangling symlink was listed"
+else
+  pass "no FIFO, directory or dangling symlink listed"
+fi
+if grep -q "^$TOKEN file [0-9]* .*/linked.conf$" <<<"$out"; then
+  pass "a symlink to a regular conf is read"
+else
+  fail "symlinked conf skipped"
+fi
+if [[ $(<"$SCRATCH/systemctl.argv") == "--user list-unit-files --no-legend --plain -- rclone-bisync@.service rclone-backup@.service" ]]; then
+  pass "the templates are listed by their constant names"
+else
+  fail "systemctl argv: $(<"$SCRATCH/systemctl.argv")"
+fi
+if (($(grep -c "^$TOKEN end$" <<<"$out") == 1)) && grep -q "^$TOKEN unitfile $TOKEN end$" <<<"$out"; then
+  pass "a forged end line from systemctl stays behind the unitfile marker"
+else
+  fail "forged systemctl line"
+fi
 # The TUI binary: found only when it is an executable regular file.
 printf '#!/bin/sh\n' >"$SHOME/.local/bin/omarchy-cloud"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"app":false'* ]] && pass "a non-executable omarchy-cloud is not installed" || fail "non-executable app reported installed"
+if [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"app":false'* ]]; then
+  pass "a non-executable omarchy-cloud is not installed"
+else
+  fail "non-executable app reported installed"
+fi
 chmod +x "$SHOME/.local/bin/omarchy-cloud"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"app":true'* ]] && pass "an installed omarchy-cloud is found" || fail "installed app not found"
+if [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"app":true'* ]]; then
+  pass "an installed omarchy-cloud is found"
+else
+  fail "installed app not found"
+fi
 # More files than the bound: the rest is not read, and the scan says so.
 for ((i = 0; i < 80; i++)); do printf 'LOCAL=/x\n' >"$SHOME/.config/rclone-bisync/p$i.conf"; done
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 n=$(grep -c "^$TOKEN file " <<<"$out")
 max=$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8");console.log(new Function(s+"\nreturn SCAN_MAX_FILES")())' "$PLUGIN_DIR/Model.js")
-((n == max)) && grep -q "^$TOKEN more$" <<<"$out" && grep -q "^$TOKEN end$" <<<"$out" &&
-  pass "at most $max files read, then 'more'" || fail "file bound: $n files read (max $max)"
-[[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"more":true'* ]] && pass "the parsed scan reports 'more'" || fail "'more' not parsed"
+if ((n == max)) && grep -q "^$TOKEN more$" <<<"$out" && grep -q "^$TOKEN end$" <<<"$out"; then
+  pass "at most $max files read, then 'more'"
+else
+  fail "file bound: $n files read (max $max)"
+fi
+if [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"more":true'* ]]; then
+  pass "the parsed scan reports 'more'"
+else
+  fail "'more' not parsed"
+fi
 # The mount-root setting: parsed, never sourced (a command in it never runs),
 # the last line of the key wins, a forged marker inside it is content.
 # parse_setting <home> <state dir> <token>: Model.rootSetting of the parsed scan.
@@ -357,25 +469,41 @@ parse_setting() {
 }
 mkdir -p "$SHOME/.config/omarchy-cloud"
 SETTING=$SHOME/.config/omarchy-cloud/cloud.env
-[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]] &&
-  pass "no cloud.env: the setting is absent, the default root" || fail "absent setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+if [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]]; then
+  pass "no cloud.env: the setting is absent, the default root"
+else
+  fail "absent setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+fi
 printf '# by install.sh\r\nOMARCHY_CLOUD_ROOT=/srv/$(touch PWNED)\nOMARCHY_CLOUD_ROOT=/srv/cloud\r\ncmscan-zzzzzzzzzzzz setting 9\n' >"$SETTING"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]] &&
-  pass "cloud.env parsed: the last line wins, CRLF stripped, a forged marker is content" || fail "setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in cloud.env ran" || pass "nothing in cloud.env ran"
+if [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]]; then
+  pass "cloud.env parsed: the last line wins, CRLF stripped, a forged marker is content"
+else
+  fail "setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+fi
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command in cloud.env ran"
+else
+  pass "nothing in cloud.env ran"
+fi
 { printf 'OMARCHY_CLOUD_ROOT=/srv/first\n'; for ((i = 0; i < 200; i++)); do printf '# padding padding padding\n'; done; printf 'OMARCHY_CLOUD_ROOT=/srv/past-the-bound\n'; } >"$SETTING"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-grep -q "^$TOKEN setting $(wc -c <"$SETTING")$" <<<"$out" && ! grep -q past-the-bound <<<"$out" &&
-  [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"path":"/srv/first"'* ]] &&
-  pass "cloud.env is read up to its byte bound only" || fail "setting bound: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+if grep -q "^$TOKEN setting $(wc -c <"$SETTING")$" <<<"$out" && ! grep -q past-the-bound <<<"$out" &&
+  [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"path":"/srv/first"'* ]]; then
+  pass "cloud.env is read up to its byte bound only"
+else
+  fail "setting bound: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+fi
 rm "$SETTING"
 mkfifo "$SETTING"
 start=$SECONDS
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 status=$?
-((status == 0 && SECONDS - start < 5)) && [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"state":"absent"'* ]] &&
-  pass "a FIFO cloud.env is skipped, not read" || fail "FIFO setting: status $status"
+if ((status == 0 && SECONDS - start < 5)) && [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"state":"absent"'* ]]; then
+  pass "a FIFO cloud.env is skipped, not read"
+else
+  fail "FIFO setting: status $status"
+fi
 rm "$SETTING"
 # A read that hangs (a stand-in head) is cut by timeout; without its end line
 # the scan is refused.
@@ -388,13 +516,24 @@ cut[3]=1
 start=$SECONDS
 out=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null)
 status=$?
-((status == 124 && SECONDS - start < 5)) && pass "a hung read is cut by timeout (status $status)" || fail "hung scan: status $status after $((SECONDS - start)) s"
-[[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"ok":false'* ]] && pass "a scan without its end line is refused" || fail "a cut scan was accepted"
+if ((status == 124 && SECONDS - start < 5)); then
+  pass "a hung read is cut by timeout (status $status)"
+else
+  fail "hung scan: status $status after $((SECONDS - start)) s"
+fi
+if [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"ok":false'* ]]; then
+  pass "a scan without its end line is refused"
+else
+  fail "a cut scan was accepted"
+fi
 # A key line cut by the byte bound is kept, as bash and Rust keep it (C1).
 { printf 'OMARCHY_CLOUD_ROOT=/srv/first\n'; for ((i = 0; i < 4039; i++)); do printf '\n'; done; printf 'OMARCHY_CLOUD_ROOT=/srv/cut-here-past-the-bound\n'; } >"$SETTING"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cut","value":"/srv/cut"}' ]] &&
-  pass "a key line cut by the byte bound is kept, and wins" || fail "cut line: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+if [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cut","value":"/srv/cut"}' ]]; then
+  pass "a key line cut by the byte bound is kept, and wins"
+else
+  fail "cut line: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+fi
 rm "$SETTING"
 
 # The setting read alone (Model.SETTING_SCRIPT, on a poll while the root is
@@ -421,27 +560,48 @@ parse_setting_read() {
   ' "$PLUGIN_DIR/Model.js" "$1" "$2"
 }
 mapfile -d '' -t argv < <(setting_read_argv "$SHOME" "$TOKEN")
-[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[9]} == "$SETTING" && ${#argv[@]} == 11 ]] &&
-  pass "the setting read runs under timeout -k through sh, the path one argument" || fail "setting read argv: ${argv[*]}"
+if [[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[9]} == "$SETTING" && ${#argv[@]} == 11 ]]; then
+  pass "the setting read runs under timeout -k through sh, the path one argument"
+else
+  fail "setting read argv: ${argv[*]}"
+fi
 [[ ${argv[6]} == *"$SHOME"* ]] && fail "the home is inside the setting script"
-[[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]] &&
-  pass "setting read: no cloud.env is absent" || fail "setting read absent"
+if [[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]]; then
+  pass "setting read: no cloud.env is absent"
+else
+  fail "setting read absent"
+fi
 printf 'OMARCHY_CLOUD_ROOT=/srv/$(touch PWNED)\nOMARCHY_CLOUD_ROOT=/srv/cloud\r\ncmscan-zzzzzzzzzzzz end\n' >"$SETTING"
-[[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]] &&
-  pass "setting read: Set up's file is read on the next poll, a forged end line is content" || fail "setting read valid"
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the setting read ran" || pass "nothing in the setting read ran"
+if [[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]]; then
+  pass "setting read: Set up's file is read on the next poll, a forged end line is content"
+else
+  fail "setting read valid"
+fi
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command in the setting read ran"
+else
+  pass "nothing in the setting read ran"
+fi
 rm "$SETTING"
 mkfifo "$SETTING"
 start=$SECONDS
 got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN")
-((SECONDS - start < 5)) && [[ $got == *'"state":"absent"'* ]] && pass "setting read: a FIFO is skipped, not read" || fail "setting read FIFO: $got"
+if ((SECONDS - start < 5)) && [[ $got == *'"state":"absent"'* ]]; then
+  pass "setting read: a FIFO is skipped, not read"
+else
+  fail "setting read FIFO: $got"
+fi
 rm "$SETTING"
 printf 'OMARCHY_CLOUD_ROOT=/srv/cloud\n' >"$SETTING"
 cut=("${argv[@]}")
 cut[3]=1
 start=$SECONDS
 got=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null | parse_setting_read "$SHOME" "$TOKEN")
-((SECONDS - start < 5)) && [[ $got == refused ]] && pass "setting read: a hung read is cut by timeout and refused" || fail "hung setting read: $got after $((SECONDS - start)) s"
+if ((SECONDS - start < 5)) && [[ $got == refused ]]; then
+  pass "setting read: a hung read is cut by timeout and refused"
+else
+  fail "hung setting read: $got after $((SECONDS - start)) s"
+fi
 rm "$SETTING"
 
 # --- 6. the installed-parts read and the install terminal script -------------
@@ -481,19 +641,28 @@ printf '{\n  "id": "x",\n  "version": "0.3.4"\n}\n' >"$VPLUG/manifest.json"
 printf '#version=0.3.2\n#repo=/src/x\n%064d  /home/u/.local/bin/x\n' 0 >"$SCRATCH/installed-target"
 ln -s "$SCRATCH/installed-target" "$VSTATE/omarchy-cloud/installed-files"
 mapfile -d '' -t argv < <(versions_argv "$VPLUG" "$VSTATE" "$TOKEN")
-[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[11]} == "$VPLUG/manifest.json" &&
-  ${argv[12]} == "$VSTATE/omarchy-cloud/installed-files" && ${argv[14]} == "$VPLUG/install.sh" ]] &&
-  pass "the versions read runs under timeout -k through sh, paths positional" || fail "versions argv: ${argv[*]}"
+if [[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[11]} == "$VPLUG/manifest.json" &&
+  ${argv[12]} == "$VSTATE/omarchy-cloud/installed-files" && ${argv[14]} == "$VPLUG/install.sh" ]]; then
+  pass "the versions read runs under timeout -k through sh, paths positional"
+else
+  fail "versions argv: ${argv[*]}"
+fi
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 status=$?
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the plugin or state path ran" || pass "nothing in the plugin or state path ran"
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command in the plugin or state path ran"
+else
+  pass "nothing in the plugin or state path ran"
+fi
 got=$(parse_versions "$TOKEN" <<<"$out")
 want='{"ok":true,"plugin":"0.3.4","installedPresent":true,"installedVersion":"0.3.2","installedRepo":"/src/x","legacy":false,"installer":false,"state":"mismatch"}'
-((status == 0)) && [[ $got == "$want" ]] && pass "manifest.json and the header read through a symlink: mismatch" || {
+if ((status == 0)) && [[ $got == "$want" ]]; then
+  pass "manifest.json and the header read through a symlink: mismatch"
+else
   fail "versions parsed (status $status)"
   echo "     want: $want"
   echo "     got:  $got"
-}
+fi
 printf 'x\n' >"$VSTATE/omarchy-cloud/installed-binary.sha256"
 printf '#!/bin/sh\n' >"$VPLUG/install.sh"
 rm "$VSTATE/omarchy-cloud/installed-files"
@@ -502,35 +671,65 @@ start=$SECONDS
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 status=$?
 got=$(parse_versions "$TOKEN" <<<"$out")
-((status == 0 && SECONDS - start < 5)) && [[ $got == *'"installedPresent":false,'*'"legacy":true,"installer":true,"state":"unknown"}' ]] &&
-  pass "a FIFO manifest is skipped; the legacy record and install.sh are found: unknown" || fail "FIFO / legacy: status $status, $got"
+if ((status == 0 && SECONDS - start < 5)) && [[ $got == *'"installedPresent":false,'*'"legacy":true,"installer":true,"state":"unknown"}' ]]; then
+  pass "a FIFO manifest is skipped; the legacy record and install.sh are found: unknown"
+else
+  fail "FIFO / legacy: status $status, $got"
+fi
 rm "$VSTATE/omarchy-cloud/installed-files" "$VSTATE/omarchy-cloud/installed-binary.sha256"
 out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
-[[ $(parse_versions "$TOKEN" <<<"$out") == *'"state":"none"}' ]] && pass "nothing installed: none" || fail "none: $(parse_versions "$TOKEN" <<<"$out")"
+if [[ $(parse_versions "$TOKEN" <<<"$out") == *'"state":"none"}' ]]; then
+  pass "nothing installed: none"
+else
+  fail "none: $(parse_versions "$TOKEN" <<<"$out")"
+fi
 cut=("${argv[@]}")
 cut[3]=1
 start=$SECONDS
 out=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null)
 status=$?
-((status == 124 && SECONDS - start < 5)) && [[ $(parse_versions "$TOKEN" <<<"$out") == *'"ok":false'* ]] &&
-  pass "a hung versions read is cut by timeout and refused" || fail "hung versions read: status $status after $((SECONDS - start)) s"
+if ((status == 124 && SECONDS - start < 5)) && [[ $(parse_versions "$TOKEN" <<<"$out") == *'"ok":false'* ]]; then
+  pass "a hung versions read is cut by timeout and refused"
+else
+  fail "hung versions read: status $status after $((SECONDS - start)) s"
+fi
 # The install terminal's script, run as the terminal would run it (the argv
 # after omarchy-launch-tui --app-id=TUI.float), Enter on stdin.
 printf 'echo "stand-in install.sh ran with $# args"\nexit "${CM_EXIT:-0}"\n' >"$VPLUG/install.sh"
 mapfile -d '' -t argv < <(install_argv "$VPLUG")
-[[ ${argv[0]} == omarchy-launch-tui && ${argv[1]} == --app-id=TUI.float && ${argv[2]} == bash && ${argv[3]} == -c && ${argv[6]} == "$VPLUG/install.sh" && ${#argv[@]} == 7 ]] &&
-  pass "install argv: the floating terminal, a fixed script, install.sh as its own argument" || fail "install argv: ${argv[*]}"
+if [[ ${argv[0]} == omarchy-launch-tui && ${argv[1]} == --app-id=TUI.float && ${argv[2]} == bash && ${argv[3]} == -c && ${argv[6]} == "$VPLUG/install.sh" && ${#argv[@]} == 7 ]]; then
+  pass "install argv: the floating terminal, a fixed script, install.sh as its own argument"
+else
+  fail "install argv: ${argv[*]}"
+fi
 out=$(cd "$SCRATCH/cwd" && printf '\n' | "${argv[@]:2}")
 status=$?
-((status == 0)) && grep -q '^stand-in install.sh ran with 0 args$' <<<"$out" && grep -q 'finished (exit status 0)' <<<"$out" && grep -q 'Press Enter to close' <<<"$out" &&
-  pass "install.sh runs from \"\$1\", its exit status is shown, then Enter closes" || fail "install script: status $status, $out"
+if ((status == 0)) && grep -q '^stand-in install.sh ran with 0 args$' <<<"$out" && grep -q 'finished (exit status 0)' <<<"$out" && grep -q 'Press Enter to close' <<<"$out"; then
+  pass "install.sh runs from \"\$1\", its exit status is shown, then Enter closes"
+else
+  fail "install script: status $status, $out"
+fi
 out=$(cd "$SCRATCH/cwd" && printf '\n' | CM_EXIT=3 "${argv[@]:2}")
-grep -q 'failed (exit status 3)' <<<"$out" && pass "a failed install.sh shows its exit status" || fail "failed install: $out"
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the plugin path ran" || pass "nothing in the plugin path ran"
+if grep -q 'failed (exit status 3)' <<<"$out"; then
+  pass "a failed install.sh shows its exit status"
+else
+  fail "failed install: $out"
+fi
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command in the plugin path ran"
+else
+  pass "nothing in the plugin path ran"
+fi
 # Without Enter the terminal stays: the script is still waiting.
+# WAITER is the coproc's name; only the WAITER_PID it sets is read.
+# shellcheck disable=SC2034
 coproc WAITER { cd "$SCRATCH/cwd" && "${argv[@]:2}"; }
 sleep 1
-kill -0 "$WAITER_PID" 2>/dev/null && pass "the script waits for Enter after install.sh exits" || fail "the script did not wait"
+if kill -0 "$WAITER_PID" 2>/dev/null; then
+  pass "the script waits for Enter after install.sh exits"
+else
+  fail "the script did not wait"
+fi
 kill "$WAITER_PID" 2>/dev/null
 wait "$WAITER_PID" 2>/dev/null
 
@@ -570,11 +769,23 @@ for r in "$SCRATCH/roots/a;id>PWNED" "$SCRATCH/roots/(id)>PWNED|x&y" "$SCRATCH/r
   got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | model_eval 'm.parseRootCheck(s)')
   want=missing
   [[ $r == */ok ]] && want=ok
-  [[ $got == "$want" ]] && pass "root check: $want for $(basename -- "$r")" || fail "root check for $r: $got"
+  if [[ $got == "$want" ]]; then
+    pass "root check: $want for $(basename -- "$r")"
+  else
+    fail "root check for $r: $got"
+  fi
 done
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED || -n $(find "$SCRATCH/roots" -name PWNED) ]] && fail "a command in a root ran" || pass "nothing in a root ran"
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED || -n $(find "$SCRATCH/roots" -name PWNED) ]]; then
+  fail "a command in a root ran"
+else
+  pass "nothing in a root ran"
+fi
 mapfile -d '' -t argv < <(model_argv 'm.rootCheckArgv(a, b)' "$RHOME/inside" "$RHOME")
-((${#argv[@]} == 0)) && pass "a root inside HOME is never checked" || fail "root inside HOME: ${argv[*]}"
+if ((${#argv[@]} == 0)); then
+  pass "a root inside HOME is never checked"
+else
+  fail "root inside HOME: ${argv[*]}"
+fi
 # BOUNDED_SCRIPT around a stand-in journalctl: argv intact, a forged end line
 # (another token's, and this run's own mid-stream) is content, output capped.
 BBIN=$SCRATCH/boundbin
@@ -590,28 +801,45 @@ EOF2
 chmod +x "$BBIN/journalctl"
 mapfile -d '' -t argv < <(model_argv 'm.logArgv(a, b)' "rclone-mount@gdrive.service" "$TOKEN")
 mapfile -d '' -t want < <(model_argv 'm.journalArgv(a)' "rclone-mount@gdrive.service")
-[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && "${argv[*]:10}" == "${want[*]}" ]] &&
-  pass "the journal runs under timeout -k through the bounded script" || fail "log argv: ${argv[*]}"
+if [[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && "${argv[*]:10}" == "${want[*]}" ]]; then
+  pass "the journal runs under timeout -k through the bounded script"
+else
+  fail "log argv: ${argv[*]}"
+fi
 # The output goes to a file: $(...) would drop the end line's newline.
 BOUT=$SCRATCH/bounded.out
 (cd "$SCRATCH/cwd" && PATH=$BBIN:$PATH "${argv[@]}") >"$BOUT"
-[[ $(<"$SCRATCH/journalctl.argv") == "$(printf '%s\n' "${want[@]:1}")" ]] && pass "journalctl gets its argv intact" || fail "journalctl argv: $(<"$SCRATCH/journalctl.argv")"
+if [[ $(<"$SCRATCH/journalctl.argv") == "$(printf '%s\n' "${want[@]:1}")" ]]; then
+  pass "journalctl gets its argv intact"
+else
+  fail "journalctl argv: $(<"$SCRATCH/journalctl.argv")"
+fi
 got=$(model_eval 'm.logView(s, a)' "$TOKEN" <"$BOUT")
-[[ $got == $'line one\ncmscan-zzzzzzzzzzzz end' ]] && pass "a finished journal is shown; another token's end line is content" || fail "log view: $got"
+if [[ $got == $'line one\ncmscan-zzzzzzzzzzzz end' ]]; then
+  pass "a finished journal is shown; another token's end line is content"
+else
+  fail "log view: $got"
+fi
 start=$SECONDS
 (cd "$SCRATCH/cwd" && CM_FLOOD=1 PATH=$BBIN:$PATH "${argv[@]}") >"$BOUT"
 cap=$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8");console.log(new Function(s+"\nreturn LOG_READ_MAX_BYTES")())' "$PLUGIN_DIR/Model.js")
 n=$(($(wc -c <"$BOUT") - ${#TOKEN} - 6))
-((SECONDS - start < 5 && n == cap)) && [[ $(model_eval 'm.parseBounded(s, a, '"$cap"').ok' "$TOKEN" <"$BOUT") == true ]] &&
-  pass "a flooding journal is cut at $cap bytes at the source" || fail "flood: $n bytes (cap $cap) after $((SECONDS - start)) s"
+if ((SECONDS - start < 5 && n == cap)) && [[ $(model_eval 'm.parseBounded(s, a, '"$cap"').ok' "$TOKEN" <"$BOUT") == true ]]; then
+  pass "a flooding journal is cut at $cap bytes at the source"
+else
+  fail "flood: $n bytes (cap $cap) after $((SECONDS - start)) s"
+fi
 cut=("${argv[@]}")
 cut[3]=1
 start=$SECONDS
 (cd "$SCRATCH/cwd" && CM_HANG=1 PATH=$BBIN:$PATH "${cut[@]}") >"$BOUT"
 status=$?
 got=$(model_eval 'm.logView(s, a)' "$TOKEN" <"$BOUT")
-((status == 124 && SECONDS - start < 5)) && [[ $got == "Log timed out" ]] &&
-  pass "a hung journalctl is cut by timeout: Log timed out" || fail "hung journal: status $status, $got"
+if ((status == 124 && SECONDS - start < 5)) && [[ $got == "Log timed out" ]]; then
+  pass "a hung journalctl is cut by timeout: Log timed out"
+else
+  fail "hung journal: status $status, $got"
+fi
 # The poll the same way: a hung systemctl leaves no answer to apply.
 cat >"$BBIN/systemctl" <<EOF2
 #!/bin/sh
@@ -625,9 +853,16 @@ cut[3]=1
 start=$SECONDS
 (cd "$SCRATCH/cwd" && PATH=$BBIN:$PATH "${cut[@]}") >"$BOUT"
 status=$?
-((status == 124 && SECONDS - start < 5)) && [[ $(model_eval 'm.parseBounded(s, a, 262144).ok' "$TOKEN" <"$BOUT") == false ]] &&
-  pass "a hung systemctl show is cut by timeout and its answer refused" || fail "hung poll: status $status"
-[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command ran" || pass "nothing ran"
+if ((status == 124 && SECONDS - start < 5)) && [[ $(model_eval 'm.parseBounded(s, a, 262144).ok' "$TOKEN" <"$BOUT") == false ]]; then
+  pass "a hung systemctl show is cut by timeout and its answer refused"
+else
+  fail "hung poll: status $status"
+fi
+if [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]]; then
+  fail "a command ran"
+else
+  pass "nothing ran"
+fi
 
 if ((FAILURES)); then
   echo "FAILED $FAILURES shell-string tests"

@@ -1,4 +1,4 @@
-// Pure model for the Cloud Mounts bar widget: every parse, validation, argv,
+// Pure model for the Omarchy Cloud bar widget: every parse, validation, argv,
 // state aggregation and formatted string the QML shows comes out of a function
 // here, so tests/model-test.js can cover it under node without a running shell.
 //
@@ -334,16 +334,38 @@ function utf8Bytes(s) {
   return n
 }
 
+// True when `s` is well-formed UTF-16 (every surrogate paired, so it has a
+// UTF-8 form) and holds no U+FFFD, the replacement character a lossy decoder
+// puts in place of a byte that is not UTF-8.
+function isWellFormedText(s) {
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i)
+    if (c === 0xfffd) return false
+    if (c >= 0xdc00 && c <= 0xdfff) return false
+    if (c >= 0xd800 && c <= 0xdbff) {
+      var d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0
+      if (d < 0xdc00 || d > 0xdfff) return false
+      i++
+    }
+  }
+  return true
+}
+
 // A usable mount root (the one rule of tests/fixtures/roots.tsv, shared with
 // the TUI's validate::is_valid_root and the scripts' valid_root): absolute;
 // not "/"; no empty, "." or ".." component (so no "//" and no trailing "/");
 // none of the bytes 0x00-0x20 and 0x7f, nor $ % \ " ' or a backquote (ASCII
 // only: "é" is allowed); not `home` nor inside it, component-wise (a root
 // inside $HOME would be crawled by everything that walks the home
-// directory); at most ROOT_MAX_BYTES UTF-8 bytes. `home` may be "" (then only
+// directory); at most ROOT_MAX_BYTES UTF-8 bytes; well-formed (no lone
+// surrogate) and without U+FFFD. The panel reads cloud.env as decoded text,
+// where a byte that is not UTF-8 arrives as U+FFFD; the TUI and the scripts
+// read bytes and refuse a value that is not UTF-8 or holds U+FFFD, so every
+// reader reaches the same verdict. `home` may be "" (then only
 // the home rule is skipped), as the scripts skip it without a $HOME.
 function isValidRoot(path, home) {
   if (typeof path !== "string" || path.length < 2 || path.charAt(0) !== "/") return false
+  if (!isWellFormedText(path)) return false
   if (utf8Bytes(path) > ROOT_MAX_BYTES) return false
   if (/[\u0000-\u0020\u007f$%\\"'`]/.test(path)) return false
   var parts = path.split("/")
@@ -772,6 +794,36 @@ function withSetting(scan, setting) {
   for (var k in scan) if (Object.prototype.hasOwnProperty.call(scan, k)) out[k] = scan[k]
   out.setting = { found: setting.found === true, value: String(setting.value === undefined || setting.value === null ? "" : setting.value) }
   return out
+}
+
+// The setting reaches the singleton's scan from two readers, the scan and
+// the setting re-read, and an earlier read can finish after a later one. So
+// every read takes a number when it STARTS (nextSettingSeq, one counter for
+// both readers), and an answer's setting counts only when its number is
+// newer than the last one applied: an older answer never overwrites a newer
+// one. nextSettingSeq(last) is the number after `last` (0 or nothing: 1).
+function nextSettingSeq(last) {
+  var n = typeof last === "number" && isFinite(last) && last > 0 ? Math.floor(last) : 0
+  return n + 1
+}
+
+// A good scan `parsed` started as read `seq`, against the current scan and
+// the last applied number: { scan, applied }. A newer read is taken whole;
+// an older one keeps everything it read except the setting, which stays the
+// current one (the newer read's).
+function scanWithFreshSetting(current, parsed, seq, applied) {
+  if (seq > applied) return { scan: parsed, applied: seq }
+  var kept = current && typeof current === "object" && current.setting ? current.setting : { found: false, value: "" }
+  return { scan: withSetting(parsed, kept), applied: applied }
+}
+
+// A good setting re-read `setting` started as read `seq`: { scan, applied },
+// the current scan with that setting when the read is newer than the last
+// applied one and there is a good scan to hold it; the current scan as it
+// is otherwise.
+function scanWithSettingRead(current, setting, seq, applied) {
+  if (seq <= applied || !current || current.ok !== true) return { scan: current, applied: applied }
+  return { scan: withSetting(current, setting), applied: seq }
 }
 
 // What Omarchy's own "File manager (cwd)" binding runs (omarchy-launch-nautilus-cwd),
@@ -1405,7 +1457,7 @@ function summary(rows, polled, pairs, jobs) {
 // or "", shortened here to installTipLine's pointer to the panel; canConfigure: right-click opens
 // the TUI (BarWidget falls back to the panel without it).
 function tooltipText(rows, pairs, jobs, polled, pollError, notice, canConfigure) {
-  var lines = ["Cloud Mounts: " + summary(rows, polled, pairs, jobs)]
+  var lines = ["Omarchy Cloud: " + summary(rows, polled, pairs, jobs)]
   if (pollError !== "") lines.push(pollError)
   var p = problems(rows, pairs, jobs)
   if (p.mounts.length > 0) lines.push("Mount failed: " + p.mounts.join(", "))

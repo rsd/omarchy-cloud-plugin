@@ -2775,7 +2775,7 @@ pub fn root_ready(paths: &Paths) -> Result<(), String> {
             let v: String = v.chars().take(120).collect();
             Err(format!(
                 "The mount root is not set up: OMARCHY_CLOUD_ROOT={v} in {file} is not valid\n\
-                 (it must be an absolute path outside your home, without spaces, quotes, $, % or \\).\n{setup}"
+                 (it must be an absolute UTF-8 path outside your home, without spaces, quotes, $, % or \\).\n{setup}"
             ))
         }
         RootSetting::Valid(r) => match sys::dir_problem(r) {

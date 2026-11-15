@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# The mount root guard of rclone-mount@<remote>.service: the unit mounts only
+# at a root every other reader (install.sh, the TUI, the panel, the bin/
+# scripts) would also accept, read from cloud.env the way they read it.
+#
+#   rclone-mount check <remote> <systemd root> <home>
+#                       (ExecCondition=) exit 0: go on (a refused root goes
+#                       on too, so that start fails loudly); exit 1: skip,
+#                       the root is valid but not yet an existing directory
+#                       this user can write to and search (one stderr line)
+#   rclone-mount start <remote> <systemd root> <home> -- <command...>
+#                       (ExecStart=) exit 78 when refused (one stderr line:
+#                       the remote, the path, the reason, the fix); else
+#                       creates <root>/<remote> (never the root; exit 78
+#                       when that fails: a file or a dangling link in the
+#                       way) and execs <command...> (same PID: Type=notify
+#                       still works)
+#
+# <systemd root> is ${OMARCHY_CLOUD_ROOT} as systemd set it (the unit's
+# Environment= default, then EnvironmentFile= cloud.env), <home> is %h
+# (every trailing / dropped). The root is refused when:
+#   - <home>/.config/omarchy-cloud/cloud.env exists but is not a readable
+#     regular file;
+#   - its setting fails valid_root (below; tests/fixtures/roots.tsv);
+#   - <systemd root> differs from it: systemd parses an EnvironmentFile its
+#     own way (strips quotes and surrounding whitespace, processes
+#     backslashes, accepts indented lines, skips a line that is not valid
+#     UTF-8 so that the default wins), and a root the readers do not see is
+#     never mounted;
+#   - the remote name is invalid (the scripts' name rule).
+# cloud.env is parsed, never sourced, as install.sh and the scripts parse it:
+# at most 4096 bytes, empty and # lines skipped, one trailing \r dropped, the
+# value of the last OMARCHY_CLOUD_ROOT= line verbatim; no file, or no such
+# line: the default /mnt/cloud.
+# A refused start exits 78 (EX_CONFIG), which the unit lists in
+# RestartPreventExitStatus=: the unit fails and is not restarted until the
+# setting is fixed. A usage error: check exits 0 (start then refuses it),
+# start 78, an unknown mode 64.
+# <home> stands in for $HOME while the root is judged (valid_root reads
+# $HOME and drops every trailing /; a home of only / skips the home rule, as
+# in every reader); one that is not absolute is refused (no cloud.env to
+# read).
+# The command runs with the environment's own HOME.
+set -u
+
+PROG=rclone-mount
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
+DEFAULT_ROOT=/mnt/cloud
+FIX='edit ~/.config/omarchy-cloud/cloud.env (one OMARCHY_CLOUD_ROOT=<path> line) or run install.sh --mount-root PATH'
+
+# valid_name <name>: NAME_RE in the C locale (in a UTF-8 locale bash's
+# [A-Za-z] also matches letters like é).
+valid_name() {
+  local LC_ALL=C
+  [[ $1 =~ $NAME_RE ]]
+}
+
+# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---
+# valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
+# empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
+# backquote, not $HOME nor inside it (every trailing / of $HOME ignored; a
+# $HOME of only / is no home: the rule is skipped), at most 255 bytes; valid
+# UTF-8 (valid_utf8) without U+FFFD (EF BF BD, what a lossy decoder puts in
+# place of a bad byte), so a reader that decodes the path as text and one
+# that reads bytes reach the same verdict.
+valid_root() {
+  local LC_ALL=C p=$1 home=$HOME
+  home=${home%"${home##*[!/]}"}
+  [[ $p == /?* && ${#p} -le 255 ]] || return 1
+  [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
+  [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
+  [[ -n $home && ($p == "$home" || $p == "$home"/*) ]] && return 1
+  [[ $p == *$'\xef\xbf\xbd'* ]] && return 1
+  valid_utf8 "$p"
+}
+# valid_utf8 STRING: 0 when STRING is well-formed UTF-8, checked byte by byte
+# (C locale): no stray continuation byte, no truncated sequence, no overlong
+# form (C0, C1, E0 80-9F, F0 80-8F), no surrogate (ED A0-BF), nothing past
+# U+10FFFF (F4 90-BF, F5-FF).
+valid_utf8() {
+  local LC_ALL=C
+  local s=$1 i=0 n=${#1} b need lo hi
+  while ((i < n)); do
+    printf -v b '%d' "'${s:i:1}"
+    ((b < 0)) && b=$((b + 256))
+    i=$((i + 1))
+    if ((b < 0x80)); then continue
+    elif ((b >= 0xc2 && b <= 0xdf)); then need=1 lo=0x80 hi=0xbf
+    elif ((b == 0xe0)); then need=2 lo=0xa0 hi=0xbf
+    elif ((b == 0xed)); then need=2 lo=0x80 hi=0x9f
+    elif ((b >= 0xe1 && b <= 0xef)); then need=2 lo=0x80 hi=0xbf
+    elif ((b == 0xf0)); then need=3 lo=0x90 hi=0xbf
+    elif ((b >= 0xf1 && b <= 0xf3)); then need=3 lo=0x80 hi=0xbf
+    elif ((b == 0xf4)); then need=3 lo=0x80 hi=0x8f
+    else return 1; fi
+    while ((need > 0)); do
+      ((i < n)) || return 1
+      printf -v b '%d' "'${s:i:1}"
+      ((b < 0)) && b=$((b + 256))
+      ((b >= lo && b <= hi)) || return 1
+      need=$((need - 1)) lo=0x80 hi=0xbf i=$((i + 1))
+    done
+  done
+  return 0
+}
+# --- end valid_root ---
+
+# shown <string>: printf %q in the C locale, so a control or non-ASCII byte is
+# shown as an escape, never raw; '' for an empty string.
+shown() {
+  local LC_ALL=C
+  printf '%q' "$1"
+}
+
+# read_setting <file>: SETTING_STATE absent (no file, or no such line),
+# unreadable (not a regular file, or not readable), invalid (the value fails
+# valid_root) or valid; SETTING_VALUE the value read.
+read_setting() {
+  local line
+  SETTING_STATE=absent SETTING_VALUE=
+  [[ -e $1 || -L $1 ]] || return 0
+  # A regular file only: a FIFO (or a device) would block the read.
+  if [[ ! -f $1 || ! -r $1 ]]; then
+    SETTING_STATE=unreadable
+    return 0
+  fi
+  # A NUL becomes \x01 (after the cap: same bytes): bash would drop it, and
+  # the other readers see a control character, so the value is invalid.
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == '#'* ]] && continue
+    [[ $line == OMARCHY_CLOUD_ROOT=* ]] && SETTING_STATE=set SETTING_VALUE=${line#OMARCHY_CLOUD_ROOT=}
+  done < <(head -c 4096 -- "$1" 2>/dev/null | tr '\0' '\1')
+  if [[ $SETTING_STATE == set ]]; then
+    if valid_root "$SETTING_VALUE"; then SETTING_STATE=valid; else SETTING_STATE=invalid; fi
+  fi
+}
+
+# refusal: WHY, why the root is refused (one sentence), or empty; ROOT, the
+# root to mount at when WHY is empty.
+refusal() {
+  local home=$HOME
+  home=${home%"${home##*[!/]}"}
+  local env="$home/.config/omarchy-cloud/cloud.env"
+  WHY='' ROOT=''
+  if ! valid_name "$REMOTE"; then
+    WHY="invalid remote name $(shown "$REMOTE") (letters, digits, _ . -, at most 64, starting with a letter or digit)"
+    FIX='rename the remote (rclone config) to a name of that form'
+    return 0
+  fi
+  read_setting "$env"
+  case $SETTING_STATE in
+    unreadable)
+      WHY="$(shown "$env") is not a readable regular file"
+      return 0
+      ;;
+    invalid)
+      WHY="the mount root $(shown "$SETTING_VALUE") in $(shown "$env") is not valid: it must be an absolute path outside your home, not /, with no empty, . or .. component, no whitespace, control character, \$ % \\ \" ' or backquote, valid UTF-8 without U+FFFD, at most 255 bytes"
+      return 0
+      ;;
+    valid) ROOT=$SETTING_VALUE ;;
+    *) ROOT=$DEFAULT_ROOT ;;
+  esac
+  if ! valid_root "$ROOT"; then
+    WHY="the default mount root $ROOT is inside your home $(shown "$HOME")"
+    ROOT=''
+    return 0
+  fi
+  # Where the readers' root came from (the line, or the built-in default)
+  # and where systemd's may have: cloud.env parsed its own way, or another
+  # file the unit reads (<remote>.env, read before cloud.env).
+  if [[ $SYSTEMD_ROOT != "$ROOT" ]]; then
+    local other="another file the unit reads (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/$REMOTE.env: remove it)"
+    WHY="the unit was given the mount root $(shown "$SYSTEMD_ROOT"), but "
+    if [[ $SETTING_STATE == absent && ! -e $env && ! -L $env ]]; then
+      WHY+="the other readers use the built-in default $DEFAULT_ROOT (there is no $(shown "$env")); systemd got it from $other"
+    else
+      if [[ $SETTING_STATE == valid ]]; then
+        WHY+="the OMARCHY_CLOUD_ROOT= line of $(shown "$env") says $(shown "$ROOT")"
+      else
+        WHY+="the other readers use the built-in default $DEFAULT_ROOT ($(shown "$env") has no OMARCHY_CLOUD_ROOT= line they see)"
+      fi
+      WHY+="; systemd got it either from that file read its own way (quotes, surrounding whitespace, backslashes, an indented line, a line that is not valid UTF-8: write the line plainly, OMARCHY_CLOUD_ROOT=<path> at the start of a line) or from $other"
+    fi
+    ROOT=''
+  fi
+}
+
+# usable <root>: an existing directory this user can write to and search.
+usable() { [[ -d $1 && -w $1 && -x $1 ]]; }
+
+not_set_up() {
+  echo "$PROG: $REMOTE: not started: the mount root $ROOT is not an existing directory you can write to and search; create it once with: sudo install -d -o \"\$USER\" -m 755 '$ROOT' (or choose another root: install.sh --mount-root PATH)" >&2
+}
+
+MODE=${1:-}
+case $MODE in
+  check)
+    # A usage error defers to start, which refuses it loudly.
+    (($# == 4)) || exit 0
+    ;;
+  start)
+    if (($# < 6)) || [[ $5 != -- ]]; then
+      echo "usage: $PROG start <remote> <root> <home> -- <command...>" >&2
+      exit 78
+    fi
+    ;;
+  *)
+    echo "usage: $PROG {check <remote> <root> <home> | start <remote> <root> <home> -- <command...>}" >&2
+    exit 64
+    ;;
+esac
+ENV_HOME=${HOME-} ENV_HOME_SET=${HOME+1}
+REMOTE=$2 SYSTEMD_ROOT=$3 HOME=$4
+shift 4
+if [[ $HOME != /* ]]; then
+  WHY="the home directory $(shown "$HOME") (%h) is not an absolute path" ROOT=''
+else
+  refusal
+fi
+if [[ -n $WHY ]]; then
+  [[ $MODE == check ]] && exit 0
+  echo "$PROG: $(shown "$REMOTE"): refusing to mount: $WHY. Fix: $FIX." >&2
+  exit 78
+fi
+if ! usable "$ROOT"; then
+  not_set_up
+  exit 1
+fi
+[[ $MODE == check ]] && exit 0
+shift
+if [[ -n $ENV_HOME_SET ]]; then HOME=$ENV_HOME; else unset HOME; fi
+# The remote's own directory only: never the root (mkdir without -p). A
+# failure is not transient (the root is usable: a file or a dangling link is
+# in the way), so it exits 78, not restarted, with one line.
+if [[ ! -d $ROOT/$REMOTE ]] && ! err=$(LC_ALL=C mkdir -- "$ROOT/$REMOTE" 2>&1); then
+  echo "$PROG: $REMOTE: refusing to mount: cannot create the mount point $ROOT/$REMOTE (${err##*: }). Fix: remove or rename what is at $ROOT/$REMOTE, or choose another root: install.sh --mount-root PATH." >&2
+  exit 78
+fi
+exec "$@"

@@ -7,9 +7,10 @@
 # the model logic, the three shell strings run through a real shell, the busy
 # check against the real fuser, and the plugin folder's layout. Then, when
 # they exist, the helper scripts' suite (tests/scripts-test.sh), install.sh's
-# (tests/install-test.sh) and the
-# omarchy-cloud app's `cargo test` and `cargo clippy`, built under
-# ${XDG_CACHE_HOME:-~/.cache}/omarchy-cloud/target, never inside the repo.
+# (tests/install-test.sh), shellcheck over install.sh, bin/* and tests/*.sh
+# (with a self-test that it can fail; skipped when no working shellcheck is
+# found) and the omarchy-cloud app's `cargo test` and `cargo clippy`, built
+# under ${XDG_CACHE_HOME:-~/.cache}/omarchy-cloud/target, never inside the repo.
 #
 # Nothing here starts, stops or enables a unit, touches the live shell, or
 # writes under ~/.config. The scratch Quickshell runs are stopped by the PID
@@ -469,8 +470,108 @@ app_cargo() {
   esac
 }
 
+# Finds a working shellcheck and sets SHELLCHECK_BIN: $SHELLCHECK if set, else
+# `shellcheck` on PATH, else the newest mise install. A candidate counts only if
+# `--version` exits 0 (a mise shim with no version set is on PATH and fails).
+# Returns 1, with what was tried on stdout, when none works.
+SHELLCHECK_BIN=
+find_shellcheck() {
+  local c tried=() installs=()
+  SHELLCHECK_BIN=
+  if [[ -n ${SHELLCHECK:-} ]]; then
+    if "$SHELLCHECK" --version >/dev/null 2>&1; then
+      SHELLCHECK_BIN=$SHELLCHECK
+      return 0
+    fi
+    echo "skipped: \$SHELLCHECK=$SHELLCHECK does not run (--version failed)"
+    return 1
+  fi
+  if c=$(command -v shellcheck); then
+    if "$c" --version >/dev/null 2>&1; then
+      SHELLCHECK_BIN=$c
+      return 0
+    fi
+    tried+=("$c (--version failed)")
+  else
+    tried+=("shellcheck not on PATH")
+  fi
+  mapfile -t installs < <(printf '%s\n' \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck | sort -V -r)
+  for c in "${installs[@]}"; do
+    [[ -x $c ]] || continue
+    if "$c" --version >/dev/null 2>&1; then
+      SHELLCHECK_BIN=$c
+      return 0
+    fi
+    tried+=("$c (--version failed)")
+  done
+  tried+=("no runnable ~/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck")
+  local IFS=';'
+  echo "skipped: no working shellcheck (set SHELLCHECK to one); tried: ${tried[*]}"
+  return 1
+}
+
+# Usage: shellcheck_check [dir]. Checks install.sh, bin/* and tests/*.sh of dir
+# (default: the plugin), globbed now so a new script is included, at default
+# severity. Any finding is printed (gcc format) and fails.
+shellcheck_check() {
+  local dir=${1:-$PLUGIN_DIR} f out status
+  local files=()
+  find_shellcheck || return $SKIP
+  for f in "$dir/install.sh" "$dir"/bin/* "$dir"/tests/*.sh; do
+    [[ -f $f ]] && files+=("$f")
+  done
+  if ((${#files[@]} == 0)); then
+    echo "FAIL no scripts found to check under $dir"
+    return 1
+  fi
+  out=$("$SHELLCHECK_BIN" -f gcc "${files[@]}" 2>&1)
+  status=$?
+  if ((status != 0)); then
+    echo "$out"
+    echo "shellcheck exit status $status in ${#files[@]} file(s)"
+    return 1
+  fi
+  echo "ok   $("$SHELLCHECK_BIN" --version | sed -n 's/^version: /shellcheck /p'): ${#files[@]} file(s) clean"
+}
+
+# The check must be able to fail: a clean scratch copy passes, then an unquoted
+# `echo $1` injected into one script must be reported (SC2086).
+shellcheck_selftest() {
+  local scratch out ok=0
+  find_shellcheck || return $SKIP
+  scratch=$(mktemp -d) || return 1
+  mkdir "$scratch/tests"
+  cp "$PLUGIN_DIR/tests/run.sh" "$scratch/tests/run.sh"
+  if out=$(shellcheck_check "$scratch"); then
+    echo "ok   untouched copy passes"
+  else
+    echo "FAIL untouched copy should pass:"
+    echo "$out"
+    ok=1
+  fi
+  # The literal, unquoted $1 is the injected finding.
+  # shellcheck disable=SC2016
+  printf '\necho $1\n' >>"$scratch/tests/run.sh"
+  if out=$(shellcheck_check "$scratch"); then
+    echo "FAIL an injected unquoted \$1 was not caught"
+    ok=1
+  elif grep -q 'SC2086' <<<"$out"; then
+    echo "ok   an injected unquoted \$1 fails: $(grep SC2086 <<<"$out" | head -1 | sed "s|$scratch/||")"
+  else
+    echo "FAIL the injected copy failed, but not on SC2086:"
+    echo "$out"
+    ok=1
+  fi
+  rm -rf "$scratch"
+  return $ok
+}
+
 run "helper scripts (tests/scripts-test.sh)" scripts_suite
 run "install.sh (tests/install-test.sh)" install_suite
+run "shellcheck (install.sh, bin/*, tests/*.sh)" shellcheck_check
+run "shellcheck self-test (injected unquoted variable)" shellcheck_selftest
 run "omarchy-cloud app: cargo test" app_cargo test
 run "omarchy-cloud app: cargo clippy -D warnings" app_cargo clippy
 

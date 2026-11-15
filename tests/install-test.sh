@@ -40,8 +40,12 @@
 #      instructions without a terminal or with --no-prompt, the prompt (the
 #      exact sudo command, never run; Enter re-checks; a typed path),
 #      --mount-root and its refusals, an existing cloud.env never rewritten,
-#      kept by --uninstall; tests/fixtures/roots.tsv through install.sh's
-#      valid_root; the diff hint for a path with a '; the mount unit.
+#      kept by --uninstall; a root must be searchable too (x), not only
+#      writable; tests/fixtures/roots.tsv (raw bytes) through install.sh's
+#      valid_root; the diff hint for a path with a '; the mount unit: its
+#      lines (the guard bin/rclone-mount in ExecCondition and ExecStart, no
+#      ExecStartPre, RestartPreventExitStatus=78), and those lines run as
+#      systemd would against the installed guard.
 #
 # The checks are eval'd single-quoted strings, expanded when they run.
 # shellcheck disable=SC2016,SC2034
@@ -198,17 +202,46 @@ snapshot() { # UD, BD, the state and config dirs and the XDG ones: types, link t
 # --- 1. syntax, lint, options -------------------------------------------------
 check "bash -n install.sh" bash -n "$PLUGIN_DIR/install.sh"
 check "install.sh is executable" test -x "$PLUGIN_DIR/install.sh"
-SHELLCHECK=$(command -v shellcheck)
-if [[ -n $SHELLCHECK ]] && "$SHELLCHECK" --version >/dev/null 2>&1; then
-  check "shellcheck" "$SHELLCHECK" "$PLUGIN_DIR/install.sh" "${BASH_SOURCE[0]}"
+# find_shellcheck: SHELLCHECK_BIN, a shellcheck that runs, found the way
+# tests/run.sh finds it: $SHELLCHECK if set, else `shellcheck` on PATH, else
+# the newest mise install; a candidate counts only if --version exits 0 (a
+# mise shim with no version set is on PATH and fails). Returns 1, with what
+# was tried in SHELLCHECK_TRIED, when none works.
+find_shellcheck() {
+  local c installs=()
+  SHELLCHECK_BIN='' SHELLCHECK_TRIED=''
+  if [[ -n ${SHELLCHECK:-} ]]; then
+    "$SHELLCHECK" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$SHELLCHECK && return 0
+    SHELLCHECK_TRIED="\$SHELLCHECK=$SHELLCHECK (--version failed)"
+    return 1
+  fi
+  if c=$(command -v shellcheck); then
+    "$c" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$c && return 0
+    SHELLCHECK_TRIED="$c (--version failed); "
+  else
+    SHELLCHECK_TRIED="shellcheck not on PATH; "
+  fi
+  mapfile -t installs < <(printf '%s\n' \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck \
+    "$HOME"/.local/share/mise/installs/shellcheck/*/shellcheck | sort -V -r)
+  for c in "${installs[@]}"; do
+    [[ -x $c ]] || continue
+    "$c" --version >/dev/null 2>&1 && SHELLCHECK_BIN=$c && return 0
+    SHELLCHECK_TRIED+="$c (--version failed); "
+  done
+  SHELLCHECK_TRIED+="no runnable ~/.local/share/mise/installs/shellcheck/*/shellcheck*/shellcheck"
+  return 1
+}
+if find_shellcheck; then
+  check "shellcheck" "$SHELLCHECK_BIN" "$PLUGIN_DIR/install.sh" "${BASH_SOURCE[0]}"
 else
-  echo "skip shellcheck (not installed or not runnable)"
+  echo "skip shellcheck (none runs; set SHELLCHECK to one; tried: $SHELLCHECK_TRIED)"
 fi
 fresh
 for args in "--bogus" "--force" "--no-build --from-source" "--uninstall --from-source" "--uninstall --no-build" \
   "--mount-root" "--no-prompt --mount-root /srv" "--mount-root /srv --mount-root /opt" "--uninstall --no-prompt" \
   "--uninstall --mount-root /srv"; do
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2086 # $args is split on purpose: one case, several options
   runc "$INSTALL" $args
   check "install.sh $args: exit 64, nothing written" eval 'rc_is 64 && [[ ! -e $UD && ! -e $BD && ! -e $MAN ]]'
 done
@@ -522,7 +555,7 @@ runc "$INSTALL" --uninstall --force
 check "uninstall --force with an enabled mount: exit 0, names the mount" \
   eval 'rc_is 0 && [[ $OUT == *"--force"*"rclone-mount@onedrive.service"* ]]'
 check "uninstall: the recorded files that still match are removed" \
-  eval '[[ ! -e $UD/rclone-mount@.service && ! -e $UD/rclone-bisync@.path && ! -e $BD/rclone-bisync && ! -e $BD/rclone-backup ]]'
+  eval '[[ ! -e $UD/rclone-mount@.service && ! -e $UD/rclone-bisync@.path && ! -e $BD/rclone-bisync && ! -e $BD/rclone-backup && ! -e $BD/rclone-mount ]]'
 check "uninstall: an edited unit and a replaced binary are left, and named" \
   eval '[[ -f $UD/rclone-backup@.service && $(cat "$BD/omarchy-cloud") == "#!/bin/sh" && $OUT == *"left $UD/rclone-backup@.service"* && $OUT == *"left $BD/omarchy-cloud"* ]]'
 check "uninstall: enablement links, config, other units kept; manifest gone; daemon-reload" \
@@ -789,6 +822,24 @@ runc "$INSTALL" --no-build
 check "root: a default we cannot write to is not adopted, the sudo command is printed" \
   eval 'rc_is 0 && [[ ! -e $ENVF && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* ]]'
 chmod 755 "$T/mnt/cloud"
+# Nor one we own and can write to but not search (no x: nothing inside it,
+# the mount point included, could be reached).
+fresh
+mkdir -p "$T/mnt/cloud"
+chmod 600 "$T/mnt/cloud"
+runc "$INSTALL" --no-build
+check "root: an owned, writable default we cannot search (mode 600) is not adopted, the sudo command is printed" \
+  eval 'rc_is 0 && [[ ! -e $ENVF && $OUT != *adopted* && $OUT == *"can write to and search"* && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* ]]'
+chmod 755 "$T/mnt/cloud"
+# A saved root we cannot search is named, with its sudo command.
+fresh
+mkdir -p "$T/srv/nx" "${ENVF%/*}"
+chmod 600 "$T/srv/nx"
+printf 'OMARCHY_CLOUD_ROOT=%s\n' "$T/srv/nx" >"$ENVF"
+runc "$INSTALL" --no-build
+check "root: a saved root we cannot search (mode 600) is named as not usable, with its sudo command, cloud.env kept" \
+  eval 'rc_is 0 && env_is "$T/srv/nx" && [[ $OUT == *"$T/srv/nx'"'"' (from $ENVF) is not a directory you can write to and search"* && $OUT == *"$(mkroot_cmd "$T/srv/nx")"* ]]'
+chmod 755 "$T/srv/nx"
 
 # The prompt, the root missing: Enter prints the exact command and never runs
 # sudo; the input ends: nothing written.
@@ -800,6 +851,9 @@ check "root prompt: sudo is never run (the sudo stand-in recorded nothing)" no_s
 # Enter again after the root was created (in "another terminal"): re-checked
 # and saved.
 fresh
+# The feeder reads the output install.sh writes on purpose: it waits for the
+# sudo line before "creating" the root.
+# shellcheck disable=SC2094
 (
   printf '\n'
   for ((i = 0; i < 100; i++)); do grep -qF "sudo install" "$T/out" 2>/dev/null && break; sleep 0.05; done
@@ -843,6 +897,16 @@ check "root: an invalid cloud.env is named and left as it is" eval '[[ $OUT == *
 check "root: a cloud.env with no OMARCHY_CLOUD_ROOT= line is named, points to --mount-root PATH, claims no default" \
   eval '[[ $OUT == *"$ENVF holds no usable"* && $OUT == *"--mount-root PATH"* && $OUT != *"mounts use"* && $OUT != *"$T/mnt/cloud"* ]]'
 
+# A NUL in the value: invalid, as for the TUI and the panel (bash would drop
+# it and read the valid $T/srv/ab, named as not set up), left as it is.
+fresh
+mkdir -p "$T/mnt/cloud" "${ENVF%/*}"
+printf 'OMARCHY_CLOUD_ROOT=%s/srv/a\0b\n' "$T" >"$ENVF"
+before=$(sha "$ENVF")
+runc "$INSTALL" --no-build
+check "root: a cloud.env value with a NUL byte is invalid: named, left as it is, \$T/srv/ab never read" \
+  eval 'rc_is 0 && [[ $(sha "$ENVF") == "$before" && $OUT == *"$ENVF holds no usable"*"left as it is"* && $OUT != *"$T/srv/ab"* && $OUT != *"null byte"* ]]'
+
 # A cloud.env that is not a regular file (a FIFO) is never read: no hang.
 fresh
 mkdir -p "$T/mnt/cloud" "${ENVF%/*}"
@@ -873,6 +937,12 @@ check "--mount-root with a mount active (waiting to restart): refused (exit 1), 
   eval 'rc_is 1 && [[ $OUT == *"rclone-mount@gd.service"* && $OUT != *"rclone-mount@old"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
 runc "$INSTALL" --no-build --mount-root "$HOME/inside"
 check "--mount-root inside HOME: refused (exit 1), nothing changed" eval 'rc_is 1 && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
+mkdir -p "$T/nx"
+chmod 600 "$T/nx"
+runc "$INSTALL" --no-build --mount-root "$T/nx"
+check "--mount-root, a writable directory we cannot search (mode 600): refused (exit 1), nothing changed" \
+  eval 'rc_is 1 && [[ $OUT == *"is not a directory you can write to and search"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
+chmod 755 "$T/nx"
 runc "$INSTALL" --no-build --mount-root "$T/missing"
 check "--mount-root, a path that does not exist: refused (exit 1) with its sudo command, nothing changed" \
   eval 'rc_is 1 && [[ $OUT == *"$(mkroot_cmd "$T/missing")"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before" && no_sudo'
@@ -896,13 +966,22 @@ check "uninstall: cloud.env and its dir are kept (content, modes); said so" \
 VALID_ROOT=$(sed -n '/^# --- valid_root (shared: /,/^# --- end valid_root ---$/p' "$INSTALL")
 check "fixture: install.sh carries the marked valid_root block" eval '[[ $VALID_ROOT == *"valid_root() {"* ]]'
 roots_n=0 roots_bad=0
-while IFS=$'\t' read -r kind path; do
+# Raw bytes: the file holds non-UTF-8 bytes and paths with leading and
+# trailing spaces or backslashes, so no IFS splitting and no read escapes.
+while IFS= read -r line || [[ -n $line ]]; do
+  [[ $line == *$'\t'* ]] || continue
+  kind=${line%%$'\t'*} path=${line#*$'\t'}
   [[ $kind == valid || $kind == invalid ]] || continue
   roots_n=$((roots_n + 1))
   if HOME=/home/tester bash -c "$VALID_ROOT"$'\nvalid_root "$1"' _ "$path"; then got=valid; else got=invalid; fi
-  [[ $got == "$kind" ]] || { echo "     roots.tsv: '$path' is $kind, valid_root says $got"; roots_bad=$((roots_bad + 1)); }
+  [[ $got == "$kind" ]] || { echo "     roots.tsv: $(printf %q "$path") is $kind, valid_root says $got"; roots_bad=$((roots_bad + 1)); }
 done <"$PLUGIN_DIR/tests/fixtures/roots.tsv"
 check "valid_root: every case of tests/fixtures/roots.tsv ($roots_n)" eval '((roots_n > 20 && roots_bad == 0))'
+# Every trailing / of HOME is dropped (as in Rust and the panel); a HOME of
+# only / is no home.
+vr_home() { HOME=$1 bash -c "$VALID_ROOT"$'\nvalid_root "$1"' _ "$2"; }
+check "valid_root: HOME=/home/tester// still refuses /home/tester/x and /home/tester; HOME=// skips the home rule" \
+  eval '! vr_home /home/tester// /home/tester/x && ! vr_home /home/tester/// /home/tester && vr_home // /home/x && vr_home /home/tester// /home/testerx'
 
 # The diff hint pastes as is when a path holds a '.
 R4="$SCRATCH/it's here"
@@ -924,69 +1003,82 @@ check "HOME-fixed: units in ~/.config/systemd/user, state, config and cloud.env 
 check "the root's other files (preview.png, docs/) are not installed" \
   eval '[[ -z $(find "$HOME" -name "*.png") ]] && manifest_all "$R0"'
 
-# The mount unit, on a scratch copy as an instance.
+# The mount unit, on a scratch copy as an instance. Its guard is the
+# installed %h/.local/bin/rclone-mount (tests/scripts-test.sh covers the
+# script itself); here: the unit's lines, and those lines run as systemd
+# would run them against this scratch HOME's installed copy.
 UNIT=$R0/systemd/rclone-mount@.service
 UV=$SCRATCH/unit
 mkdir -p "$UV"
 cp "$UNIT" "$UV/rclone-mount@x.service"
+check "fixture: this HOME has rclone-mount installed (systemd-analyze verify checks %h/.local/bin/rclone-mount)" \
+  eval '[[ -x $BD/rclone-mount && $(sha "$BD/rclone-mount") == $(sha "$R0/bin/rclone-mount") ]]'
 if command -v systemd-analyze >/dev/null && [[ -x /usr/bin/rclone && -x /usr/bin/fusermount3 ]]; then
   check "unit: systemd-analyze --user verify (a scratch instance)" eval 'systemd-analyze --user verify "$UV/rclone-mount@x.service" >"$T/verify" 2>&1 || { sed "s/^/     /" "$T/verify"; false; }'
 else
   echo "skip unit: systemd-analyze --user verify (systemd-analyze, rclone or fusermount3 missing)"
 fi
-# exec_line <key>: the unit's <key>= line(s), continuations joined.
-exec_line() { sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$UNIT" | grep "^$1="; }
-check "unit: ExecStart mounts at \${OMARCHY_CLOUD_ROOT}/%i, ExecStop unmounts it" \
-  eval '[[ $(exec_line ExecStart) == "ExecStart=/usr/bin/rclone mount %i: \${OMARCHY_CLOUD_ROOT}/%i "* && $(exec_line ExecStop) == "ExecStop=/usr/bin/fusermount3 -uz \${OMARCHY_CLOUD_ROOT}/%i" ]]'
-ROOT_COND="ExecCondition=/usr/bin/sh -c 'case \$\$1 in /?*) ;; *) exit 1 ;; esac; case \$\$1/ in *//* | */./* | */../*) exit 1 ;; esac; case \$\$1 in \"\$\$2\" | \"\$\$2\"/*) exit 1 ;; esac' _ \${OMARCHY_CLOUD_ROOT} %h"
-WANT_COND="$ROOT_COND"'
-ExecCondition=/usr/bin/test -d ${OMARCHY_CLOUD_ROOT}
-ExecCondition=/usr/bin/test -w ${OMARCHY_CLOUD_ROOT}
-ExecCondition=/usr/bin/test -x ${OMARCHY_CLOUD_ROOT}'
+# exec_line <key>: the unit's <key>= line(s), continuations joined (a
+# backslash-newline and the spaces around it read as one space).
+exec_line() { sed -e ':a' -e '/\\$/N; s/ *\\\n */ /; ta' "$UNIT" | grep "^$1="; }
+WANT_COND='ExecCondition=%h/.local/bin/rclone-mount check %i ${OMARCHY_CLOUD_ROOT} %h'
+WANT_START='ExecStart=%h/.local/bin/rclone-mount start %i ${OMARCHY_CLOUD_ROOT} %h -- /usr/bin/rclone mount %i: ${OMARCHY_CLOUD_ROOT}/%i --cache-dir %h/.cache/rclone --vfs-cache-mode full --vfs-read-chunk-size 8M --vfs-read-chunk-size-limit 32M --vfs-read-ahead 8M --buffer-size 4M'
+check "unit: one ExecCondition, through rclone-mount check (the root, the remote, %h)" eval '[[ $(exec_line ExecCondition) == "$WANT_COND" ]]'
+check "unit: ExecStart runs rclone mount at \${OMARCHY_CLOUD_ROOT}/%i through rclone-mount start, the flags unchanged" \
+  eval '[[ $(exec_line ExecStart) == "$WANT_START" ]]'
+check "unit: no ExecStartPre (a mkdir there would run under a refused root)" eval '! exec_line ExecStartPre'
+check "unit: ExecStop unmounts \${OMARCHY_CLOUD_ROOT}/%i, as before" \
+  eval '[[ $(exec_line ExecStop) == "ExecStop=/usr/bin/fusermount3 -uz \${OMARCHY_CLOUD_ROOT}/%i" ]]'
+check "unit: a refused start (exit 78) is not restarted; any other failure is" \
+  eval '[[ $(grep -c "^RestartPreventExitStatus=" "$UNIT") == 1 && $(exec_line RestartPreventExitStatus) == RestartPreventExitStatus=78 && $(exec_line Restart) == Restart=on-failure ]]'
 WANT_ENV='Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud
 EnvironmentFile=-%h/.config/omarchy-cloud/cloud.env'
-check "unit: ExecCondition: the root is one the readers accept, an existing directory, writable and searchable; ExecStartPre makes only the remote's dir" \
-  eval '[[ $(exec_line ExecCondition) == "$WANT_COND" && $(exec_line ExecStartPre) == "ExecStartPre=/usr/bin/mkdir -p \${OMARCHY_CLOUD_ROOT}/%i" ]]'
 check "unit: the default Environment=, then cloud.env (which wins), after it" \
   eval '[[ $(grep -e "^Environment=OMARCHY_CLOUD_ROOT=" -e "^EnvironmentFile=-%h/.config/omarchy-cloud/" "$UNIT") == "$WANT_ENV" ]]'
 check "unit: no literal /mnt/cloud besides the default Environment= line" \
   eval '[[ $(grep -F /mnt/cloud "$UNIT") == "Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud" ]]'
-# The conditions as systemd runs them: $$ is a literal $, ${OMARCHY_CLOUD_ROOT}
-# and %h one word each (no other $ or specifier in them, checked first),
-# then the words as a shell splits them (single quotes only). A refused
-# root skips (1-254), an accepted one passes.
-check "unit: the ExecCondition lines use no \$ but \$\$ and \${OMARCHY_CLOUD_ROOT}, no specifier but %h" \
-  eval '! exec_line ExecCondition | sed -e "s/[$][$]//g" -e "s/[$]{OMARCHY_CLOUD_ROOT}//g" -e "s/%h//g" | grep -q "[$%]"'
-cond_run() { # cond_run <root> <home> <line>: <line>'s status, run as systemd would
-  local c=${3#ExecCondition=}
-  c=${c//\$\$/\$}
-  c=${c//\$\{OMARCHY_CLOUD_ROOT\}/$(printf %q "$1")}
-  c=${c//%h/$(printf %q "$2")}
-  eval "$c"
+# The lines as systemd runs them: ${OMARCHY_CLOUD_ROOT} one word, %h and %i
+# (no other $ or specifier in them, checked first), then the words split on
+# spaces (there are no quotes); /usr/bin/rclone a stand-in that records its
+# argv.
+check "unit: the ExecCondition and ExecStart lines use no \$ but \${OMARCHY_CLOUD_ROOT}, no specifier but %h and %i" \
+  eval '! exec_line "Exec\(Condition\|Start\)" | sed -e "s/[$]{OMARCHY_CLOUD_ROOT}//g" -e "s/%[hi]//g" | grep -q "[$%\"'"'"'\\\\]"'
+FAKE_RCLONE=$SCRATCH/fake-rclone
+printf '#!/bin/bash\nprintf "%%s\\n" "$@" >"$FAKE_LOG/rclone-mount"\n' >"$FAKE_RCLONE"
+chmod +x "$FAKE_RCLONE"
+unit_run() { # unit_run <key> <systemd root>: the unit's <key> line run as systemd would, for remote od
+  local c
+  c=$(exec_line "$1")
+  c=${c#"$1"=}
+  c=${c//\$\{OMARCHY_CLOUD_ROOT\}/$(printf %q "$2")}
+  c=${c//%h/$(printf %q "$HOME")}
+  c=${c//%i/od}
+  c=${c//\/usr\/bin\/rclone /$(printf %q "$FAKE_RCLONE") }
+  OUT=$(eval "$c" 2>&1)
+  RC=$?
 }
-cond_rc() { # cond_rc <root> [home]: the first failing ExecCondition's status, else 0
-  local l
-  while IFS= read -r l; do
-    cond_run "$1" "${2:-$HOME}" "$l" || return $?
-  done < <(exec_line ExecCondition)
-  return 0
-}
-skips() { local r; cond_rc "$@"; r=$?; ((r >= 1 && r <= 254)); }
-UNIT_ROOT_COND=$(exec_line ExecCondition | head -n 1) # the unit's own, not $ROOT_COND
-mkdir -p "$SCRATCH/rw-root" "$SCRATCH/ro-root" "$SCRATCH/nx-root" "$HOME/mnt"
-chmod 555 "$SCRATCH/ro-root"
-chmod 600 "$SCRATCH/nx-root"
-check "unit: the conditions skip a missing, read-only or unsearchable root (exit 1-254) and pass a writable one" \
-  eval 'cond_rc "$SCRATCH/rw-root" && skips "$SCRATCH/none" && skips "$SCRATCH/ro-root" && skips "$SCRATCH/nx-root"'
-chmod 755 "$SCRATCH/ro-root" "$SCRATCH/nx-root"
-check "unit: the root condition passes an absolute root outside home (/mnt/x, which need not exist)" \
-  eval 'cond_run /mnt/x "$HOME" "$UNIT_ROOT_COND"'
-for bad in "" relative mnt/x / /mnt/../etc /mnt/./x /mnt//x /mnt/x/ "$HOME" "$HOME/mnt"; do
-  check "unit: the conditions skip the root '$bad' (exit 1-254), even when it is a writable directory" \
-    eval '{ cond_run "$bad" "$HOME" "$UNIT_ROOT_COND"; r=$?; ((r >= 1 && r <= 254)); } && skips "$bad"'
-done
-check "fixture: \$HOME and \$HOME/mnt are writable directories (only the root condition skips them)" \
-  eval '[[ -d $HOME/mnt && -w $HOME/mnt && -x $HOME/mnt ]]'
+UR=$SCRATCH/unit-root
+mkdir -p "$UR" "${ENVF%/*}"
+printf 'OMARCHY_CLOUD_ROOT=%s\n' "$UR" >"$ENVF"
+unit_run ExecCondition "$UR"
+check "unit, as run: a valid, agreeing, usable root passes ExecCondition" rc_is 0
+rm -f "$FAKE_LOG/rclone-mount"
+unit_run ExecStart "$UR"
+mapfile -t ra <"$FAKE_LOG/rclone-mount" 2>/dev/null
+check "unit, as run: ExecStart makes <root>/od and runs rclone mount od: <root>/od with the unit's flags" \
+  eval 'rc_is 0 && [[ -d $UR/od && "${ra[*]}" == "mount od: $UR/od --cache-dir $HOME/.cache/rclone --vfs-cache-mode full --vfs-read-chunk-size 8M --vfs-read-chunk-size-limit 32M --vfs-read-ahead 8M --buffer-size 4M" ]]'
+printf 'OMARCHY_CLOUD_ROOT=%s\n' "$SCRATCH/no-root" >"$ENVF"
+unit_run ExecCondition "$SCRATCH/no-root"
+check "unit, as run: a valid root that does not exist skips (ExecCondition exit 1, one line)" \
+  eval 'rc_is 1 && [[ $OUT == *"not started: the mount root $SCRATCH/no-root is not an existing directory you can write to and search"* ]]'
+printf 'OMARCHY_CLOUD_ROOT="%s"\n' "$UR" >"$ENVF"
+rm -rf "$UR/od" "$FAKE_LOG/rclone-mount"
+unit_run ExecCondition "$UR"
+rc1=$RC
+unit_run ExecStart "$UR"
+check "unit, as run: a quoted cloud.env value (systemd strips the quotes) goes past ExecCondition and fails ExecStart with 78, nothing made, rclone not run" \
+  eval '((rc1 == 0)) && rc_is 78 && [[ $OUT == *"refusing to mount"* && ! -e $UR/od && ! -e $FAKE_LOG/rclone-mount ]]'
+rm -f "$ENVF"
 
 # --- 9. the repository ---------------------------------------------------------------
 if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
