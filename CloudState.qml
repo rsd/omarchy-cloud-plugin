@@ -20,8 +20,12 @@ import "Model.js" as Model
 //     opening and SETTLE_MS after an action.
 //   - sizes (du -s -B1 over the remotes' VFS cache dirs, one call): only while a
 //     panel is open, and never twice within Model.DU_MIN_MS.
+//     Both run through Model.BOUNDED_SCRIPT under `timeout -k` with a `head -c`
+//     cap (Model.pollArgv, Model.sizesArgv); an answer without its end line
+//     (cut by the timeout) is dropped and the last good state kept.
 //   - scan (one `sh` over the offline-folder and backup config files, their
-//     state files, and whether the omarchy-cloud TUI and the two service
+//     state files, the mount-root setting ~/.config/omarchy-cloud/cloud.env,
+//     and whether the omarchy-cloud TUI and the two service
 //     templates are installed; see
 //     Model.SCAN_SCRIPT): never on a timer. At the first answer of the poll,
 //     whenever a later poll shows a pair or job service exited again (each
@@ -29,6 +33,14 @@ import "Model.js" as Model
 //     changed, and on a panel opening. Conflict copies the user deletes by hand
 //     therefore stay listed until the next sync run rewrites the state file
 //     (the timer's interval at most, while it is enabled) or a panel opens.
+//   - root check (one `sh` asking whether the mount root is a writable
+//     directory; Model.ROOT_CHECK_SCRIPT, the root as "$1"): after each good
+//     scan or setting read whose setting is a valid root, never otherwise.
+//   - setting read (one `sh` reading only cloud.env; Model.SETTING_SCRIPT):
+//     on a poll that starts no scan, and only while the root is not set up
+//     (Model.rootNeedsReread: absent, invalid or missing), followed by the
+//     root check; so Set up or the one-time sudo command clears the notice on
+//     the next poll. Nothing extra runs while the root is ready.
 //   - versions (one `sh` reading the plugin's own manifest.json version, the
 //     header of install.sh's installed-files manifest and whether the legacy
 //     installed-binary.sha256 and the plugin's install.sh exist; see
@@ -44,7 +56,8 @@ Singleton {
   id: root
 
   readonly property string home: Model.cleanHome(Quickshell.env("HOME"))
-  readonly property string stateDir: Model.stateHome(root.home, Quickshell.env("XDG_STATE_HOME"))
+  // HOME-fixed, as the scripts and the TUI write it (XDG_STATE_HOME is never read).
+  readonly property string stateDir: Model.stateHome(root.home)
   // This file's own folder, the plugin's (manifest.json, install.sh).
   readonly property string pluginDir: Model.pluginDirFromUrl(Qt.resolvedUrl("manifest.json"))
 
@@ -81,6 +94,14 @@ Singleton {
   // The last good versions read (Model.parseVersions); its ok stays false
   // until one arrives, so nothing is claimed before that.
   property var versions: Model.emptyVersions()
+  // The mount root: the setting from the last good scan (Model.rootSetting,
+  // null before one), the root mounts use (the default without a valid
+  // setting), the last root check ({ path, result }) and what the notice
+  // makes of them (Model.rootStatus: "" until known).
+  readonly property var rootSetting: root.scanned ? Model.rootSetting(root.scanData, root.home) : null
+  readonly property string mountRoot: Model.mountRoot(root.rootSetting)
+  property var rootCheck: ({ path: "", result: "" })
+  readonly property string rootStatus: Model.rootStatus(root.rootSetting, root.rootCheck)
   readonly property var pairs: Model.mergePairs(Model.scanPairs(root.scanData), Model.unitPairs(root.units))
   readonly property var jobs: Model.mergeJobs(Model.scanJobs(root.scanData), Model.unitJobs(root.units))
   // A panel opened before the first answer had no remotes to size; the slot
@@ -95,11 +116,58 @@ Singleton {
   property bool sizesPending: false
   property bool scanPending: false
   property bool versionsPending: false
+  property bool rootPending: false
 
+  // Each bounded run gets a fresh token, read back against the token it was
+  // armed with (Model.parseBounded), like the scan's.
   function refresh() {
     if (poll.running) { root.pollPending = true; return }
-    poll.command = Model.showArgv(root.remotes)
+    var token = Model.scanToken()
+    var argv = Model.pollArgv(root.remotes, token)
+    if (argv.length === 0) return
+    poll.token = token
+    poll.command = argv
     poll.running = true
+  }
+
+  // Only for a valid setting (Model.rootCheckArgv refuses anything else); the
+  // answer is kept with the path it was asked about.
+  function recheckRoot() {
+    var setting = Model.rootSetting(root.scanData, root.home)
+    if (!setting || setting.state !== "valid") return
+    if (rootProc.running) { root.rootPending = true; return }
+    var argv = Model.rootCheckArgv(setting.path, root.home)
+    if (argv.length === 0) return
+    rootProc.path = setting.path
+    rootProc.command = argv
+    rootProc.running = true
+  }
+
+  function applyRootCheck(text, path) {
+    var result = Model.parseRootCheck(text)
+    if (result === "") return
+    if (root.rootCheck.path !== path || root.rootCheck.result !== result) root.rootCheck = { path: path, result: result }
+  }
+
+  // Skipped while the scan (which reads the setting too) or an earlier read
+  // is running: the next poll asks again, so nothing is re-armed.
+  function rereadSetting() {
+    if (scan.running || settingProc.running) return
+    var token = Model.scanToken()
+    var argv = Model.settingArgv(root.home, token)
+    if (argv.length === 0) return
+    settingProc.token = token
+    settingProc.command = argv
+    settingProc.running = true
+  }
+
+  // A read cut by the timeout keeps the last setting.
+  function applySetting(text, token) {
+    var parsed = Model.parseSettingRead(text, token)
+    if (!parsed.ok) return
+    var next = Model.withSetting(root.scanData, parsed.setting)
+    if (JSON.stringify(next) !== JSON.stringify(root.scanData)) root.scanData = next
+    root.recheckRoot()
   }
 
   // A fresh token per run; the answer is read against the token it was armed
@@ -143,17 +211,27 @@ Singleton {
     if (JSON.stringify(parsed) !== JSON.stringify(root.scanData)) root.scanData = parsed
     root.scanError = ""
     root.scanned = true
+    root.recheckRoot()
   }
 
   function refreshSizes(force) {
     if (!force && !Model.duDue(root.openPanels.length, root.lastSizesMs, Date.now())) return
     if (root.openPanels.length === 0) return
     if (du.running) { root.sizesPending = true; return }
-    var argv = Model.duArgv(root.home, root.remotes)
+    var token = Model.scanToken()
+    var argv = Model.sizesArgv(root.home, root.remotes, token)
     if (argv.length === 0) return
     root.lastSizesMs = Date.now()
+    du.token = token
     du.command = argv
     du.running = true
+  }
+
+  // A du cut by the timeout keeps the last sizes.
+  function applySizes(text, token) {
+    var b = Model.parseBounded(text, token, Model.DU_MAX_CHARS)
+    if (!b.ok) return
+    root.sizes = Model.parseDu(b.text, root.home, root.remotes)
   }
 
   function settleSoon() { settle.restart() }
@@ -185,9 +263,15 @@ Singleton {
 
   // A working systemctl always answers with a block for Model.SENTINEL_UNIT,
   // which every poll names, so an answer without it is a failed poll
-  // (systemctl missing, user manager unreachable); the last good state is kept.
-  function applyPoll(text) {
-    var parsed = Model.parseShow(text)
+  // (systemctl missing, user manager unreachable); so is one cut by the
+  // timeout (no end line). Either way the last good state is kept.
+  function applyPoll(text, token) {
+    var answer = Model.parseBounded(text, token, Model.SHOW_MAX_CHARS)
+    if (!answer.ok) {
+      root.pollError = "systemctl --user show timed out"
+      return
+    }
+    var parsed = Model.parseShow(answer.text)
     if (!Object.prototype.hasOwnProperty.call(parsed, Model.SENTINEL_UNIT)) {
       root.pollError = "No answer from systemctl --user show"
       return
@@ -205,6 +289,8 @@ Singleton {
     if (key !== root.scanKey) {
       root.scanKey = key
       root.rescan()
+    } else if (Model.rootNeedsReread(root.rootStatus)) {
+      root.rereadSetting()
     }
   }
 
@@ -214,11 +300,14 @@ Singleton {
     return out
   }
 
+  // Bounded at the source: Model.pollArgv (timeout -k, head -c
+  // Model.SHOW_MAX_CHARS, an end line).
   Process {
     id: poll
+    property string token: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyPoll(text)
+      onStreamFinished: root.applyPoll(text, poll.token)
     }
     onRunningChanged: {
       if (poll.running || !root.pollPending) return
@@ -263,16 +352,45 @@ Singleton {
   }
 
   // du exits 1 when a cache dir is missing and still lists the others.
+  // Bounded like the poll: Model.sizesArgv (head -c Model.DU_MAX_CHARS).
   Process {
     id: du
+    property string token: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.sizes = Model.parseDu(text, root.home, root.remotes)
+      onStreamFinished: root.applySizes(text, du.token)
     }
     onRunningChanged: {
       if (du.running || !root.sizesPending) return
       root.sizesPending = false
       Qt.callLater(function() { root.refreshSizes(true) })
+    }
+  }
+
+  // Bounded like the scan: cloud.env's first Model.ROOT_SETTING_MAX_BYTES,
+  // under `timeout -k`; parseSettingRead refuses an answer over
+  // Model.SETTING_MAX_CHARS or without its end line.
+  Process {
+    id: settingProc
+    property string token: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applySetting(text, settingProc.token)
+    }
+  }
+
+  // One constant word on stdout, under `timeout -k`; no answer claims nothing.
+  Process {
+    id: rootProc
+    property string path: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyRootCheck(text, rootProc.path)
+    }
+    onRunningChanged: {
+      if (rootProc.running || !root.rootPending) return
+      root.rootPending = false
+      Qt.callLater(root.recheckRoot)
     }
   }
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.rsd.cloud-mounts",
   "name": "Cloud Mounts",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "author": "Raul Dias",
   "license": "MIT",
   "description": "State of the rclone-mount@ systemd user mounts, the rclone-bisync@ offline folders and the rclone-backup@ backups, with mount, unmount, open, sync, log and configure actions.",

@@ -20,7 +20,7 @@ import "Model.js" as Model
 // Actions, all argv arrays through Quickshell.execDetached or a Process (no
 // shell string carries a remote name; Model.isValidRemote gates every name):
 //   - toggle on:  systemctl --user start rclone-mount@<r>.service
-//   - toggle off: first, only then, `fuser -v -M -m /mnt/cloud/<r>` (who has
+//   - toggle off: first, only then, `fuser -v -M -m <root>/<r>` (who has
 //     files open; Model.FUSER_SCRIPT) and the pending-upload count
 //     (Model.PENDING_SCRIPT), each under `timeout -k`, the path as "$1".
 //     Nothing open and nothing pending: stop at once. Otherwise the row says
@@ -29,22 +29,28 @@ import "Model.js" as Model
 //     same stop: the unit's ExecStop is already a lazy `fusermount3 -uz`. No
 //     process is ever killed, no cache file deleted.
 //   - open folder: uwsm-app -- nautilus --new-window ~/Cloud/<r>
-//   - show log (failed units): journalctl --user -u <unit> -n 20, bounded.
+//   - show log (failed units): journalctl --user -u <unit> -n 20, bounded at
+//     the source (Model.logArgv: timeout -k, head -c, an end line); a run cut
+//     by the timeout shows Model.LOG_TIMED_OUT instead of staying on Loading….
 //   - Sync now: systemctl --user start --no-block rclone-bisync@<pair>.service,
 //     only while that pair's timer or path unit is enabled.
 //   - Configure… (also a right-click on the bar icon): omarchy-launch-tui
 //     --app-id=TUI.float ~/.local/bin/omarchy-cloud (Model.configureArgv says
 //     why not launch-or-focus), only once the scan has found the binary
 //     installed; until then a right-click opens the panel, which says why.
-//   - Update installed parts (shown while the parts install.sh installed are
-//     missing, unversioned or of another version than the plugin;
-//     Model.installState): omarchy-launch-tui --app-id=TUI.float bash -c
+//   - Set up… / Update installed parts (shown while the parts install.sh
+//     installed are missing, unversioned or of another version than the
+//     plugin, Model.installState, or while the mount root is not set up,
+//     Model.rootStatus; labelled Set up… for nothing installed or the root,
+//     Model.installButtonText): omarchy-launch-tui --app-id=TUI.float bash -c
 //     Model.INSTALL_SCRIPT with the plugin folder's install.sh as "$1", in a
 //     visible terminal that stays open on the result until Enter. The panel
-//     closes; the next opening reads the versions again.
+//     closes; the next opening reads the versions and the root again. Never
+//     run without that click.
 //
-// Every Text in this file declares textFormat: Text.PlainText (journal output
-// and file names are shown here); the model test counts them.
+// Every Text in this file declares textFormat: Text.PlainText (journal output,
+// file names and the mount-root setting are shown here); the model test
+// checks each Text block for its own declaration.
 Panel {
   id: root
   moduleName: "io.github.rsd.cloud-mounts"
@@ -94,7 +100,10 @@ Panel {
   // read, else none | unknown | mismatch | ok. Anything but ok puts a quiet
   // mark on the bar icon; an error still shows as the error.
   readonly property string installState: Model.installState(CloudState.versions)
-  readonly property string installNotice: Model.installNotice(CloudState.versions)
+  // Nothing installed, the mount root not set up, or the parts out of date
+  // (Model.setupNotice, in that order); the button's label follows it.
+  readonly property string installNotice: Model.setupNotice(CloudState.versions, CloudState.rootStatus, CloudState.rootSetting)
+  readonly property string installButtonText: Model.installButtonText(CloudState.versions, CloudState.rootStatus)
   readonly property bool canInstall: root.installNotice !== "" && CloudState.versions.installer === true && CloudState.pluginDir !== ""
   readonly property bool nothingSetUp: root.polled && root.rows.length === 0 && root.pairRows.length === 0 && root.jobRows.length === 0
 
@@ -177,7 +186,7 @@ Panel {
     root.stopPending = -1
     root.busyDone = false
     root.pendingDone = false
-    var busyArgv = Model.fuserArgv(row.name)
+    var busyArgv = Model.fuserArgv(row.name, CloudState.mountRoot)
     if (busyArgv.length > 0 && !busyCheck.running) {
       busyCheck.gen = root.checkGen
       busyCheck.command = busyArgv
@@ -232,10 +241,12 @@ Panel {
       root.logText = ""
       return
     }
-    var argv = Model.journalArgv(unit)
+    var token = Model.scanToken()
+    var argv = Model.logArgv(unit, token)
     if (argv.length === 0 || logProc.running) return
     root.logUnit = unit
     root.logText = "Loading…"
+    logProc.token = token
     logProc.command = argv
     logProc.running = true
   }
@@ -374,7 +385,7 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         if (busyCheck.gen !== root.checkGen || root.stopPhase !== "checking") return
-        root.stopBusy = Model.parseFuser(text, root.stopRemote)
+        root.stopBusy = Model.parseFuser(text, root.stopRemote, CloudState.mountRoot)
         root.busyDone = true
         root.checkDone()
       }
@@ -428,11 +439,14 @@ Panel {
     }
   }
 
+  // Bounded at the source (Model.logArgv); cut by the timeout, it says so
+  // (Model.logView) rather than staying on Loading….
   Process {
     id: logProc
+    property string token: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (root.logUnit !== "") root.logText = Model.formatLog(text)
+      onStreamFinished: if (root.logUnit !== "") root.logText = Model.logView(text, logProc.token)
     }
   }
 
@@ -680,9 +694,9 @@ Panel {
           PanelSeparator { foreground: root.foreground }
 
           // The installed parts are missing, unversioned or of another
-          // version: the line on its own, full width, and beneath it, on the
-          // right, the button that runs install.sh (hidden, not disabled,
-          // without the plugin's install.sh).
+          // version, or the mount root is not set up: the line on its own,
+          // full width, and beneath it, on the right, the button that runs
+          // install.sh (hidden, not disabled, without the plugin's install.sh).
           Column {
             visible: root.installNotice !== ""
             width: parent.width
@@ -702,7 +716,7 @@ Panel {
               id: installButton
               visible: root.canInstall
               anchors.right: parent.right
-              text: Model.INSTALL_BUTTON_TEXT
+              text: root.installButtonText
               iconText: Model.ICON.update
               tooltipText: "Runs install.sh from the plugin folder in a terminal"
               hasCursor: root.cursorActive && root.cursorAt === "install"

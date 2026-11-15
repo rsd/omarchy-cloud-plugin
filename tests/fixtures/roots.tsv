@@ -1,0 +1,45 @@
+# Mount roots: the ONE list of cases every root validator is tested against
+# (Rust validate::is_valid_root, the shared bash valid_root in bin/rclone-bisync,
+# bin/rclone-backup and install.sh, the bar's Model.js). Every test runs these
+# with HOME=/home/tester. Format: <valid|invalid><TAB><path>; "#" lines are
+# comments; an empty path field means the empty string.
+# Rule: absolute; not "/"; every component non-empty and not "." or ".." (so no
+# "//", no trailing "/"); no whitespace, control character, $ % \ " ' or `;
+# not $HOME, not inside $HOME (so never ~/Cloud); at most 255 bytes.
+valid	/mnt/cloud
+valid	/mnt/cloud-drives
+valid	/srv/cloud
+valid	/media/me/cloud
+valid	/mnt/a.b
+valid	/mnt/a..b
+valid	/opt/x_y-z
+valid	/home/other/cloud
+valid	/home/tester2/cloud
+valid	/home/testerCloud
+valid	/mnt
+invalid	
+invalid	/
+invalid	mnt/cloud
+invalid	./cloud
+invalid	~/cloud
+invalid	~
+invalid	/home/tester
+invalid	/home/tester/cloud
+invalid	/home/tester/Cloud
+invalid	/home/tester/.local/cloud
+invalid	/mnt/my cloud
+invalid	/mnt/$HOME
+invalid	/mnt/${X}
+invalid	/mnt/%h
+invalid	/mnt/a\b
+invalid	/mnt/"q"
+invalid	/mnt/'q'
+invalid	/mnt/`id`
+invalid	/mnt/../etc
+invalid	/mnt/cloud/..
+invalid	/mnt/./cloud
+invalid	/mnt/cloud/
+invalid	//mnt/cloud
+invalid	/mnt//cloud
+invalid	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+valid	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

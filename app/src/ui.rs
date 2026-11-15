@@ -247,10 +247,14 @@ pub fn draw(f: &mut Frame, app: &App) {
             }
             lines.push(Line::from(""));
             if let Some(e) = &form.error {
-                lines.push(Line::from(Span::styled(
-                    format!(" {e}"),
-                    level_style(Level::Error),
-                )));
+                // An error may carry instructions on several lines (the
+                // mount-root setup command).
+                for l in e.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {l}"),
+                        level_style(Level::Error),
+                    )));
+                }
             }
             lines.push(Line::from(Span::styled(
                 form_footer(form.has_choice()),
@@ -627,7 +631,11 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             vec![
                 kv(
                     "Mount",
-                    format!("/mnt/cloud/{}  (~/Cloud/{})", r.name, r.name),
+                    format!(
+                        "{}  (~/Cloud/{})",
+                        app.paths.mount_point(&r.name).display(),
+                        r.name
+                    ),
                 ),
                 kv(
                     "Unit",

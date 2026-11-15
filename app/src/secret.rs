@@ -1,6 +1,8 @@
 //! Secret holders. Their Debug output is `***`, they have no Display, and
-//! their memory is zeroed on drop (best effort: the OS pipe to rclone and
-//! rclone's own copies are outside this process's reach).
+//! their memory is zeroed on drop (best effort: rclone's own copies, once
+//! it reads rclone.conf, are outside this process's reach). A secret never
+//! goes on an argument vector: it is written into rclone.conf in-process
+//! (`app::set_client`).
 
 use std::fmt;
 use zeroize::Zeroize;
@@ -64,55 +66,12 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// An argument vector that carries a secret. Debug masks every argument
-/// that contains it; the vector is zeroed on drop.
-pub struct SecretArgv {
-    args: Vec<String>,
-    secret_index: usize,
-}
-
-impl SecretArgv {
-    pub fn new(args: Vec<String>, secret_index: usize) -> SecretArgv {
-        SecretArgv { args, secret_index }
-    }
-
-    pub fn expose(&self) -> &[String] {
-        &self.args
-    }
-}
-
 /// Removes the secret from `text` (e.g. a command's error output).
 pub fn scrub(text: &str, secret: &Secret) -> String {
     if secret.is_empty() {
         text.to_string()
     } else {
         text.replace(secret.expose(), "***")
-    }
-}
-
-impl Drop for SecretArgv {
-    fn drop(&mut self) {
-        for a in &mut self.args {
-            a.zeroize();
-        }
-    }
-}
-
-impl fmt::Debug for SecretArgv {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shown: Vec<&str> = self
-            .args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                if i == self.secret_index {
-                    "***"
-                } else {
-                    a.as_str()
-                }
-            })
-            .collect();
-        write!(f, "{shown:?}")
     }
 }
 
@@ -137,16 +96,13 @@ mod tests {
     }
 
     #[test]
-    fn secret_argv_debug_is_masked() {
+    fn scrub_masks_the_secret() {
         let mut s = Secret::new();
         for c in "hunter2".chars() {
             s.push(c);
         }
-        let a = SecretArgv::new(vec!["rclone".into(), "client_secret=hunter2".into()], 1);
-        let d = format!("{a:?}");
-        assert!(!d.contains("hunter2"), "{d}");
-        assert_eq!(d, r#"["rclone", "***"]"#);
         assert_eq!(scrub("error near hunter2!", &s), "error near ***!");
+        assert_eq!(scrub("nothing", &Secret::new()), "nothing");
     }
 
     #[test]

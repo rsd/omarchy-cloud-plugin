@@ -280,16 +280,21 @@ test("the scan: constant script, paths and bounds as positional arguments, token
   const argv = model.scanArgv(HOME, model.stateHome(HOME, ""), TOKEN)
   assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.SCAN_SCRIPT, "cloud-mounts-scan", TOKEN,
     String(model.SCAN_FILE_MAX_BYTES), String(model.SCAN_MAX_FILES), "/home/u/.local/bin/omarchy-cloud",
+    "/home/u/.config/omarchy-cloud/cloud.env", String(model.ROOT_SETTING_MAX_BYTES),
     DIRS.bisyncConf, DIRS.backupConf, DIRS.bisyncState, DIRS.backupState])
+  assert.strictEqual(model.ROOT_SETTING_MAX_BYTES, 4096)
   // The script expands only its own variables and positional parameters.
   const vars = new Set([...model.SCAN_SCRIPT.matchAll(/\$\{?([A-Za-z_]\w*|[0-9@#?])/g)].map(m => m[1]))
-  assert.deepStrictEqual([...vars].sort(), ["1", "2", "3", "4", "@", "a", "c", "d", "f", "l", "m", "n", "s", "t"])
-  for (const v of ["a", "c", "d", "f", "l", "m", "s", "t"]) assert.ok(new RegExp("(^|\\s)" + v + "=|for " + v + " in|read -r " + v + ";").test(model.SCAN_SCRIPT), v + " is assigned")
+  assert.deepStrictEqual([...vars].sort(), ["1", "2", "3", "4", "5", "6", "@", "a", "c", "d", "e", "f", "l", "m", "n", "r", "s", "t"])
+  for (const v of ["a", "c", "d", "e", "f", "l", "m", "r", "s", "t"]) assert.ok(new RegExp("(^|\\s)" + v + "=|for " + v + " in|read -r " + v + ";").test(model.SCAN_SCRIPT), v + " is assigned")
   // Every expansion of a value is quoted, except the first line's assignments
   // (no word splitting there) and the arithmetic on the counter.
   const body = model.SCAN_SCRIPT.split("\n")
-  assert.strictEqual(body[0], "t=$1 c=$2 m=$3 a=$4")
-  assert.ok(!/[^"(]\$[a-z@1-4]/.test(body.slice(1).join("\n").replace(/\$\(\(n \+ 1\)\)/, "").replace(/\$\(wc -c <"\$f"\)/, "")), model.SCAN_SCRIPT)
+  assert.strictEqual(body[0], "t=$1 c=$2 m=$3 a=$4 e=$5 r=$6")
+  assert.ok(!/[^"(]\$[a-z@1-6]/.test(body.slice(1).join("\n").replace(/\$\(\(n \+ 1\)\)/, "").replace(/\$\(wc -c <"\$[fe]"\)/g, "")), model.SCAN_SCRIPT)
+  // The mount-root setting: a regular file, bounded like the others.
+  assert.ok(/if \[ -f "\$e" \] && s=\$\(wc -c <"\$e"\); then/.test(model.SCAN_SCRIPT), "the setting: regular file only")
+  assert.ok(/head -c "\$r" -- "\$e"/.test(model.SCAN_SCRIPT), "the setting read bounded")
   // Regular files only; a symlink is followed to one (the helper scripts
   // follow it too), a FIFO, device, directory or dangling link is skipped.
   assert.ok(/\[ -f "\$f" \] \|\| continue/.test(model.SCAN_SCRIPT), "regular files only")
@@ -298,12 +303,11 @@ test("the scan: constant script, paths and bounds as positional arguments, token
   assert.ok(model.SCAN_SCRIPT.includes("systemctl --user list-unit-files --no-legend --plain -- 'rclone-bisync@.service' 'rclone-backup@.service' 2>/dev/null | head -n " + model.TEMPLATE_MAX_LINES + " | while IFS= read -r l; do printf '%s unitfile %s\\n' \"$t\" \"$l\"; done"))
   for (const u of [model.BISYNC_TEMPLATE, model.BACKUP_TEMPLATE]) assert.ok(/^[a-z-]+@\.service$/.test(u), u)
   assert.ok(/head -c "\$c" -- "\$f"/.test(model.SCAN_SCRIPT), "each file read bounded")
-  // XDG_STATE_HOME: used when clean and absolute, else the default; state and
+  // State is HOME-fixed: an XDG_STATE_HOME value is never used; state and
   // config directories are listed once each.
-  assert.strictEqual(model.stateHome(HOME, "/x/state"), "/x/state")
-  for (const bad of ["", "relative", "/a/../b", "/a\nb", null, undefined]) assert.strictEqual(model.stateHome(HOME, bad), "/home/u/.local/state", String(bad))
+  for (const x of ["/x/state", "", "relative", "/a/../b", "/a\nb", null, undefined]) assert.strictEqual(model.stateHome(HOME, x), "/home/u/.local/state", String(x))
   assert.strictEqual(model.stateHome("", ""), "")
-  assert.deepStrictEqual(model.scanArgv(HOME, "/home/u/.config", TOKEN).slice(12), [DIRS.bisyncConf, DIRS.backupConf])
+  assert.deepStrictEqual(model.scanArgv(HOME, "/home/u/.config", TOKEN).slice(14), [DIRS.bisyncConf, DIRS.backupConf])
   // No argv without a usable home or with a token not of the expected shape.
   for (const bad of ["", "relative", "/a/../b"]) assert.deepStrictEqual(model.scanArgv(bad, "/x", TOKEN), [], String(bad))
   for (const bad of ["", "x", "cmscan-short", "cmscan-ABCDEFGHIJKLMN", "cmscan-abcdefghijkl0123 end", null])
@@ -312,7 +316,8 @@ test("the scan: constant script, paths and bounds as positional arguments, token
   const weird = "/tmp/$(touch x) `y`; z"
   const w = model.scanArgv(weird, model.stateHome(weird, ""), TOKEN)
   assert.strictEqual(w[6], model.SCAN_SCRIPT)
-  assert.ok(w.slice(11).every(a => a.indexOf(weird) === 0))
+  assert.ok([w[11], w[12]].concat(w.slice(14)).every(a => a.indexOf(weird) === 0))
+  assert.strictEqual(w[13], String(model.ROOT_SETTING_MAX_BYTES))
   // Tokens are drawn fresh and match the accepted shape.
   const t1 = model.scanToken(), t2 = model.scanToken()
   assert.ok(model.SCAN_TOKEN_RE.test(t1) && model.SCAN_TOKEN_RE.test(t2) && t1 !== t2, t1 + " " + t2)
@@ -1103,7 +1108,7 @@ test("installed parts: read on attach and opening only, launched visibly, quiet 
   // Launched like Configure…: detached, the panel closes.
   assert.ok(/function updateInstalled\(\) \{\s*if \(!root\.canInstall\) return\s*var argv = Model\.installArgv\(CloudState\.pluginDir\)\s*if \(argv\.length === 0\) return\s*Quickshell\.execDetached\(argv\)\s*root\.close\(\)/.test(bar))
   assert.ok(/else if \(a\.kind === "install"\) root\.updateInstalled\(\)/.test(bar))
-  assert.ok(/text: Model\.INSTALL_BUTTON_TEXT/.test(bar) && /hasCursor: root\.cursorActive && root\.cursorAt === "install"/.test(bar))
+  assert.ok(/text: root\.installButtonText\n/.test(bar) && /hasCursor: root\.cursorActive && root\.cursorAt === "install"/.test(bar))
   assert.ok(/canInstall: root\.canInstall,/.test(bar))
   // Right-click: Configure… once installed, else the panel; left toggles.
   assert.ok(/onPressed: function\(b\) \{ root\.pressButton\(b\) \}/.test(bar))
@@ -1138,13 +1143,50 @@ test("every CloudState.<name> the widget uses exists in CloudState.qml", () => {
   assert.ok(/^pragma Singleton$/m.test(fs.readFileSync(path.join(pluginDir, "CloudState.qml"), "utf8")))
 })
 
-test("every Text declares textFormat: Text.PlainText", () => {
+// The body of the QML block whose "{" is at `open`, with every nested block
+// and string literal blanked out: what is left are the block's own
+// properties.
+const ownBody = (qml, open) => {
+  let depth = 0, out = ""
+  for (let i = open; i < qml.length; i++) {
+    const c = qml[i]
+    if (c === '"' || c === "'") {
+      let j = i + 1
+      while (j < qml.length && qml[j] !== c) j += qml[j] === "\\" ? 2 : 1
+      if (depth === 1) out += c + c
+      i = j
+      continue
+    }
+    if (c === "{") { depth++; if (depth === 1) continue }
+    if (c === "}") { depth--; if (depth === 0) return out; continue }
+    if (depth === 1) out += c
+  }
+  throw new Error("unbalanced block at " + open)
+}
+// Every Text block in a QML source: [line, own body].
+const textBlocks = (qml) => [...qml.matchAll(/(^|[\s:])Text\s*\{/gm)].map(m => {
+  const open = m.index + m[0].length - 1
+  return [qml.slice(0, open).split("\n").length, ownBody(qml, open)]
+})
+
+test("every Text declares textFormat: Text.PlainText, each in its own block", () => {
+  let total = 0
   for (const file of qmlFiles) {
     const qml = qmlCode(file)
-    const texts = (qml.match(/(^|[\s:])Text\s*\{/gm) || []).length
-    const plain = (qml.match(/textFormat:\s*Text\.PlainText/g) || []).length
-    assert.strictEqual(plain, texts, file + ": " + texts + " Text items, " + plain + " PlainText declarations")
+    for (const [line, body] of textBlocks(qml)) {
+      total++
+      const own = (body.match(/(^|[\s;])textFormat:\s*Text\.PlainText\b/g) || []).length
+      assert.strictEqual(own, 1, file + ":" + line + ": a Text with " + own + " own textFormat: Text.PlainText")
+      assert.ok(!/textFormat:\s*Text\.(AutoText|StyledText|RichText|MarkdownText)/.test(body), file + ":" + line)
+    }
   }
+  assert.ok(total >= 20, "Text blocks found: " + total)
+  // The check is per block: a Text with two declarations does not cover one
+  // with none, and a nested child's declaration is not its parent's.
+  const doubled = "Item {\n  Text {\n    textFormat: Text.PlainText\n    textFormat: Text.PlainText\n  }\n  Text {\n    text: \"{ }\"\n  }\n}"
+  assert.deepStrictEqual(textBlocks(doubled).map(([, b]) => (b.match(/textFormat:\s*Text\.PlainText/g) || []).length), [2, 0])
+  const nested = "Text {\n  text: \"a\"\n  Item { Text { textFormat: Text.PlainText } }\n}"
+  assert.deepStrictEqual(textBlocks(nested).map(([, b]) => (b.match(/textFormat:\s*Text\.PlainText/g) || []).length), [0, 1])
 })
 
 test("theme colours are read as Commons.Color, never a bare Color", () => {
@@ -1231,7 +1273,7 @@ test("panel: stable rows, theme tokens, capped height, dim hero, no dead tooltip
   // The install hint is a hint, not an alarm.
   assert.ok(/text: root\.installNotice !== "" \? "" : Model\.configureHint\(CloudState\.scanned, root\.appInstalled\)\s*textFormat: Text\.PlainText\s*wrapMode: Text\.Wrap\s*color: root\.dim/.test(bar), "install hint in the dim colour")
   // The poll is armed with the remotes only (pairs and jobs are globbed).
-  assert.ok(/poll\.command = Model\.showArgv\(root\.remotes\)/.test(qmlCode("CloudState.qml")))
+  assert.ok(/var argv = Model\.pollArgv\(root\.remotes, token\)[\s\S]{0,80}poll\.command = argv/.test(qmlCode("CloudState.qml")))
   assert.ok(/function configure\(\) \{\s*if \(!root\.appInstalled\) return/.test(bar))
   assert.ok(/function syncNow\(pair\) \{[\s\S]{0,120}if \(!row \|\| !row\.canSync\) return/.test(bar), "Sync now only while enabled")
   assert.ok(!/KeePass|vault-A|KEEPASS/i.test(bar.replace(/\/\/.*$/gm, "")), "no hardcoded KeePass section")
@@ -1400,6 +1442,392 @@ test("#14 the pending script says unknown, never 0, when the cache cannot be rea
   assert.strictEqual(model.stopDecision(idle, model.parsePendingCount("unknown")), "confirm")
   assert.strictEqual(model.stopDecision(idle, 0), "stop")
   assert.ok(/could not be counted/.test(model.stopPrompt("gdrive", idle, -1)))
+})
+
+// ------------------------------------------------------- 0.3.5: mount root
+
+test("D1 roots: every line of tests/fixtures/roots.tsv, HOME=/home/tester", () => {
+  let n = 0
+  for (const line of fs.readFileSync(path.join(pluginDir, "tests/fixtures/roots.tsv"), "utf8").split("\n")) {
+    if (line === "" || line.startsWith("#")) continue
+    const tab = line.indexOf("\t")
+    assert.ok(tab > 0, JSON.stringify(line))
+    const kind = line.slice(0, tab), root = line.slice(tab + 1)
+    assert.ok(kind === "valid" || kind === "invalid", line)
+    assert.strictEqual(model.isValidRoot(root, "/home/tester"), kind === "valid", JSON.stringify(line))
+    assert.strictEqual(model.isValidRoot(root, "/home/tester/"), kind === "valid", "trailing slash on HOME: " + JSON.stringify(line))
+    n++
+  }
+  assert.ok(n >= 30, "fixture read: " + n)
+  for (const v of [null, undefined, 1, {}, ["/mnt/cloud"]]) assert.strictEqual(model.isValidRoot(v, "/home/tester"), false, String(v))
+  // Byte length, not characters; non-ASCII allowed; every control byte refused.
+  assert.ok(model.isValidRoot("/mnt/é", "/home/tester"))
+  assert.ok(model.isValidRoot("/" + "é".repeat(127), "/home/tester"), "255 bytes")
+  assert.ok(!model.isValidRoot("/" + "é".repeat(127) + "a", "/home/tester"), "256 bytes")
+  for (let c = 0; c <= 0x20; c++) assert.ok(!model.isValidRoot("/mnt/a" + String.fromCharCode(c) + "b", "/home/tester"), "byte " + c)
+  assert.ok(!model.isValidRoot("/mnt/a\u007fb", "/home/tester"))
+  // Without a usable HOME only the home rule is skipped (the scripts' rule).
+  assert.ok(model.isValidRoot("/home/tester/cloud", ""))
+  for (const h of ["", "/", "//"]) {
+    assert.strictEqual(model.isValidRoot("/mnt/x", h), true, "HOME " + JSON.stringify(h))
+    assert.strictEqual(model.isValidRoot("/mnt/../x", h), false, "HOME " + JSON.stringify(h))
+  }
+  assert.ok(!model.isValidRoot("/", ""))
+})
+
+// A scan with the setting file `content` (undefined: no file).
+const scanWithSetting = (content, o) => {
+  const opt = o || {}
+  let out = TOKEN + " app\n"
+  if (content !== undefined) {
+    const size = opt.size !== undefined ? opt.size : Buffer.byteLength(content)
+    out += TOKEN + " setting " + size + "\n" + content + "\n" + TOKEN + " eof\n"
+  }
+  return model.parseScan(out + TOKEN + " end\n", TOKEN, model.scanDirs("/home/tester", "/home/tester/.local/state"))
+}
+
+test("D1 the root is parsed from cloud.env (never sourced) and mountPath follows it", () => {
+  const setting = (content, o) => model.rootSetting(scanWithSetting(content, o), "/home/tester")
+  assert.deepStrictEqual(setting("OMARCHY_CLOUD_ROOT=/srv/cloud\n"), { state: "valid", path: "/srv/cloud", value: "/srv/cloud" })
+  assert.deepStrictEqual(setting(undefined), { state: "absent", path: "/mnt/cloud", value: "" })
+  assert.deepStrictEqual(setting("# nothing\n\nOTHER=/srv/x\n"), { state: "absent", path: "/mnt/cloud", value: "" })
+  // CRLF, comments, blank lines; the last line of the key wins (systemd).
+  assert.strictEqual(setting("# root\r\n\r\nOMARCHY_CLOUD_ROOT=/srv/a\r\nOMARCHY_CLOUD_ROOT=/srv/b\r\n").path, "/srv/b")
+  // Verbatim: no quote stripping, no trimming, no expansion, so these are invalid.
+  for (const raw of ['"/srv/cloud"', "'/srv/cloud'", "/srv/cloud ", " /srv/cloud", "$HOME/cloud", "~/cloud", "/home/tester/Cloud", "", "/srv/cloud/"]) {
+    const s = setting("OMARCHY_CLOUD_ROOT=" + raw + "\n")
+    assert.deepStrictEqual(s, { state: "invalid", path: "/mnt/cloud", value: raw }, JSON.stringify(raw))
+  }
+  // Only a line that starts with the key counts.
+  assert.strictEqual(setting(" OMARCHY_CLOUD_ROOT=/srv/a\nexport OMARCHY_CLOUD_ROOT=/srv/b\n#OMARCHY_CLOUD_ROOT=/srv/c\n").state, "absent")
+  // A file larger than the read keeps its cut last line, as the bash and Rust
+  // readers do (C1): the partial line is a line like any other.
+  assert.strictEqual(setting("OMARCHY_CLOUD_ROOT=/srv/a\nOMARCHY_CLOUD_ROOT=/srv/cut", { size: 99999 }).path, "/srv/cut")
+  // Every line within the byte bound counts: no line cap (a key line after
+  // 1000 short comment lines still wins).
+  assert.strictEqual(setting("OMARCHY_CLOUD_ROOT=/srv/a\n" + "#\n".repeat(1000) + "OMARCHY_CLOUD_ROOT=/srv/late\n").path, "/srv/late")
+  assert.strictEqual(setting("\n".repeat(4000) + "OMARCHY_CLOUD_ROOT=/srv/late\n").path, "/srv/late")
+  assert.deepStrictEqual(model.parseRootSetting(Array(500).fill("#").concat(["OMARCHY_CLOUD_ROOT=/srv/late"])), { found: true, value: "/srv/late" })
+  // The marker is the token's: a forged one inside a conf is content.
+  const forged = model.parseScan(TOKEN + " file 40 /home/tester/.config/rclone-bisync/p.conf\ncmscan-zzzzzzzzzzzz setting 30\nOMARCHY_CLOUD_ROOT=/srv/evil\n"
+    + TOKEN + " eof\n" + TOKEN + " end\n", TOKEN, model.scanDirs("/home/tester", "/home/tester/.local/state"))
+  assert.strictEqual(model.rootSetting(forged, "/home/tester").state, "absent")
+  // A HOME that is "" or "/" skips only the home rule (bash and Rust agree).
+  for (const h of ["", "/"]) {
+    assert.deepStrictEqual(model.rootSetting(scanWithSetting("OMARCHY_CLOUD_ROOT=/mnt/x\n"), h), { state: "valid", path: "/mnt/x", value: "/mnt/x" }, "HOME " + JSON.stringify(h))
+    assert.strictEqual(model.rootSetting(scanWithSetting("OMARCHY_CLOUD_ROOT=/mnt/x/\n"), h).state, "invalid")
+  }
+  // Nothing is claimed before a good scan.
+  assert.strictEqual(model.rootSetting(model.emptyScan(), "/home/tester"), null)
+  assert.strictEqual(model.rootSetting(null, "/home/tester"), null)
+  // mountPath and the stop checks follow the root in use; the default without one.
+  const valid = setting("OMARCHY_CLOUD_ROOT=/srv/cloud\n")
+  assert.strictEqual(model.mountRoot(valid), "/srv/cloud")
+  assert.strictEqual(model.mountPath("gdrive", model.mountRoot(valid)), "/srv/cloud/gdrive")
+  assert.deepStrictEqual(model.fuserArgv("gdrive", model.mountRoot(valid)).slice(-1), ["/srv/cloud/gdrive"])
+  assert.strictEqual(model.parseFuser("/srv/cloud/gdrive:  kernel mount /srv/cloud/gdrive\ncloud-mounts-fuser-exit 0\n", "gdrive", "/srv/cloud").known, true)
+  for (const none of [null, setting(undefined), setting("OMARCHY_CLOUD_ROOT=relative\n")]) {
+    assert.strictEqual(model.mountRoot(none), "/mnt/cloud")
+    assert.strictEqual(model.mountPath("gdrive", model.mountRoot(none)), "/mnt/cloud/gdrive")
+  }
+  assert.strictEqual(model.mountPath("gdrive"), "/mnt/cloud/gdrive")
+  assert.strictEqual(model.mountPath("gdrive", "/a/../b"), "/mnt/cloud/gdrive", "an invalid root is never used")
+  assert.strictEqual(model.mountPath("../x", "/srv/cloud"), "")
+  assert.strictEqual(model.DEFAULT_MOUNT_ROOT, "/mnt/cloud")
+  assert.ok(!/\/mnt\/cloud/.test(source.replace(/\/\/.*$/gm, "").replace(/var DEFAULT_MOUNT_ROOT = "\/mnt\/cloud"/, "")), "no other literal /mnt/cloud in Model.js code")
+})
+
+test("D1 the root check: the root as its own argument, never in the script", () => {
+  const argv = model.rootCheckArgv("/srv/cloud", "/home/tester")
+  assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.ROOT_CHECK_SCRIPT, "cloud-mounts-root", "/srv/cloud"])
+  assert.ok(/^if \[ -d "\$1" \] && \[ -w "\$1" \] && \[ -x "\$1" \]; then echo root-ok; else echo root-missing; fi$/.test(model.ROOT_CHECK_SCRIPT), model.ROOT_CHECK_SCRIPT)
+  // Only a valid root (the home rule included) is ever checked.
+  for (const line of fs.readFileSync(path.join(pluginDir, "tests/fixtures/roots.tsv"), "utf8").split("\n")) {
+    if (line === "" || line.startsWith("#")) continue
+    const root = line.slice(line.indexOf("\t") + 1)
+    const a = model.rootCheckArgv(root, "/home/tester")
+    if (line.startsWith("valid\t")) {
+      assert.strictEqual(a[a.length - 1], root, root)
+      assert.strictEqual(a.filter(x => x.includes(root)).length, 1, "the root is one element: " + root)
+      assert.ok(!model.ROOT_CHECK_SCRIPT.includes(root))
+    } else assert.deepStrictEqual(a, [], JSON.stringify(root))
+  }
+  // A HOME that is "" or "/" skips only the home rule, as bash and Rust do.
+  for (const h of ["", "/"]) {
+    assert.deepStrictEqual(model.rootCheckArgv("/srv/cloud", h).slice(-1), ["/srv/cloud"], "HOME " + JSON.stringify(h))
+    assert.deepStrictEqual(model.rootCheckArgv("/srv/a/../b", h), [], "still the other rules")
+  }
+  // Through a real sh: a writable dir is ok, a missing or read-only one is
+  // missing, and a crafted (valid) root runs nothing.
+  const cp = require("child_process")
+  const os = require("os")
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "root-"))
+  const check = (root) => {
+    const a = model.rootCheckArgv(root, "/home/tester")
+    return model.parseRootCheck(cp.spawnSync(a[0], a.slice(1), { encoding: "utf8", cwd: tmp }).stdout)
+  }
+  try {
+    assert.strictEqual(check(tmp), "ok")
+    assert.strictEqual(check(tmp + "/missing"), "missing")
+    fs.writeFileSync(path.join(tmp, "file"), "")
+    assert.strictEqual(check(tmp + "/file"), "missing", "a file is not a root")
+    if (process.getuid && process.getuid() !== 0) {
+      fs.mkdirSync(path.join(tmp, "ro"), { mode: 0o500 })
+      assert.strictEqual(check(tmp + "/ro"), "missing", "not writable")
+    }
+    const crafted = tmp + "/a;touch.PWNED;(id)>PWNED2|x&y"
+    assert.ok(model.isValidRoot(crafted, "/home/tester"), crafted)
+    assert.strictEqual(check(crafted), "missing")
+    assert.ok(!fs.existsSync(path.join(tmp, "PWNED2")) && !fs.readdirSync(tmp).some(f => /PWNED/.test(f)), "nothing in the root ran")
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }) }
+  for (const bad of ["", "root-ok", "root-ok\nroot-ok\n", "ok\n", null, "root-missing \n"]) assert.strictEqual(model.parseRootCheck(bad), "", String(bad))
+  // The status: absent / invalid from the setting; a valid one by its check,
+  // and only the check of that path.
+  const valid = { state: "valid", path: "/srv/cloud", value: "/srv/cloud" }
+  assert.strictEqual(model.rootStatus(null, null), "")
+  assert.strictEqual(model.rootStatus({ state: "absent", path: "/mnt/cloud" }, null), "absent")
+  assert.strictEqual(model.rootStatus({ state: "invalid", path: "/mnt/cloud" }, { path: "/mnt/cloud", result: "ok" }), "invalid")
+  assert.strictEqual(model.rootStatus(valid, null), "")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/old", result: "ok" }), "")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "missing" }), "missing")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "ok" }), "ok")
+})
+
+test("D5 the notice: not installed, mount root not set up, out of date; Set up… while not installed", () => {
+  const vNone = { ok: true, plugin: "0.3.5", installedPresent: false, legacy: false, installedVersion: "" }
+  const vOk = { ok: true, plugin: "0.3.5", installedPresent: true, legacy: false, installedVersion: "0.3.5" }
+  const vOld = { ok: true, plugin: "0.3.5", installedPresent: true, legacy: false, installedVersion: "0.3.4" }
+  const absent = { state: "absent", path: "/mnt/cloud", value: "" }
+  const invalid = { state: "invalid", path: "/mnt/cloud", value: "~/my\u0007cloud" }
+  const valid = { state: "valid", path: "/srv/cloud", value: "/srv/cloud" }
+  const NOT_SET = "Mount root not set up: "
+  assert.strictEqual(model.setupNotice(vOk, "absent", absent),
+    "Mount root not set up: no root chosen yet (the default is /mnt/cloud) — run Set up…")
+  assert.strictEqual(model.setupNotice(vOk, "invalid", invalid),
+    "Mount root not set up: the setting ~/mycloud in ~/.config/omarchy-cloud/cloud.env is not a valid root — run Set up…")
+  assert.strictEqual(model.setupNotice(vOk, "invalid", { state: "invalid", path: "/mnt/cloud", value: "" }),
+    "Mount root not set up: the setting (empty) in ~/.config/omarchy-cloud/cloud.env is not a valid root — run Set up…")
+  assert.strictEqual(model.setupNotice(vOk, "missing", valid),
+    "Mount root not set up: /srv/cloud does not exist or is not writable — run Set up…, or create it once with: sudo install -d -o \"$USER\" -m 755 '/srv/cloud'")
+  assert.strictEqual(model.setupNotice(vOk, "ok", valid), "")
+  assert.strictEqual(model.setupNotice(vOk, "", null), "", "nothing claimed before the scan")
+  // Nothing installed comes first; then the root; then the version.
+  assert.strictEqual(model.setupNotice(vNone, "absent", absent), model.INSTALL_NOTICE_NONE)
+  assert.ok(model.setupNotice(vOld, "missing", valid).startsWith(NOT_SET))
+  assert.strictEqual(model.setupNotice(vOld, "ok", valid), "Installed parts are 0.3.4, plugin is 0.3.5 — run install.sh")
+  assert.ok(model.setupNotice(model.emptyVersions(), "absent", absent).startsWith(NOT_SET), "the root notice does not wait for the versions")
+  // The label: Set up… while nothing is installed or the root is not set up.
+  assert.strictEqual(model.SETUP_BUTTON_TEXT, "Set up…")
+  assert.strictEqual(model.installButtonText(vNone, ""), "Set up…")
+  assert.strictEqual(model.installButtonText(vNone, "ok"), "Set up…")
+  for (const st of ["absent", "invalid", "missing"]) assert.strictEqual(model.installButtonText(vOk, st), "Set up…", st)
+  assert.strictEqual(model.installButtonText(vOld, "ok"), "Update installed parts")
+  assert.strictEqual(model.installButtonText(vOld, ""), "Update installed parts")
+  // The tooltip (a shell component with no plain-text setting) gets a fixed
+  // line, never the root or the raw setting.
+  const hostile = { state: "valid", path: "/mnt/<b>x</b>", value: "/mnt/<b>x</b>" }
+  assert.ok(model.isValidRoot(hostile.path, "/home/tester"))
+  const tip = model.tooltipText([], null, null, true, "", model.setupNotice(vOk, "missing", hostile), false)
+  assert.strictEqual(tip, "Cloud Mounts: No rclone-mount units found\nMount root not set up — open the panel\nClick to manage")
+  assert.strictEqual(model.installTipLine(model.setupNotice(vOk, "invalid", { state: "invalid", path: "/mnt/cloud", value: "<img src=x>" })),
+    "Mount root not set up — open the panel")
+  // The one-time command, as the user's shell reads it: "$USER" expanded
+  // there, the path one argument whatever it holds.
+  const cp = require("child_process")
+  for (const p of ["/srv/cloud", "/mnt/a'b", "/mnt/a b;$(id)`x`"]) {
+    const out = cp.spawnSync("bash", ["-c", 'sudo() { printf "%s\\n" "$@"; }; USER=tester; eval "$1"', "_", model.setupCommand(p)], { encoding: "utf8" }).stdout
+    assert.strictEqual(out, ["install", "-d", "-o", "tester", "-m", "755", p].join("\n") + "\n", p)
+  }
+})
+
+test("D5 the panel: the same button, its label from the model, run only on a click", () => {
+  const bar = qmlCode("BarWidget.qml")
+  const state = qmlCode("CloudState.qml")
+  assert.ok(/readonly property string installNotice: Model\.setupNotice\(CloudState\.versions, CloudState\.rootStatus, CloudState\.rootSetting\)/.test(bar))
+  assert.ok(/readonly property string installButtonText: Model\.installButtonText\(CloudState\.versions, CloudState\.rootStatus\)/.test(bar))
+  assert.ok(/id: installButton[\s\S]{0,200}text: root\.installButtonText\s*iconText: Model\.ICON\.update\s*tooltipText: "Runs install\.sh from the plugin folder in a terminal"/.test(bar), "label from the model, tooltip kept")
+  // install.sh only from the button or the cursor on it, never on its own.
+  assert.strictEqual((bar.match(/root\.updateInstalled\(\)/g) || []).length, 2)
+  assert.ok(/onClicked: root\.updateInstalled\(\)/.test(bar) && /a\.kind === "install"\) root\.updateInstalled\(\)/.test(bar))
+  assert.strictEqual((bar.match(/Model\.installArgv\(/g) || []).length, 1)
+  assert.ok(!/installArgv/.test(state))
+  // The singleton: the setting from the scan, the root in use, the check.
+  assert.ok(/readonly property var rootSetting: root\.scanned \? Model\.rootSetting\(root\.scanData, root\.home\) : null/.test(state))
+  assert.ok(/readonly property string mountRoot: Model\.mountRoot\(root\.rootSetting\)/.test(state))
+  assert.ok(/readonly property string rootStatus: Model\.rootStatus\(root\.rootSetting, root\.rootCheck\)/.test(state))
+  assert.ok(/root\.scanned = true\s*root\.recheckRoot\(\)/.test(state), "checked after each good scan")
+  assert.ok(/if \(!setting \|\| setting\.state !== "valid"\) return/.test(state))
+  assert.ok(/var argv = Model\.rootCheckArgv\(setting\.path, root\.home\)\s*if \(argv\.length === 0\) return\s*rootProc\.path = setting\.path\s*rootProc\.command = argv/.test(state))
+  assert.ok(/if \(rootProc\.running\) \{ root\.rootPending = true; return \}/.test(state))
+  // The stop checks use the root in use.
+  assert.ok(/Model\.fuserArgv\(row\.name, CloudState\.mountRoot\)/.test(bar))
+  assert.ok(/Model\.parseFuser\(text, root\.stopRemote, CloudState\.mountRoot\)/.test(bar))
+})
+
+test("D5 the root notice clears on the next poll after Set up or the sudo command", () => {
+  // Only a root that is not set up costs a poll anything extra.
+  for (const s of ["absent", "invalid", "missing"]) assert.strictEqual(model.rootNeedsReread(s), true, s)
+  for (const s of ["ok", "", undefined, null]) assert.strictEqual(model.rootNeedsReread(s), false, String(s))
+  // The read is SCAN_SCRIPT's own, the path its own argument.
+  const argv = model.settingArgv("/home/tester", TOKEN)
+  assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.SETTING_SCRIPT, "cloud-mounts-setting", TOKEN,
+    "/home/tester/.config/omarchy-cloud/cloud.env", "4096"])
+  for (const line of model.SETTING_READ_LINES) {
+    assert.ok(model.SCAN_SCRIPT.split("\n").includes(line), line)
+    assert.ok(model.SETTING_SCRIPT.split("\n").includes(line), line)
+  }
+  assert.ok(/^t=\$1 e=\$2 r=\$3\n[\s\S]*\nprintf '%s end\\n' "\$t"$/.test(model.SETTING_SCRIPT), model.SETTING_SCRIPT)
+  assert.deepStrictEqual(model.settingArgv("", TOKEN), [])
+  assert.deepStrictEqual(model.settingArgv("/home/tester", "bad token"), [])
+  // Its answer: refused without its end line, over the bound or with another token.
+  const ans = (body, tok) => (body === undefined ? "" : TOKEN + " setting " + Buffer.byteLength(body) + "\n" + body + "\n" + TOKEN + " eof\n") + (tok || TOKEN) + " end\n"
+  assert.deepStrictEqual(model.parseSettingRead(ans("OMARCHY_CLOUD_ROOT=/srv/c\n"), TOKEN), { ok: true, setting: { found: true, value: "/srv/c" } })
+  assert.deepStrictEqual(model.parseSettingRead(ans(undefined), TOKEN), { ok: true, setting: { found: false, value: "" } })
+  assert.strictEqual(model.parseSettingRead(ans("OMARCHY_CLOUD_ROOT=/srv/c\n").replace(/[^\n]*end\n$/, ""), TOKEN).ok, false)
+  assert.strictEqual(model.parseSettingRead(ans("OMARCHY_CLOUD_ROOT=/srv/c\n", "cmscan-zzzzzzzzzzzz"), TOKEN).ok, false)
+  assert.strictEqual(model.parseSettingRead(ans("#".repeat(model.SETTING_MAX_CHARS)), TOKEN).ok, false)
+  // withSetting: only over a good scan, the rest of the scan untouched.
+  assert.strictEqual(model.withSetting(model.emptyScan(), { found: true, value: "/srv/c" }).setting.found, false)
+  // Through a real sh, as the poll runs it: Set up writes cloud.env, the
+  // user creates the root; each clears the notice on the next poll.
+  const cp = require("child_process")
+  const os = require("os")
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "home-"))
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "root-")) + "/cloud"
+  const run = a => cp.spawnSync(a[0], a.slice(1), { encoding: "utf8" }).stdout
+  const reread = scan => {
+    const r = model.parseSettingRead(run(model.settingArgv(home, TOKEN)), TOKEN)
+    assert.strictEqual(r.ok, true)
+    return model.withSetting(scan, r.setting)
+  }
+  const status = scan => {
+    const setting = model.rootSetting(scan, home)
+    const a = setting.state === "valid" ? model.rootCheckArgv(setting.path, home) : []
+    return model.rootStatus(setting, { path: setting.path, result: a.length ? model.parseRootCheck(run(a)) : "" })
+  }
+  try {
+    let scan = model.parseScan(TOKEN + " app\n" + TOKEN + " end\n", TOKEN, model.scanDirs(home, home + "/.local/state"))
+    scan.pairConfs = { vault: { local: "~/V" } }
+    assert.strictEqual(status(scan), "absent")
+    assert.ok(model.rootNeedsReread(status(scan)))
+    fs.mkdirSync(path.join(home, ".config/omarchy-cloud"), { recursive: true })
+    fs.writeFileSync(path.join(home, ".config/omarchy-cloud/cloud.env"), "OMARCHY_CLOUD_ROOT=" + rootDir + "\n")
+    scan = reread(scan)
+    assert.strictEqual(status(scan), "missing", "Set up wrote the setting: now the root itself")
+    assert.deepStrictEqual(scan.pairConfs, { vault: { local: "~/V" } }, "the rest of the scan kept")
+    fs.mkdirSync(rootDir)
+    scan = reread(scan)
+    assert.strictEqual(status(scan), "ok", "the root created: the notice clears")
+    assert.strictEqual(model.rootNeedsReread(status(scan)), false, "and the polls go back to their normal cost")
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+    fs.rmSync(path.dirname(rootDir), { recursive: true, force: true })
+  }
+  // The singleton: a poll that starts no scan re-reads the setting while the
+  // root is not set up, and the read is followed by the root check.
+  const state = qmlCode("CloudState.qml")
+  assert.ok(/root\.rescan\(\)\s*\} else if \(Model\.rootNeedsReread\(root\.rootStatus\)\) \{\s*root\.rereadSetting\(\)\s*\}/.test(state), "applyPoll re-reads while not set up")
+  assert.ok(/function rereadSetting\(\) \{\s*if \(scan\.running \|\| settingProc\.running\) return\s*var token = Model\.scanToken\(\)\s*var argv = Model\.settingArgv\(root\.home, token\)/.test(state))
+  assert.ok(/var parsed = Model\.parseSettingRead\(text, token\)\s*if \(!parsed\.ok\) return\s*var next = Model\.withSetting\(root\.scanData, parsed\.setting\)[\s\S]{0,120}root\.recheckRoot\(\)/.test(state))
+  assert.ok(/id: settingProc[\s\S]{0,200}onStreamFinished: root\.applySetting\(text, settingProc\.token\)/.test(state))
+  assert.strictEqual((state.match(/root\.rereadSetting\(\)/g) || []).length, 1, "only from the poll")
+})
+
+// --------------------------------------------------- 0.3.5: bounded processes
+
+test("D8 the poll, du and journal argv start with the timeout and end in a byte cap", () => {
+  const T = model.timeoutArgv()
+  assert.deepStrictEqual(T, ["timeout", "-k", "2", "10"])
+  const cases = [
+    [model.pollArgv(["gdrive"], TOKEN), model.showArgv(["gdrive"]), model.SHOW_MAX_CHARS],
+    [model.sizesArgv(HOME, ["gdrive"], TOKEN), model.duArgv(HOME, ["gdrive"]), model.DU_MAX_CHARS],
+    [model.logArgv("rclone-mount@gdrive.service", TOKEN), model.journalArgv("rclone-mount@gdrive.service"), model.LOG_READ_MAX_BYTES]
+  ]
+  for (const [argv, inner, cap] of cases) {
+    assert.deepStrictEqual(argv.slice(0, 4), T, JSON.stringify(argv))
+    assert.deepStrictEqual(argv.slice(4, 10), ["sh", "-c", model.BOUNDED_SCRIPT, "cloud-mounts-bounded", TOKEN, String(cap)])
+    assert.deepStrictEqual(argv.slice(10), inner)
+  }
+  // The pipeline ends in `head -c` at the cap, then the end line.
+  assert.deepStrictEqual(model.BOUNDED_SCRIPT.split("\n"), ["t=$1 c=$2", "shift 2", '"$@" 2>/dev/null | head -c "$c"', "printf '\\n%s end\\n' \"$t\""])
+  assert.strictEqual(model.LOG_READ_MAX_BYTES, model.LOG_MAX_CHARS * 8)
+  // Nothing to run, a bad token or a bad cap: no argv.
+  assert.deepStrictEqual(model.sizesArgv(HOME, [], TOKEN), [])
+  assert.deepStrictEqual(model.logArgv("sshd.service", TOKEN), [])
+  for (const bad of ["", "x", null, TOKEN + " end"]) assert.deepStrictEqual(model.pollArgv(["gdrive"], bad), [], String(bad))
+  for (const cap of [0, -1, 1.5, NaN, Infinity, "10"]) assert.deepStrictEqual(model.boundedArgv(["true"], cap, TOKEN), [], String(cap))
+  // The widget arms exactly these, and reads the answer against the token.
+  const state = qmlCode("CloudState.qml")
+  const bar = qmlCode("BarWidget.qml")
+  assert.ok(/var argv = Model\.pollArgv\(root\.remotes, token\)[\s\S]{0,80}poll\.token = token\s*poll\.command = argv/.test(state))
+  assert.ok(/var argv = Model\.sizesArgv\(root\.home, root\.remotes, token\)[\s\S]{0,120}du\.token = token\s*du\.command = argv/.test(state))
+  assert.ok(/var argv = Model\.logArgv\(unit, token\)[\s\S]{0,200}logProc\.token = token\s*logProc\.command = argv/.test(bar))
+  assert.ok(/onStreamFinished: root\.applyPoll\(text, poll\.token\)/.test(state))
+  assert.ok(/onStreamFinished: root\.applySizes\(text, du\.token\)/.test(state))
+  assert.ok(/onStreamFinished: if \(root\.logUnit !== ""\) root\.logText = Model\.logView\(text, logProc\.token\)/.test(bar))
+  for (const raw of ["showArgv", "duArgv", "journalArgv", "parseDu(text", "formatLog("])
+    assert.ok(!(state + bar).includes("Model." + raw), "an unbounded " + raw + " in the QML")
+  // A cut answer keeps the last good state.
+  assert.ok(/var answer = Model\.parseBounded\(text, token, Model\.SHOW_MAX_CHARS\)\s*if \(!answer\.ok\) \{\s*root\.pollError = "[^"]+"\s*return\s*\}\s*var parsed = Model\.parseShow\(answer\.text\)/.test(state))
+  assert.ok(/var b = Model\.parseBounded\(text, token, Model\.DU_MAX_CHARS\)\s*if \(!b\.ok\) return\s*root\.sizes = /.test(state))
+})
+
+test("D8 through a real sh: output capped, a hung command cut, Log timed out", () => {
+  const cp = require("child_process")
+  // The widget's own argv with the timeout shortened and a stand-in command.
+  const run = (inner, cap, secs) => {
+    const argv = model.boundedArgv(inner, cap, TOKEN)
+    const short = ["timeout", "-k", "1", String(secs)].concat(argv.slice(4))
+    const t0 = Date.now()
+    const r = cp.spawnSync(short[0], short.slice(1), { encoding: "utf8" })
+    return { out: r.stdout, status: r.status, ms: Date.now() - t0 }
+  }
+  const big = run(["sh", "-c", "yes x | head -c 100000"], 1000, 5)
+  const b = model.parseBounded(big.out, TOKEN, 1000)
+  assert.ok(b.ok && b.text.length === 1000, "capped at the source: " + b.text.length)
+  const fine = run(["printf", "a\\nb\\n"], 1000, 5)
+  assert.deepStrictEqual(model.parseBounded(fine.out, TOKEN, 1000), { ok: true, text: "a\nb\n" })
+  assert.strictEqual(model.logView(fine.out, TOKEN), "a\nb")
+  // Hung after some output: killed with its group, no end line, refused.
+  const hung = run(["sh", "-c", "echo partial; exec sleep 30"], 1000, 1)
+  assert.ok(hung.ms < 5000, "cut by the timeout: " + hung.ms + " ms")
+  assert.strictEqual(hung.status, 124)
+  assert.deepStrictEqual(model.parseBounded(hung.out, TOKEN, 1000), { ok: false, text: "" })
+  assert.strictEqual(model.logView(hung.out, TOKEN), "Log timed out")
+  assert.strictEqual(model.LOG_TIMED_OUT, "Log timed out")
+  // Another token's end line, or an end line inside the output, is not this run's.
+  assert.strictEqual(model.parseBounded("x\ncmscan-zzzzzzzzzzzz end\n", TOKEN, 1000).ok, false)
+  assert.strictEqual(model.parseBounded("\n" + TOKEN + " end\ncut", TOKEN, 1000).ok, false)
+  assert.strictEqual(model.parseBounded("x".repeat(1001) + "\n" + TOKEN + " end\n", TOKEN, 1000).ok, false, "over the cap")
+  // An empty journal still reads as such, not as timed out.
+  assert.strictEqual(model.logView("\n" + TOKEN + " end\n", TOKEN), "(no journal entries)")
+})
+
+// ---------------------------------------------------- 0.3.5: HOME-fixed paths
+
+test("D6 paths are HOME-fixed: XDG variables set elsewhere change nothing", () => {
+  const saved = {}
+  for (const k of ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"]) { saved[k] = process.env[k]; process.env[k] = "/elsewhere/" + k }
+  try {
+    const m = new Function(source + "\nreturn {" + NAMES.join(",") + "}")()
+    const st = m.stateHome("/home/tester", process.env.XDG_STATE_HOME)
+    assert.strictEqual(st, "/home/tester/.local/state")
+    assert.deepStrictEqual(m.scanDirs("/home/tester", st), {
+      bisyncConf: "/home/tester/.config/rclone-bisync", backupConf: "/home/tester/.config/rclone-backup",
+      bisyncState: "/home/tester/.local/state/rclone-bisync", backupState: "/home/tester/.local/state/rclone-backup",
+      setting: "/home/tester/.config/omarchy-cloud/cloud.env" })
+    assert.strictEqual(m.envDir("/home/tester"), "/home/tester/.config/rclone-mount")
+    assert.strictEqual(m.cacheDir("/home/tester", "gdrive"), "/home/tester/.cache/rclone/vfs/gdrive")
+    assert.strictEqual(m.rootSettingPath("/home/tester"), "/home/tester/.config/omarchy-cloud/cloud.env")
+    assert.deepStrictEqual(m.versionsArgv("/opt/cloud", st, TOKEN).slice(12, 14),
+      ["/home/tester/.local/state/omarchy-cloud/installed-files", "/home/tester/.local/state/omarchy-cloud/installed-binary.sha256"])
+  } finally {
+    for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k] }
+  }
+  // No code reads an XDG variable: not the model, not the QML.
+  assert.ok(!/XDG_/.test(source.replace(/\/\/.*$/gm, "")), "Model.js code names an XDG variable")
+  for (const file of qmlFiles) assert.ok(!/XDG_|Quickshell\.env\("(?!HOME")/.test(qmlCode(file)), file + " reads an XDG variable")
+  assert.ok(/readonly property string stateDir: Model\.stateHome\(root\.home\)\n/.test(qmlCode("CloudState.qml")))
 })
 
 let failed = 0

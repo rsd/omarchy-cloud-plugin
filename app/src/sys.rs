@@ -587,6 +587,47 @@ pub fn read_small(path: &Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// The first `max` bytes of a regular file (symlinks followed); None when
+/// it is missing or not a regular file (a FIFO would block the read).
+pub fn read_bounded(path: &Path, max: usize) -> Option<Vec<u8>> {
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(max as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// The mount-root setting from cloud.env (`envfile::parse_root`); Absent
+/// when the file is missing or unreadable.
+pub fn read_root(paths: &crate::cmd::Paths) -> crate::envfile::RootSetting {
+    match read_bounded(&paths.cloud_env(), crate::envfile::ROOT_FILE_MAX) {
+        Some(b) => crate::envfile::parse_root(&b, &paths.home),
+        None => crate::envfile::RootSetting::Absent,
+    }
+}
+
+/// Why `dir` cannot hold mount points: missing, not a directory, or not
+/// writable and searchable by this user (`access(W_OK|X_OK)`). None: usable.
+pub fn dir_problem(dir: &Path) -> Option<&'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    match fs::metadata(dir) {
+        Err(_) => return Some("does not exist"),
+        Ok(m) if !m.is_dir() => return Some("is not a directory"),
+        Ok(_) => {}
+    }
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return Some("is not a usable path");
+    };
+    // SAFETY: `c` is a valid NUL-terminated string that outlives the call.
+    let r = unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) };
+    (r != 0).then_some("is not writable by you")
+}
+
 /// The valid instance names of `<dir>/<name>.conf`, sorted.
 pub fn list_confs(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = fs::read_dir(dir)
@@ -659,7 +700,7 @@ pub fn remove_if_exists(path: &Path) -> Result<bool, String> {
     }
 }
 
-/// ~/Cloud/<r> → /mnt/cloud/<r>, only when nothing exists at the link path.
+/// ~/Cloud/<r> → <root>/<r>, only when nothing exists at the link path.
 pub fn create_cloud_link(link: &Path, target: &Path) -> Result<bool, String> {
     if fs::symlink_metadata(link).is_ok() {
         return Ok(false);
@@ -671,7 +712,8 @@ pub fn create_cloud_link(link: &Path, target: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Removes ~/Cloud/<r> only if it is a symlink pointing at /mnt/cloud/<r>.
+/// Removes ~/Cloud/<r> only if it is a symlink pointing at `target`
+/// (<root>/<r>).
 pub fn remove_cloud_link(link: &Path, target: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(link) {
         Ok(m) if m.file_type().is_symlink() => {

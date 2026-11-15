@@ -2,30 +2,29 @@
 //! vector built here by a pure function from already validated names — no
 //! shell is ever involved.
 
-use crate::secret::{Secret, SecretArgv};
+use crate::envfile::{DEFAULT_ROOT, RootSetting};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// fuser runs under `timeout -k 2 10`, like the plugin's stop check.
 pub const CHECK_TIMEOUT_S: &str = "10";
 pub const CHECK_KILL_S: &str = "2";
 
+/// Where everything lives. HOME-fixed: `~/.config`, `~/.local/state` and
+/// `~/.cache`, whatever XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_CACHE_HOME
+/// say, like the helper scripts, the bar and the units (the user manager's
+/// environment usually lacks the shell's XDG variables, so following them
+/// would split the parts).
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub home: PathBuf,
-    /// `$XDG_CONFIG_HOME` (absolute) or `~/.config`, like the helper scripts.
+    /// `~/.config`.
     pub config_home: PathBuf,
+    /// `~/.local/state`.
     pub state_home: PathBuf,
-    /// `$XDG_CACHE_HOME` (absolute) or `~/.cache`; only used to delete the
-    /// bisync listings of the work dir rclone used before the helper pinned
-    /// one (`bisync_workdirs`).
-    pub cache_home: PathBuf,
-}
-
-/// An XDG base directory: the variable when it is an absolute path, else
-/// `home/<fallback>` (relative values are ignored, as the XDG spec says).
-fn xdg(var: Option<PathBuf>, home: &Path, fallback: &str) -> PathBuf {
-    var.filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home.join(fallback))
+    /// The mount-root setting (cloud.env) as last read (`sys::read_root`);
+    /// Absent until then.
+    pub root_setting: RootSetting,
 }
 
 /// `~/…` when `p` is under `home`, else `p` as is.
@@ -38,30 +37,51 @@ pub fn tilde_of(home: &Path, p: &Path) -> String {
 }
 
 impl Paths {
-    pub fn new(
-        home: PathBuf,
-        xdg_config: Option<PathBuf>,
-        xdg_state: Option<PathBuf>,
-        xdg_cache: Option<PathBuf>,
-    ) -> Paths {
+    pub fn new(home: PathBuf) -> Paths {
         Paths {
-            config_home: xdg(xdg_config, &home, ".config"),
-            state_home: xdg(xdg_state, &home, ".local/state"),
-            cache_home: xdg(xdg_cache, &home, ".cache"),
+            config_home: home.join(".config"),
+            state_home: home.join(".local/state"),
             home,
+            root_setting: RootSetting::Absent,
         }
     }
 
-    /// The mount env files stay under `~/.config`: the unit reads
-    /// `%h/.config/rclone-mount/%i.env`, whatever XDG_CONFIG_HOME says.
+    /// From the environment `get` reads: only HOME, which must be an
+    /// absolute path without control characters or `.`/`..` segments.
+    /// XDG_* variables are never read.
+    pub fn from_env(get: impl Fn(&str) -> Option<OsString>) -> Option<Paths> {
+        let h = PathBuf::from(get("HOME")?);
+        (h.is_absolute() && crate::validate::expand_local(&h.to_string_lossy(), &h).is_ok())
+            .then(|| Paths::new(h))
+    }
+
+    /// The mount-root setting, `~/.config/omarchy-cloud/cloud.env`.
+    pub fn cloud_env(&self) -> PathBuf {
+        self.home.join(".config/omarchy-cloud/cloud.env")
+    }
+    /// The configured root when the setting is valid.
+    pub fn configured_root(&self) -> Option<&Path> {
+        match &self.root_setting {
+            RootSetting::Valid(p) => Some(p),
+            _ => None,
+        }
+    }
+    /// The root mounts live under: the configured one, else the unit's
+    /// default /mnt/cloud.
+    pub fn root(&self) -> &Path {
+        self.configured_root()
+            .unwrap_or_else(|| Path::new(DEFAULT_ROOT))
+    }
+    /// The mount env files: the unit reads `%h/.config/rclone-mount/%i.env`.
     pub fn mount_env_dir(&self) -> PathBuf {
         self.home.join(".config/rclone-mount")
     }
     pub fn mount_env(&self, remote: &str) -> PathBuf {
         self.mount_env_dir().join(format!("{remote}.env"))
     }
-    pub fn mount_point(remote: &str) -> PathBuf {
-        PathBuf::from("/mnt/cloud").join(remote)
+    /// `<root>/<remote>`, where the unit mounts it.
+    pub fn mount_point(&self, remote: &str) -> PathBuf {
+        self.root().join(remote)
     }
     pub fn cloud_dir(&self) -> PathBuf {
         self.home.join("Cloud")
@@ -97,8 +117,7 @@ impl Paths {
             .join("rclone-backup")
             .join(format!("{job}.state"))
     }
-    /// The mount units' cache dir (`--cache-dir %h/.cache/rclone`, fixed in
-    /// the unit, so not XDG_CACHE_HOME).
+    /// The mount units' cache dir (`--cache-dir %h/.cache/rclone`).
     pub fn rclone_cache(&self) -> PathBuf {
         self.home.join(".cache/rclone")
     }
@@ -115,22 +134,12 @@ impl Paths {
         self.home.join(".local/bin/rclone-backup")
     }
     /// The bisync work dir: the helper passes `--workdir
-    /// "$HOME/.cache/rclone/bisync"` to every bisync call, whatever
-    /// XDG_CACHE_HOME says, so the service and a run from a terminal share
-    /// the listings. The only dir that decides whether a pair has synced.
+    /// "$HOME/.cache/rclone/bisync"` to every bisync call, so the service and
+    /// a run from a terminal share the listings. The only dir that decides
+    /// whether a pair has synced, and the one a pair's listings are deleted
+    /// from.
     pub fn bisync_workdir(&self) -> PathBuf {
         self.home.join(".cache/rclone/bisync")
-    }
-    /// The dirs a pair's listings are deleted from: the pinned work dir and
-    /// rclone's default under XDG_CACHE_HOME (legacy, before the helper
-    /// pinned it), without duplicates.
-    pub fn bisync_workdirs(&self) -> Vec<PathBuf> {
-        let mut v = vec![self.bisync_workdir()];
-        let d = self.cache_home.join("rclone/bisync");
-        if !v.contains(&d) {
-            v.push(d);
-        }
-        v
     }
     /// The drop-in `rclone-backup setup` writes (the job's SCHEDULE): a job
     /// without it was never set up.
@@ -347,21 +356,10 @@ pub fn config_delete_cmd(remote: &str) -> Vec<String> {
     v(&["rclone", "config", "delete", remote])
 }
 
-/// Sets a Drive remote's OAuth client without touching its token (the
-/// reconnect that follows gets a new one). `--non-interactive` so a question
-/// from rclone comes back as output instead of waiting on stdin.
-pub fn client_update_cmd(remote: &str, client_id: &str, secret: &Secret) -> SecretArgv {
-    let args = vec![
-        "rclone".to_string(),
-        "config".to_string(),
-        "update".to_string(),
-        "--non-interactive".to_string(),
-        remote.to_string(),
-        format!("client_id={client_id}"),
-        format!("client_secret={}", secret.expose()),
-        "config_refresh_token=false".to_string(),
-    ];
-    SecretArgv::new(args, 6)
+/// Prints the path of rclone.conf (the OAuth client is written there
+/// in-process, never on an argument vector: `app::set_client`).
+pub fn config_file_cmd() -> Vec<String> {
+    v(&["rclone", "config", "file"])
 }
 
 /// Copy remote → local, used only to seed an empty local folder before the
@@ -435,7 +433,7 @@ mod tests {
     use super::*;
 
     fn paths() -> Paths {
-        Paths::new(PathBuf::from("/home/u"), None, None, None)
+        Paths::new(PathBuf::from("/home/u"))
     }
 
     #[test]
@@ -445,10 +443,7 @@ mod tests {
             p.mount_env("gdrive"),
             PathBuf::from("/home/u/.config/rclone-mount/gdrive.env")
         );
-        assert_eq!(
-            Paths::mount_point("gdrive"),
-            PathBuf::from("/mnt/cloud/gdrive")
-        );
+        assert_eq!(p.mount_point("gdrive"), PathBuf::from("/mnt/cloud/gdrive"));
         assert_eq!(
             p.cloud_link("gdrive"),
             PathBuf::from("/home/u/Cloud/gdrive")
@@ -484,53 +479,101 @@ mod tests {
         assert_eq!(p.tilde(Path::new("/home/u/Docs")), "~/Docs");
         assert_eq!(p.tilde(Path::new("/srv/x")), "/srv/x");
         assert_eq!(p.tilde(Path::new("/home/u")), "~/");
-        let x = Paths::new(
-            PathBuf::from("/home/u"),
-            Some(PathBuf::from("/cf")),
-            Some(PathBuf::from("/st")),
-            Some(PathBuf::from("/ca")),
+        assert_eq!(
+            p.bisync_workdir(),
+            PathBuf::from("/home/u/.cache/rclone/bisync")
+        );
+        assert_eq!(
+            p.pair_path_dropin("p"),
+            PathBuf::from("/home/u/.config/systemd/user/rclone-bisync@p.path.d/10-local.conf")
+        );
+        assert_eq!(
+            p.job_timer_dropin("j"),
+            PathBuf::from("/home/u/.config/systemd/user/rclone-backup@j.timer.d/10-schedule.conf")
+        );
+        assert_eq!(
+            p.cloud_env(),
+            PathBuf::from("/home/u/.config/omarchy-cloud/cloud.env")
+        );
+    }
+
+    /// D6: XDG variables set elsewhere change nothing; only HOME is read.
+    #[test]
+    fn paths_are_home_fixed() {
+        let env = |k: &str| -> Option<OsString> {
+            match k {
+                "HOME" => Some("/home/u".into()),
+                "XDG_CONFIG_HOME" => Some("/elsewhere/config".into()),
+                "XDG_STATE_HOME" => Some("/elsewhere/state".into()),
+                "XDG_CACHE_HOME" => Some("/elsewhere/cache".into()),
+                "XDG_DATA_HOME" => Some("/elsewhere/data".into()),
+                _ => None,
+            }
+        };
+        let x = Paths::from_env(env).unwrap();
+        assert_eq!(x.config_home, PathBuf::from("/home/u/.config"));
+        assert_eq!(x.state_home, PathBuf::from("/home/u/.local/state"));
+        assert_eq!(
+            x.pair_conf("p"),
+            PathBuf::from("/home/u/.config/rclone-bisync/p.conf")
+        );
+        assert_eq!(
+            x.job_files("j"),
+            PathBuf::from("/home/u/.config/rclone-backup/j.files")
         );
         assert_eq!(
             x.pair_state("p"),
-            PathBuf::from("/st/rclone-bisync/p.state")
+            PathBuf::from("/home/u/.local/state/rclone-bisync/p.state")
         );
-        assert_eq!(x.pair_conf("p"), PathBuf::from("/cf/rclone-bisync/p.conf"));
-        assert_eq!(x.job_files("j"), PathBuf::from("/cf/rclone-backup/j.files"));
-        // The unit reads the env file and the cache from fixed %h paths.
+        assert_eq!(
+            x.job_state("j"),
+            PathBuf::from("/home/u/.local/state/rclone-backup/j.state")
+        );
         assert_eq!(
             x.mount_env("r"),
             PathBuf::from("/home/u/.config/rclone-mount/r.env")
         );
-        assert_eq!(x.vfs_dir("r"), PathBuf::from("/home/u/.cache/rclone/vfs/r"));
-        // One pinned work dir decides; the legacy XDG one is only cleaned.
+        assert_eq!(
+            x.cloud_env(),
+            PathBuf::from("/home/u/.config/omarchy-cloud/cloud.env")
+        );
         assert_eq!(
             x.bisync_workdir(),
             PathBuf::from("/home/u/.cache/rclone/bisync")
         );
-        assert_eq!(
-            x.bisync_workdirs(),
-            [
-                PathBuf::from("/home/u/.cache/rclone/bisync"),
-                PathBuf::from("/ca/rclone/bisync")
-            ]
-        );
-        assert_eq!(p.bisync_workdirs(), [p.bisync_workdir()]);
+        assert_eq!(x.vfs_dir("r"), PathBuf::from("/home/u/.cache/rclone/vfs/r"));
         assert_eq!(
             x.pair_path_dropin("p"),
-            PathBuf::from("/cf/systemd/user/rclone-bisync@p.path.d/10-local.conf")
+            PathBuf::from("/home/u/.config/systemd/user/rclone-bisync@p.path.d/10-local.conf")
         );
+        let all = format!("{x:?}");
+        assert!(!all.contains("elsewhere"), "{all}");
+        // HOME must be usable.
+        for bad in ["", "rel", "/a/../b", "/a\nb"] {
+            assert!(
+                Paths::from_env(|k| (k == "HOME").then(|| bad.into())).is_none(),
+                "{bad:?}"
+            );
+        }
+        assert!(Paths::from_env(|_| None).is_none());
+    }
+
+    #[test]
+    fn mount_points_follow_the_root() {
+        let mut p = paths();
+        assert_eq!(p.root(), Path::new("/mnt/cloud"));
+        assert_eq!(p.configured_root(), None);
+        p.root_setting = RootSetting::Valid(PathBuf::from("/srv/cloud"));
+        assert_eq!(p.mount_point("od"), PathBuf::from("/srv/cloud/od"));
+        assert_eq!(p.configured_root(), Some(Path::new("/srv/cloud")));
         assert_eq!(
-            x.job_timer_dropin("j"),
-            PathBuf::from("/cf/systemd/user/rclone-backup@j.timer.d/10-schedule.conf")
+            fuser_cmd(&p.mount_point("od")).last().unwrap(),
+            "/srv/cloud/od"
         );
-        let rel = Paths::new(
-            PathBuf::from("/home/u"),
-            Some(PathBuf::from("cf")),
-            Some(PathBuf::from("st")),
-            None,
-        );
-        assert_eq!(rel.state_home, PathBuf::from("/home/u/.local/state"));
-        assert_eq!(rel.config_home, PathBuf::from("/home/u/.config"));
+        // An invalid setting is never used as a path.
+        p.root_setting = RootSetting::Invalid("/home/u/x".into());
+        assert_eq!(p.mount_point("od"), PathBuf::from("/mnt/cloud/od"));
+        assert_eq!(p.configured_root(), None);
     }
 
     #[test]
@@ -773,26 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn client_update_argv_and_masking() {
-        let mut s = Secret::new();
-        for c in "GOCSPX-s3cr3t".chars() {
-            s.push(c);
-        }
-        let a = client_update_cmd("gdrive", "123.apps.googleusercontent.com", &s);
-        assert_eq!(
-            a.expose(),
-            [
-                "rclone",
-                "config",
-                "update",
-                "--non-interactive",
-                "gdrive",
-                "client_id=123.apps.googleusercontent.com",
-                "client_secret=GOCSPX-s3cr3t",
-                "config_refresh_token=false"
-            ]
-        );
-        assert!(!format!("{a:?}").contains("s3cr3t"));
+    fn config_file_argv() {
+        assert_eq!(config_file_cmd(), ["rclone", "config", "file"]);
     }
 
     #[test]
@@ -811,7 +836,7 @@ mod tests {
             ["/home/u/.local/bin/rclone-backup", "list", "j"]
         );
         assert_eq!(
-            fuser_cmd(&Paths::mount_point("gdrive")),
+            fuser_cmd(&p.mount_point("gdrive")),
             [
                 "timeout",
                 "-k",

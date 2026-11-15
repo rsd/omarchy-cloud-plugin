@@ -174,13 +174,48 @@ pub fn expand_local(input: &str, home: &Path) -> Result<PathBuf, String> {
     Ok(clean)
 }
 
+/// Longest accepted mount root, in UTF-8 bytes.
+pub const MAX_ROOT: usize = 255;
+
+/// The mount root (`OMARCHY_CLOUD_ROOT` in cloud.env): absolute, not `/`,
+/// every component non-empty and not `.` or `..` (so no `//` and no trailing
+/// `/`), no ASCII whitespace or control byte (0x00-0x20, 0x7F), none of
+/// `$`, `%`, `\`, `"`, `'` or a backtick, not `home` and not inside it (component-wise), at most
+/// 255 bytes. The same rule as the helpers' and install.sh's `valid_root`
+/// and the bar's `isValidRoot`; the cases every validator is tested
+/// against: tests/fixtures/roots.tsv.
+pub fn is_valid_root(path: &str, home: &Path) -> bool {
+    let b = path.as_bytes();
+    b.len() <= MAX_ROOT
+        && b.first() == Some(&b'/')
+        && path != "/"
+        && !b.iter().any(|&c| {
+            c <= 0x20 || c == 0x7f || matches!(c, b'$' | b'%' | b'\\' | b'"' | b'\'' | b'`')
+        })
+        && path[1..]
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        && !inside_home(path, home)
+}
+
+/// True when `path` is inside `home`. A home of "/" or "" (after trimming
+/// trailing `/`) is no home: the rule is skipped, like the helpers'
+/// `valid_root` (`home=${HOME%/}`; `[[ -n $home && ... ]]`).
+fn inside_home(path: &str, home: &Path) -> bool {
+    let h = home.to_string_lossy();
+    let h = h.trim_end_matches('/');
+    !h.is_empty() && Path::new(path).starts_with(h)
+}
+
 /// True when `p` is `root` or inside it. Both should be canonical. Pure.
 pub fn is_within(p: &Path, root: &Path) -> bool {
     p.starts_with(root)
 }
 
 /// True when `a` and `b` are the same directory or one is inside the other,
-/// by path components (/a/b and /a/bc do not overlap). Pure.
+/// by path components (/a/b and /a/bc do not overlap; trailing and repeated
+/// `/` are ignored). Pure. The cloud guard (`app::cloud_loop`) and the
+/// helpers' `guard_cloud` use the same rule in both directions.
 pub fn overlaps(a: &Path, b: &Path) -> bool {
     is_within(a, b) || is_within(b, a)
 }
@@ -241,10 +276,15 @@ pub fn is_valid_client_id(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
-/// A client secret: printable ASCII without spaces or `=` (it travels as
-/// `client_secret=<value>`), 1..=256 characters.
+/// A client secret: printable ASCII without spaces, `=`, quotes or
+/// backticks (it is written as a `client_secret = <value>` line of
+/// rclone.conf, whose parser reads a leading quote or backtick as quoting),
+/// 1..=256 characters.
 pub fn is_valid_client_secret(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 256 && s.bytes().all(|c| c.is_ascii_graphic() && c != b'=')
+    !s.is_empty()
+        && s.len() <= 256
+        && s.bytes()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, b'=' | b'"' | b'\'' | b'`'))
 }
 
 #[cfg(test)]
@@ -293,6 +333,57 @@ mod tests {
             n += 1;
         }
         assert!(n >= 20, "only {n} cases read");
+    }
+
+    /// The one list of mount-root cases shared with the helpers, install.sh
+    /// and the bar, all run with HOME=/home/tester.
+    #[test]
+    fn roots_fixture() {
+        let text = include_str!("../../tests/fixtures/roots.tsv");
+        let home = Path::new("/home/tester");
+        let (mut n, mut valid, mut invalid) = (0, 0, 0);
+        for line in text.split('\n') {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (want, path) = line.split_once('\t').expect("<valid|invalid><TAB><path>");
+            let expect = match want {
+                "valid" => true,
+                "invalid" => false,
+                other => panic!("bad fixture verdict {other:?}"),
+            };
+            assert_eq!(is_valid_root(path, home), expect, "{want} {path:?}");
+            if expect {
+                valid += 1;
+            } else {
+                invalid += 1;
+            }
+            n += 1;
+        }
+        assert!(
+            n >= 35 && valid >= 10 && invalid >= 25,
+            "only {n} cases read"
+        );
+    }
+
+    #[test]
+    fn roots_beyond_the_fixture() {
+        let home = Path::new("/home/tester");
+        // Control bytes, DEL and tabs; non-ASCII is allowed; 255 is BYTES.
+        for bad in ["/mnt/a\tb", "/mnt/a\nb", "/mnt/a\u{7f}b", "/mnt/a\u{1}b"] {
+            assert!(!is_valid_root(bad, home), "{bad:?}");
+        }
+        assert!(is_valid_root("/mnt/caf\u{e9}", home));
+        let e255 = format!("/{}", "\u{e9}".repeat(127)); // 255 bytes
+        assert!(is_valid_root(&e255, home));
+        let e256 = format!("/{}a", "\u{e9}".repeat(127));
+        assert!(!is_valid_root(&e256, home), "256 bytes");
+        // A home with a trailing slash is the same home.
+        assert!(!is_valid_root("/home/tester/x", Path::new("/home/tester/")));
+        // No usable home ("/" or empty): the home rule is skipped.
+        for home in ["/", "", "//"] {
+            assert!(is_valid_root("/mnt/x", Path::new(home)), "home {home:?}");
+        }
     }
 
     #[test]
@@ -401,6 +492,20 @@ mod tests {
     #[test]
     fn overlapping_dirs() {
         let p = Path::new;
+        // The cloud guard's cases (C4): equal, inside, containing, and a
+        // sibling that only shares a prefix.
+        let mnt = p("/mnt/cloud");
+        assert!(overlaps(p("/mnt/cloud"), mnt), "equal");
+        assert!(overlaps(p("/mnt/cloud/"), mnt), "equal, trailing /");
+        assert!(overlaps(p("/mnt/cloud/od/x"), mnt), "inside");
+        assert!(overlaps(p("/mnt"), mnt), "contains");
+        assert!(overlaps(mnt, p("/mnt")), "contains, either order");
+        assert!(!overlaps(p("/mnt/cloudy"), mnt), "sibling prefix");
+        assert!(
+            !overlaps(mnt, p("/mnt/cloudy")),
+            "sibling prefix, either order"
+        );
+        assert!(!overlaps(p("/mnt/cloudy/x"), mnt));
         assert!(overlaps(p("/home/u/Vaults"), p("/home/u/Vaults")));
         assert!(overlaps(p("/home/u/Vaults/bk"), p("/home/u/Vaults")));
         assert!(overlaps(p("/home/u/Vaults"), p("/home/u/Vaults/bk")));
@@ -477,6 +582,9 @@ mod tests {
         assert!(is_valid_client_secret("GOCSPX-abc_DEF123"));
         assert!(!is_valid_client_secret("has space"));
         assert!(!is_valid_client_secret("a=b"));
+        for q in ["`x", "x\"y", "'x'"] {
+            assert!(!is_valid_client_secret(q), "{q}");
+        }
         assert!(!is_valid_client_secret(""));
     }
 }

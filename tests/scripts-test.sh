@@ -2,8 +2,10 @@
 
 # The helper scripts (bin/rclone-bisync, bin/rclone-backup), hermetic:
 # stand-ins for rclone, systemctl, notify-send and date come first on PATH and record their argv (one line per call, each argument through
-# printf %q); HOME and the XDG_* dirs point into a scratch dir, and the mounts
-# table the cloud guard reads is a scratch file. The real rclone is never run,
+# printf %q; notify-send also keeps its last argv NUL-separated); HOME and the
+# XDG_* dirs point into a scratch dir (the XDG_* ones away from HOME, which the
+# scripts must ignore), and the mounts table the cloud guard reads is a
+# scratch file. The real rclone is never run,
 # no unit is touched, nothing outside the scratch dir is written. install.sh
 # has its own suite (tests/install-test.sh).
 #
@@ -11,6 +13,9 @@
 #   2. Conf parsing: a valid pair, an unknown key, a bad name, a conf that would
 #      run code if sourced, a missing LOCAL, INTERVAL (at least 30s, s|min|h|d),
 #      a CRLF conf; every line of tests/fixtures/names.tsv through both scripts;
+#      the shared valid_root: its marker blocks in both scripts and install.sh
+#      byte-identical, every line of tests/fixtures/roots.tsv through each;
+#      HOME-fixed paths (XDG_CONFIG_HOME / XDG_STATE_HOME ignored);
 #      backup FILES with .., an absolute path, duplicate copy names, empty.
 #   3. rclone-bisync: run passes exactly the safety flags and bisync's exit
 #      code; a busy lock: run exits 0, resync and dry-run 75, without rclone;
@@ -19,9 +24,12 @@
 #      take the filter as --filter-from; FILTER= (empty) is no filter; the
 #      workdir is pinned; an empty pair is check/resync exit 4;
 #      conflicts are listed (even those the filter hides), notified and written
-#      to the state file; setup writes the drop-ins (and warns when the filter
+#      to the state file; a hostile copy name reaches the notification without
+#      < > & (and, when the shell's Markup.js is installed, renders no link); setup writes the drop-ins (and warns when the filter
 #      excludes conflict copies), teardown removes them; validate; the guards
-#      (backup DEST, other pairs' LOCAL, cloud locations and FUSE mounts); a
+#      (backup DEST, other pairs' LOCAL, cloud locations and FUSE mounts, in
+#      both directions: LOCAL inside one or containing one; the configured
+#      mount root of cloud.env, parsed and validated, never run); a
 #      hung FUSE mount: the guards never resolve a path in it and a run
 #      completes, setup and validate still refuse; a hung realpath elsewhere is
 #      cut off after 5 s.
@@ -30,8 +38,9 @@
 #      file and never touches legacy (unprefixed) copies; modes (only a new DEST
 #      is made 700); .part handling; a failure (copy or mv) notifies and does
 #      not prune; a busy job lock exits 0; only `rclone copyto <remote> <local>`;
-#      validate; the guards (pairs' LOCAL, other jobs' DEST, cloud locations),
-#      and the same hung-mount cases.
+#      validate; the guards (pairs' LOCAL, other jobs' DEST, cloud locations,
+#      both directions), the same hung-mount cases; a hostile path in the
+#      failure notification is stripped of < > &.
 #   5. The generated drop-ins against the repo's templates, through the real
 #      systemd (`systemd --test`, `systemd-analyze verify`), read-only.
 
@@ -46,6 +55,7 @@ PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BISYNC=$PLUGIN_DIR/bin/rclone-bisync
 BACKUP=$PLUGIN_DIR/bin/rclone-backup
 NAMES_TSV=$PLUGIN_DIR/tests/fixtures/names.tsv
+ROOTS_TSV=$PLUGIN_DIR/tests/fixtures/roots.tsv
 FAILURES=0
 SCRATCH=$(mktemp -d) || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -104,7 +114,7 @@ for tool in systemctl notify-send; do
   cat >"$STUBS/$tool" <<'EOF'
 #!/bin/bash
 { printf '%s' "${0##*/}"; printf ' %q' "$@"; printf '\n'; } >>"$FAKE_LOG/${0##*/}"
-[[ ${0##*/} == notify-send ]] && exit "${FAKE_NOTIFY_RC:-0}"
+[[ ${0##*/} == notify-send ]] && { printf '%s\0' "$@" >"$FAKE_LOG/notify-send.argv"; exit "${FAKE_NOTIFY_RC:-0}"; }
 exit 0
 EOF
 done
@@ -141,13 +151,47 @@ chmod +x "$RPSTUB/realpath"
 export PATH="$STUBS:$PATH"
 TODAY=2026-11-14
 
+# The Omarchy shell's notification markup renderer (decodes entities, then
+# re-allows <a href> and a few tags), when it and node are installed:
+# render_markup <file> prints the rendered text of the file's content.
+MARKUP_JS=${OMARCHY_MARKUP_JS:-/usr/share/omarchy/shell/plugins/notifications/Markup.js}
+RENDER=
+if [[ -r $MARKUP_JS && -r ${MARKUP_JS%/*}/Security.js ]] && command -v node >/dev/null; then
+  RENDER=$SCRATCH/render.js
+  cat >"$RENDER" <<'EOF'
+const fs = require('fs');
+const dir = process.argv[2], text = fs.readFileSync(process.argv[3], 'utf8');
+const strip = s => s.split('\n').filter(l => !/^\s*\.(pragma|import)/.test(l)).join('\n');
+const Qt = { openUrlExternally() {} };
+// Every top-level function and variable of Security.js, as the .import gives.
+const src = strip(fs.readFileSync(dir + '/Security.js', 'utf8'));
+const names = [...src.matchAll(/^(?:function\s+|(?:var|const|let)\s+)([A-Za-z_$][\w$]*)/gm)].map(m => m[1]);
+const Security = new Function('Qt', src + '\nreturn {' + names.join(', ') + '};')(Qt);
+const Markup = new Function('Security', strip(fs.readFileSync(dir + '/Markup.js', 'utf8')) + '\nreturn {render};')(Security);
+process.stdout.write(Markup.render(text));
+EOF
+fi
+render_markup() { node "$RENDER" "${MARKUP_JS%/*}" "$1"; }
+# notify_arg <n>: argument n (from 0) of the last notify-send call.
+notify_arg() {
+  local a=()
+  mapfile -d '' -t a <"$FAKE_LOG/notify-send.argv"
+  printf '%s' "${a[$1]}"
+}
+# no_markup_chars <text>: no < > & in it.
+no_markup_chars() { [[ $1 != *[\<\>\&]* ]]; }
+# A remote-made file name that the renderer turns into a clickable link.
+HOSTILE='<a href="https:&#47;&#47;evil.example">Open the fix<&#47;a>'
+
 # fresh: a new scratch HOME with empty logs; clears the stand-ins' knobs.
 N=0
 fresh() {
   N=$((N + 1))
   T=$SCRATCH/t$N
   mkdir -p "$T/home/.config" "$T/state" "$T/run" "$T/cache" "$T/log"
-  export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_STATE_HOME=$T/state \
+  # The XDG_* dirs point away from HOME on purpose: the scripts ignore them
+  # (HOME-fixed paths), so every check below reads and writes under $HOME.
+  export HOME=$T/home XDG_CONFIG_HOME=$T/xdg-config XDG_STATE_HOME=$T/state \
     XDG_RUNTIME_DIR=$T/run XDG_CACHE_HOME=$T/cache FAKE_LOG=$T/log OMARCHY_CLOUD_MOUNTS=$T/mounts
   unset FAKE_BISYNC_RC FAKE_CHECK_COMBINED FAKE_CHECK_RC FAKE_LSF FAKE_LSF_RC FAKE_COPY_FAIL \
     FAKE_LSF_FILTERED FAKE_LSF_FIND FAKE_LSF_DROP FAKE_MV_FAIL FAKE_NOTIFY_RC FAKE_HUNG
@@ -185,16 +229,16 @@ fi
 pair() {
   local name=$1
   shift
-  mkdir -p "$XDG_CONFIG_HOME/rclone-bisync" "$HOME/Vaults"
+  mkdir -p "$HOME/.config/rclone-bisync" "$HOME/Vaults"
   {
     echo "# offline folder"
     echo "LOCAL=~/Vaults"
     echo "REMOTE=onedrive:Backup/Vaults"
     printf '%s\n' "$@"
-  } >"$XDG_CONFIG_HOME/rclone-bisync/$name.conf"
+  } >"$HOME/.config/rclone-bisync/$name.conf"
 }
 filter() {
-  printf '+ /Personal.kdbx\n+ /Personal.kdbx.conflict*\n- **\n' >"$XDG_CONFIG_HOME/rclone-bisync/$1.filter"
+  printf '+ /Personal.kdbx\n+ /Personal.kdbx.conflict*\n- **\n' >"$HOME/.config/rclone-bisync/$1.filter"
 }
 
 # --- 2. conf parsing (bisync) -----------------------------------------------
@@ -220,32 +264,32 @@ for bad in ../x -x 'a b' '' "$(printf 'a%.0s' {1..65})" 'x/y'; do
 done
 
 fresh
-mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-printf 'LOCAL=$(touch %s/canary)\nREMOTE=onedrive:x\n' "$T" >"$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+mkdir -p "$HOME/.config/rclone-bisync"
+printf 'LOCAL=$(touch %s/canary)\nREMOTE=onedrive:x\n' "$T" >"$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" run p
 check "conf is parsed, never sourced (no canary, exit 64)" eval 'rc_is 64 && [[ ! -e $T/canary ]]'
 
 fresh
-mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-echo "REMOTE=onedrive:x" >"$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+mkdir -p "$HOME/.config/rclone-bisync"
+echo "REMOTE=onedrive:x" >"$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" run p
 check "missing LOCAL: exit 64" eval 'rc_is 64 && [[ $OUT == *"LOCAL is required"* ]]'
 
 fresh
 pair p
-sed -i 's|^LOCAL=.*|LOCAL=Vaults|' "$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+sed -i 's|^LOCAL=.*|LOCAL=Vaults|' "$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" run p
 check "relative LOCAL: exit 64" rc_is 64
 
 fresh
 pair p
-sed -i 's|^LOCAL=.*|LOCAL=~/nope|' "$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+sed -i 's|^LOCAL=.*|LOCAL=~/nope|' "$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" run p
 check "LOCAL not an existing directory: exit 64" rc_is 64
 
 fresh
 pair p
-sed -i 's|^REMOTE=.*|REMOTE=-bad:x|' "$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+sed -i 's|^REMOTE=.*|REMOTE=-bad:x|' "$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" run p
 check "bad remote name in REMOTE: exit 64" rc_is 64
 
@@ -258,14 +302,14 @@ for iv in 29s 0 0s 0min 500ms 30000ms 2m 1w; do
   fresh
   pair p "INTERVAL=$iv"
   runc "$BISYNC" setup p
-  check "INTERVAL $iv: exit 64, no drop-in" eval 'rc_is 64 && [[ ! -e $XDG_CONFIG_HOME/systemd/user/rclone-bisync@p.timer.d ]]'
+  check "INTERVAL $iv: exit 64, no drop-in" eval 'rc_is 64 && [[ ! -e $HOME/.config/systemd/user/rclone-bisync@p.timer.d ]]'
 done
 for iv in 30s 1min 1h 1d 045s; do
   fresh
   pair p "INTERVAL=$iv"
   runc "$BISYNC" setup p
   check "INTERVAL $iv: accepted" \
-    eval 'rc_is 0 && grep -qx "OnUnitInactiveSec=$iv" "$XDG_CONFIG_HOME/systemd/user/rclone-bisync@p.timer.d/10-interval.conf"'
+    eval 'rc_is 0 && grep -qx "OnUnitInactiveSec=$iv" "$HOME/.config/systemd/user/rclone-bisync@p.timer.d/10-interval.conf"'
 done
 
 fresh
@@ -300,10 +344,79 @@ while IFS=$'\t' read -r kind name; do
 done < <(grep -v '^#' "$NAMES_TSV")
 check "names.tsv: read (at least 20 cases)" eval '((names_n >= 20))'
 
+# The mount-root validator: one bash function, valid_root, copied byte for
+# byte between its marker lines into both scripts and install.sh; every case
+# of tests/fixtures/roots.tsv through each copy, with HOME=/home/tester.
+VR_BEGIN='# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, install.sh; tests/fixtures/roots.tsv) ---'
+VR_END='# --- end valid_root ---'
+# vr_block <file>: the marker block of the file, markers included.
+vr_block() { awk -v b="$VR_BEGIN" -v e="$VR_END" '$0 == b { p = 1 } p { print } p && $0 == e { exit }' "$1"; }
+# vr <block> <path>: the block's valid_root on path (status).
+vr() { HOME=/home/tester bash -c 'eval "$1"; valid_root "$2"' vr "$1" "$2"; }
+VR_FILES=("$BISYNC" "$BACKUP" "$PLUGIN_DIR/install.sh")
+VR_REF=$(vr_block "$BISYNC")
+for f in "${VR_FILES[@]}"; do
+  blk=$(vr_block "$f")
+  check "valid_root: ${f#"$PLUGIN_DIR"/} has the marker block" \
+    eval '[[ $blk == "$VR_BEGIN"$'"'"'\n'"'"'*valid_root\(\)*"$VR_END" ]]'
+  check "valid_root: ${f#"$PLUGIN_DIR"/}'s block is byte-identical to bin/rclone-bisync's" eval '[[ -n $blk && $blk == "$VR_REF" ]]'
+  [[ -n $blk ]] || continue
+  roots_n=0 roots_bad=()
+  while IFS=$'\t' read -r kind path; do
+    [[ $kind == valid || $kind == invalid ]] || continue
+    roots_n=$((roots_n + 1))
+    if vr "$blk" "$path"; then got=valid; else got=invalid; fi
+    [[ $got == "$kind" ]] || roots_bad+=("$kind '${path:0:40}'")
+  done < <(grep -v '^#' "$ROOTS_TSV")
+  check "roots.tsv: ${f#"$PLUGIN_DIR"/} valid_root gives every verdict ($roots_n cases${roots_bad:+; wrong: ${roots_bad[*]}})" \
+    eval '((roots_n >= 30 && ${#roots_bad[@]} == 0))'
+  # Cases a TSV line cannot carry: control characters, and the 255-byte limit
+  # counted in bytes (é is two), non-ASCII allowed.
+  e127=$(printf 'é%.0s' {1..127})
+  check "valid_root (${f##*/}): tab, newline, DEL and ESC are invalid; é is valid; 255 bytes, not characters" \
+    eval '! vr "$blk" /mnt/a$'"'"'\t'"'"'b && ! vr "$blk" /mnt/a$'"'"'\n'"'"'b && ! vr "$blk" /mnt/a$'"'"'\x7f'"'"'b && ! vr "$blk" /mnt/a$'"'"'\e'"'"'b && vr "$blk" /mnt/é && vr "$blk" "/$e127" && ! vr "$blk" "/${e127}a"'
+done
+
+# HOME-fixed paths: XDG_CONFIG_HOME and XDG_STATE_HOME (pointed away from
+# HOME by fresh) are ignored: confs are read from ~/.config, state is written
+# to ~/.local/state, drop-ins go to ~/.config/systemd/user, as the services
+# (run with the user manager's environment) see them.
+fresh
+check "XDG dirs point away from HOME in these tests" \
+  eval '[[ $XDG_CONFIG_HOME != "$HOME/.config" && $XDG_STATE_HOME != "$HOME/.local/state" ]]'
+mkdir -p "$XDG_CONFIG_HOME/rclone-bisync" "$XDG_CONFIG_HOME/rclone-backup" "$HOME/Vaults"
+printf 'LOCAL=~/Vaults\nREMOTE=onedrive:x\n' >"$XDG_CONFIG_HOME/rclone-bisync/xonly.conf"
+printf 'REMOTE=work_drive:\nDEST=~/b\n' >"$XDG_CONFIG_HOME/rclone-backup/xonly.conf"
+echo a.kdbx >"$XDG_CONFIG_HOME/rclone-backup/xonly.files"
+for script in "$BISYNC" "$BACKUP"; do
+  runc "$script" validate xonly
+  check "${script##*/}: a conf only under XDG_CONFIG_HOME is not read (no conf in ~/.config)" \
+    eval 'rc_is 64 && [[ $OUT == *"no conf $HOME/.config/"* ]]'
+done
+pair p
+FAKE_LSF='a.conflict1\n' runc "$BISYNC" run p
+runc "$BISYNC" setup p
+check "rclone-bisync: state in ~/.local/state, drop-ins in ~/.config/systemd/user, nothing under the XDG dirs" \
+  eval '[[ -s $HOME/.local/state/rclone-bisync/p.state && -f $HOME/.config/systemd/user/rclone-bisync@p.path.d/10-local.conf && ! -e $XDG_STATE_HOME/rclone-bisync && ! -e $XDG_CONFIG_HOME/systemd ]]'
+mkdir -p "$HOME/.config/rclone-backup"
+printf 'REMOTE=work_drive:\nDEST=~/b\n' >"$HOME/.config/rclone-backup/j.conf"
+echo a.kdbx >"$HOME/.config/rclone-backup/j.files"
+runc "$BACKUP" run j
+runc "$BACKUP" setup j
+check "rclone-backup: state in ~/.local/state, drop-in in ~/.config/systemd/user, nothing under the XDG dirs" \
+  eval '[[ -s $HOME/.local/state/rclone-backup/j.state && -f $HOME/.config/systemd/user/rclone-backup@j.timer.d/10-schedule.conf && ! -e $XDG_STATE_HOME/rclone-backup && ! -e $XDG_CONFIG_HOME/systemd ]]'
+fresh
+mkdir -p "$T/srv/clouds" "$XDG_CONFIG_HOME/omarchy-cloud"
+printf 'OMARCHY_CLOUD_ROOT=%s\n' "$T/srv/clouds" >"$XDG_CONFIG_HOME/omarchy-cloud/cloud.env"
+pair p
+sed -i "s|^LOCAL=.*|LOCAL=$T/srv|" "$HOME/.config/rclone-bisync/p.conf"
+runc "$BISYNC" validate p
+check "rclone-bisync: a cloud.env only under XDG_CONFIG_HOME is not read" eval 'rc_is 0 && [[ -z $OUT ]]'
+
 # A conf with CRLF line ends is invalid (a \r is a control character).
 fresh
 pair p
-sed -i 's/$/\r/' "$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+sed -i 's/$/\r/' "$HOME/.config/rclone-bisync/p.conf"
 runc "$BISYNC" validate p
 check "bisync: a CRLF conf is invalid (exit 64)" eval 'rc_is 64 && [[ $OUT == *"not a KEY=VALUE line"* ]]'
 runc "$BISYNC" run p
@@ -322,7 +435,7 @@ conflict_note() {
 fresh
 pair vault-A
 filter vault-A
-F=$XDG_CONFIG_HOME/rclone-bisync/vault-A.filter
+F=$HOME/.config/rclone-bisync/vault-A.filter
 FAKE_BISYNC_RC=7 runc "$BISYNC" run vault-A
 want="rclone$(q bisync "$(LOCALDIR)" onedrive:Backup/Vaults --filters-file "$F" "${SAFETY[@]}" --workdir "$(WORKDIR)")"
 check "run: rclone bisync with exactly the safety flags (default filter)" eval '[[ $(head -1 "$FAKE_LOG/rclone") == "$want" ]]'
@@ -330,7 +443,7 @@ check "run: exit code is bisync's (7)" rc_is 7
 check "run: bisync's lock expires (--max-lock 2m), so a killed run cannot block later ones" \
   eval 'grep -q "^rclone bisync .* --max-lock 2m" "$FAKE_LOG/rclone"'
 check "run: state file exit=7, a unix time" \
-  eval 'grep -qx "exit=7" "$XDG_STATE_HOME/rclone-bisync/vault-A.state" && grep -qE "^time=[0-9]{9,}$" "$XDG_STATE_HOME/rclone-bisync/vault-A.state"'
+  eval 'grep -qx "exit=7" "$HOME/.local/state/rclone-bisync/vault-A.state" && grep -qE "^time=[0-9]{9,}$" "$HOME/.local/state/rclone-bisync/vault-A.state"'
 check "run: conflicts listed via rclone lsf of LOCAL, conflict copies only, the filter not applied" \
   eval '[[ $(sed -n 2p "$FAKE_LOG/rclone") == "rclone$(q lsf -R --files-only --include "*.conflict[0-9]*" "$(LOCALDIR)")" ]]'
 check "run: no conflict, no notification" eval '[[ ! -s $FAKE_LOG/notify-send ]]'
@@ -389,19 +502,19 @@ want="notify-send$(q -u critical -a rclone-bisync "vault-A: conflict" "$(conflic
 check "run with conflicts: one critical notification naming them" eval '[[ $(log notify-send) == "$want" ]]'
 check "run with conflicts: logged" eval '[[ $OUT == *"CONFLICT copies present: Personal.kdbx.conflict1 notes.conflict2.txt"* ]]'
 check "run with conflicts: state file lists them" \
-  eval '[[ $(grep ^conflict= "$XDG_STATE_HOME/rclone-bisync/vault-A.state") == $'"'"'conflict=Personal.kdbx.conflict1\nconflict=sub/notes.conflict2.txt'"'"' ]]'
-check "state written atomically (no temp file left)" eval '[[ -z $(find "$XDG_STATE_HOME/rclone-bisync" -name ".*") ]]'
+  eval '[[ $(grep ^conflict= "$HOME/.local/state/rclone-bisync/vault-A.state") == $'"'"'conflict=Personal.kdbx.conflict1\nconflict=sub/notes.conflict2.txt'"'"' ]]'
+check "state written atomically (no temp file left)" eval '[[ -z $(find "$HOME/.local/state/rclone-bisync" -name ".*") ]]'
 : >"$FAKE_LOG/notify-send"
 runc "$BISYNC" run vault-A
 check "run with the same conflicts again: no new notification, still logged" \
   eval '[[ ! -s $FAKE_LOG/notify-send && $OUT == *"CONFLICT copies present: Personal.kdbx.conflict1 notes.conflict2.txt"* ]]'
 check "run with the same conflicts again: the state file still lists them all" \
-  eval '[[ $(grep -c ^conflict= "$XDG_STATE_HOME/rclone-bisync/vault-A.state") == 2 ]]'
+  eval '[[ $(grep -c ^conflict= "$HOME/.local/state/rclone-bisync/vault-A.state") == 2 ]]'
 FAKE_LSF='Personal.kdbx.conflict1\nsub/notes.conflict2.txt\nWork.kdbx.conflict1\nWork.kdbx.conflict2\n' runc "$BISYNC" run vault-A
 want="notify-send$(q -u critical -a rclone-bisync "vault-A: conflict" "$(conflict_note "Work.kdbx.conflict1 Work.kdbx.conflict2")")"
 check "run with a new conflict: one notification naming only the new copies" eval '[[ $(log notify-send) == "$want" ]]'
 check "run with a new conflict: the state file lists all four" \
-  eval '[[ $(grep -c ^conflict= "$XDG_STATE_HOME/rclone-bisync/vault-A.state") == 4 ]]'
+  eval '[[ $(grep -c ^conflict= "$HOME/.local/state/rclone-bisync/vault-A.state") == 4 ]]'
 : >"$FAKE_LOG/notify-send"
 FAKE_LSF='Personal.kdbx.conflict1\n' runc "$BISYNC" run vault-A
 check "run after some copies were merged away: no notification" eval '[[ ! -s $FAKE_LOG/notify-send ]]'
@@ -425,7 +538,7 @@ done
 fresh
 pair vault-A
 filter vault-A
-ST=$XDG_STATE_HOME/rclone-bisync/vault-A.state
+ST=$HOME/.local/state/rclone-bisync/vault-A.state
 export FAKE_LSF='a.conflict1\n'
 FAKE_NOTIFY_RC=1 runc "$BISYNC" run vault-A
 check "notify-send fails: the copy is in the state file, not as notified" \
@@ -455,24 +568,47 @@ unset FAKE_LSF
 # not show the copy, the conflict listing must.
 fresh
 pair vault-A
-printf '+ /Personal.kdbx\n- **\n' >"$XDG_CONFIG_HOME/rclone-bisync/vault-A.filter"
+printf '+ /Personal.kdbx\n- **\n' >"$HOME/.config/rclone-bisync/vault-A.filter"
 export FAKE_LSF_FILTERED='Personal.kdbx\n' FAKE_LSF='Personal.kdbx.conflict1\n'
 runc "$BISYNC" run vault-A
 check "run: a conflict copy the filter hides is still notified" eval '[[ $(log notify-send) == "notify-send$(q -u critical -a rclone-bisync "vault-A: conflict" "$(conflict_note Personal.kdbx.conflict1)")" ]]'
 check "run: a conflict copy the filter hides is in the state file" \
-  eval 'grep -qx "conflict=Personal.kdbx.conflict1" "$XDG_STATE_HOME/rclone-bisync/vault-A.state"'
+  eval 'grep -qx "conflict=Personal.kdbx.conflict1" "$HOME/.local/state/rclone-bisync/vault-A.state"'
 runc "$BISYNC" conflicts vault-A
 check "conflicts: lists a copy the filter hides" eval 'rc_is 0 && [[ $OUT == Personal.kdbx.conflict1 ]]'
 unset FAKE_LSF_FILTERED FAKE_LSF
 
+# A conflict copy name is chosen by whoever writes into the remote: the
+# notification strips < > & from it (and from the pair name), so the shell's
+# renderer cannot make it a link; the log line keeps the real name.
 fresh
 pair vault-A
-printf '+ /Personal.kdbx\n- **\n' >"$XDG_CONFIG_HOME/rclone-bisync/vault-A.filter"
+FAKE_LSF="$HOSTILE.conflict1\nsub/x&y.conflict2\n" runc "$BISYNC" run vault-A
+check "conflict notification: summary and body have no < > & (hostile copy name)" \
+  eval 'rc_is 0 && [[ $(notify_arg 4) == "vault-A: conflict" ]] && no_markup_chars "$(notify_arg 4)" && no_markup_chars "$(notify_arg 5)"'
+check "conflict notification: the body still names the copies, minus < > &" \
+  eval '[[ $(notify_arg 5) == "$(conflict_note "a href=\"https:#47;#47;evil.example\"Open the fix#47;a.conflict1 xy.conflict2")" ]]'
+check "conflict log line: the real names, unchanged" \
+  eval '[[ $OUT == *"CONFLICT copies present: $HOSTILE.conflict1 x&y.conflict2"* ]] && grep -qxF "conflict=$HOSTILE.conflict1" "$HOME/.local/state/rclone-bisync/vault-A.state"'
+if [[ -n $RENDER ]]; then
+  notify_arg 5 >"$T/body"
+  printf '%s' "$(conflict_note "$HOSTILE.conflict1")" >"$T/raw"
+  check "conflict notification: the shell's Markup.render of the body has no link" \
+    eval '[[ $(render_markup "$T/body") != *"<a"* ]]'
+  [[ $(render_markup "$T/raw") == *"<a href="* ]] ||
+    echo "note: Markup.render no longer makes a link of the raw name; the render check above proves less"
+else
+  echo "skip Markup.render check (no $MARKUP_JS or no node)"
+fi
+
+fresh
+pair vault-A
+printf '+ /Personal.kdbx\n- **\n' >"$HOME/.config/rclone-bisync/vault-A.filter"
 touch "$(LOCALDIR)/Personal.kdbx"
 FAKE_LSF_FIND=1 FAKE_LSF_DROP='*.conflict*' runc "$BISYNC" setup vault-A
 check "setup: warns when the filter excludes an included file's conflict copies" \
   eval 'rc_is 0 && [[ $OUT == *"warning: the filter"*"excludes the conflict copies"*Personal.kdbx* ]]'
-check "setup with the warning: drop-ins still written" test -f "$XDG_CONFIG_HOME/systemd/user/rclone-bisync@vault-A.timer.d/10-interval.conf"
+check "setup with the warning: drop-ins still written" test -f "$HOME/.config/systemd/user/rclone-bisync@vault-A.timer.d/10-interval.conf"
 check "setup: the probe asks rclone with --filter-from, on a temp dir, not on LOCAL" \
   eval '[[ $(sed -n 2p "$FAKE_LOG/rclone") == "rclone lsf -R --files-only --filter-from "* && $(sed -n 2p "$FAKE_LOG/rclone") != *"$(LOCALDIR)"* ]]'
 filter vault-A
@@ -482,7 +618,7 @@ check "setup: no warning when the filter includes the conflict copies" eval 'rc_
 fresh
 pair vault-A
 filter vault-A
-F=$XDG_CONFIG_HOME/rclone-bisync/vault-A.filter
+F=$HOME/.config/rclone-bisync/vault-A.filter
 runc "$BISYNC" check vault-A
 want="rclone$(q check "$(LOCALDIR)" onedrive:Backup/Vaults --filter-from "$F" --download --combined)"
 check "check: rclone check LOCAL REMOTE --filter-from F --download (check has no --filters-file)" eval '[[ $(head -1 "$FAKE_LOG/rclone") == "$want "* ]] && rc_is 0'
@@ -496,7 +632,7 @@ check "check: an error line (!) is exit 2" rc_is 2
 fresh
 pair vault-A
 filter vault-A
-F=$XDG_CONFIG_HOME/rclone-bisync/vault-A.filter
+F=$HOME/.config/rclone-bisync/vault-A.filter
 FAKE_CHECK_RC=1 FAKE_CHECK_COMBINED='* Personal.kdbx\n' runc "$BISYNC" resync vault-A
 check "resync when they differ: REFUSED, exit 3" eval 'rc_is 3 && [[ $OUT == *REFUSING* ]]'
 check "resync when they differ: bisync never called" eval '! grep -q "^rclone bisync" "$FAKE_LOG/rclone"'
@@ -510,21 +646,21 @@ runc "$BISYNC" resync vault-A
 want="rclone$(q bisync "$(LOCALDIR)" onedrive:Backup/Vaults --filters-file "$F" "${SAFETY[@]}" --workdir "$(WORKDIR)" --resync)"
 check "resync when identical: check first, then bisync --resync" \
   eval '[[ $(sed -n 1p "$FAKE_LOG/rclone") == "rclone check "* && $(sed -n 2p "$FAKE_LOG/rclone") == "$want" ]] && rc_is 0'
-check "resync writes the state file" test -s "$XDG_STATE_HOME/rclone-bisync/vault-A.state"
+check "resync writes the state file" test -s "$HOME/.local/state/rclone-bisync/vault-A.state"
 
 fresh
 pair vault-A
 runc "$BISYNC" dry-run vault-A
 want="rclone$(q bisync "$(LOCALDIR)" onedrive:Backup/Vaults "${SAFETY[@]}" --workdir "$(WORKDIR)" --dry-run)"
 check "dry-run: bisync --dry-run, no --resync, no state" \
-  eval '[[ $(log rclone) == "$want" ]] && [[ ! -e $XDG_STATE_HOME/rclone-bisync/vault-A.state ]]'
+  eval '[[ $(log rclone) == "$want" ]] && [[ ! -e $HOME/.local/state/rclone-bisync/vault-A.state ]]'
 
 fresh
 mkdir -p "$HOME/My Vault%d"
 pair vault-A "INTERVAL=5min"
-sed -i 's|^LOCAL=.*|LOCAL=~/My Vault%d|' "$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+sed -i 's|^LOCAL=.*|LOCAL=~/My Vault%d|' "$HOME/.config/rclone-bisync/vault-A.conf"
 runc "$BISYNC" setup vault-A
-UD=$XDG_CONFIG_HOME/systemd/user
+UD=$HOME/.config/systemd/user
 check "setup: path drop-in, % escaped" \
   eval '[[ $(cat "$UD/rclone-bisync@vault-A.path.d/10-local.conf") == "$(printf "[Path]\nPathChanged=%s" "$HOME/My Vault%%d")" ]]'
 check "setup: timer drop-in resets and restates OnStartupSec" \
@@ -545,8 +681,8 @@ runc "$BISYNC" setup vault-A # keep the drop-ins for section 5
 # as written and through a symlink: setup refuses; run, check, resync and
 # dry-run warn and go on (a sync is never stopped for it).
 bk_dest() { # bk_dest <job> <DEST value>
-  mkdir -p "$XDG_CONFIG_HOME/rclone-backup"
-  printf 'REMOTE=work_drive:\nDEST=%s\n' "$2" >"$XDG_CONFIG_HOME/rclone-backup/$1.conf"
+  mkdir -p "$HOME/.config/rclone-backup"
+  printf 'REMOTE=work_drive:\nDEST=%s\n' "$2" >"$HOME/.config/rclone-backup/$1.conf"
 }
 for dest in "~/Vaults/backups" "~/Vaults" "~/Vaults/" "~/" "@HOME@/Vaults/a/b"; do
   fresh
@@ -555,7 +691,7 @@ for dest in "~/Vaults/backups" "~/Vaults" "~/Vaults/" "~/" "@HOME@/Vaults/a/b"; 
   bk_dest archive-vaults "$dest"
   runc "$BISYNC" setup vault-A
   check "bisync setup: LOCAL overlapping backup DEST $dest is refused (exit 64, no rclone, no drop-in)" \
-    eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps DEST"*"archive-vaults"* && $OUT != *continuing* && ! -e $XDG_CONFIG_HOME/systemd/user/rclone-bisync@vault-A.path.d ]]'
+    eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps DEST"*"archive-vaults"* && $OUT != *continuing* && ! -e $HOME/.config/systemd/user/rclone-bisync@vault-A.path.d ]]'
   for sub in run check resync dry-run; do
     : >"$FAKE_LOG/rclone"
     runc "$BISYNC" "$sub" vault-A
@@ -594,7 +730,7 @@ check "check of an empty pair: exit 4, nothing to sync" \
 : >"$FAKE_LOG/rclone"
 FAKE_CHECK_COMBINED='' runc "$BISYNC" resync vault-A
 check "resync of an empty pair: refused (exit 4), bisync never called, no state" \
-  eval 'rc_is 4 && [[ $OUT == *REFUSING*"nothing to sync"* ]] && ! grep -q "^rclone bisync" "$FAKE_LOG/rclone" && [[ ! -e $XDG_STATE_HOME/rclone-bisync/vault-A.state ]]'
+  eval 'rc_is 4 && [[ $OUT == *REFUSING*"nothing to sync"* ]] && ! grep -q "^rclone bisync" "$FAKE_LOG/rclone" && [[ ! -e $HOME/.local/state/rclone-bisync/vault-A.state ]]'
 FAKE_CHECK_COMBINED='= Personal.kdbx\n= sub/x\n' runc "$BISYNC" check vault-A
 check "check with identical files: exit 0" rc_is 0
 
@@ -621,8 +757,8 @@ check "bisync validate: LOCAL overlapping a backup DEST is exit 64, no warning-a
 
 # LOCAL against the LOCAL of the other pairs.
 other_pair() { # other_pair <name> <LOCAL value>
-  mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-  printf 'LOCAL=%s\nREMOTE=gdrive:other\n' "$2" >"$XDG_CONFIG_HOME/rclone-bisync/$1.conf"
+  mkdir -p "$HOME/.config/rclone-bisync"
+  printf 'LOCAL=%s\nREMOTE=gdrive:other\n' "$2" >"$HOME/.config/rclone-bisync/$1.conf"
 }
 for other in "~/Vaults" "~/Vaults/sub" "~/" "@HOME@/Vaults/"; do
   fresh
@@ -631,7 +767,7 @@ for other in "~/Vaults" "~/Vaults/sub" "~/" "@HOME@/Vaults/"; do
   for sub in setup validate; do
     runc "$BISYNC" "$sub" vault-A
     check "bisync $sub: LOCAL overlapping the LOCAL $other of another pair is refused (exit 64, no drop-in)" \
-      eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps LOCAL"*"offline folder vault-B"* && $OUT != *continuing* && ! -e $XDG_CONFIG_HOME/systemd/user/rclone-bisync@vault-A.path.d ]]'
+      eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps LOCAL"*"offline folder vault-B"* && $OUT != *continuing* && ! -e $HOME/.config/systemd/user/rclone-bisync@vault-A.path.d ]]'
   done
   for sub in run check resync dry-run; do
     : >"$FAKE_LOG/rclone"
@@ -659,7 +795,7 @@ check "bisync setup: another pair's LOCAL inside LOCAL through a symlink is refu
 cloud_local() { # cloud_local <dir under HOME>: pair vault-A on it
   mkdir -p "$HOME/$1"
   pair vault-A
-  sed -i "s|^LOCAL=.*|LOCAL=~/$1|" "$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+  sed -i "s|^LOCAL=.*|LOCAL=~/$1|" "$HOME/.config/rclone-bisync/vault-A.conf"
 }
 fresh
 cloud_local Cloud/onedrive/K
@@ -699,6 +835,128 @@ printf 'x %s fuse rw 0 0\n' "$HOME" >"$OMARCHY_CLOUD_MOUNTS"
 runc "$BISYNC" validate vault-A
 check "bisync validate: fstype fuse (no subtype) counts" eval 'rc_is 64 && [[ $OUT == *"FUSE mount $HOME (fuse)"* ]]'
 
+# The cloud guard checks overlap both ways: a LOCAL that contains a cloud
+# location (the configured mount root of cloud.env, /mnt/cloud, ~/Cloud, a
+# FUSE mount) would sync a remote into itself. The configured root is a
+# scratch dir outside the scratch HOME: $T/srv/clouds.
+# cloud_env <line...>: the scratch HOME's cloud.env.
+cloud_env() {
+  mkdir -p "$HOME/.config/omarchy-cloud"
+  printf '%s\n' "$@" >"$HOME/.config/omarchy-cloud/cloud.env"
+}
+# local_at <path>: pair vault-A on the absolute path (created).
+local_at() {
+  mkdir -p "$1"
+  pair vault-A
+  sed -i "s|^LOCAL=.*|LOCAL=$1|" "$HOME/.config/rclone-bisync/vault-A.conf"
+}
+# root_cases <script> <setter>: the overlap cases against the configured root,
+# for LOCAL (bisync) or DEST (backup); <setter> <path> points the pair or job
+# at path.
+root_cases() {
+  local script=$1 setter=$2 what=$3 at
+  for at in "$T/srv" "$T" "$T/srv/clouds" "$T/srv/clouds/od/x"; do
+    "$setter" "$at"
+    runc "$script" validate "$what"
+    check "${script##*/} validate: \$T${at#"$T"} overlapping the configured root srv/clouds is refused (exit 64)" \
+      eval 'rc_is 64 && no_rclone && [[ $OUT == *"the cloud location $T/srv/clouds;"* ]]'
+  done
+  "$setter" "$T/srv"
+  runc "$script" setup "$what"
+  check "${script##*/} setup: the parent of the configured root is refused, naming it (contains)" \
+    eval 'rc_is 64 && [[ $OUT == *" $T/srv contains the cloud location $T/srv/clouds;"* && $OUT != *continuing* ]]'
+  for at in "$T/srv/cloudsy" "$T/srv/cl"; do
+    "$setter" "$at"
+    runc "$script" validate "$what"
+    check "${script##*/} validate: \$T${at#"$T"}, next to the configured root, is not a hit (exit 0)" eval 'rc_is 0 && [[ -z $OUT ]]'
+  done
+}
+fresh
+mkdir -p "$T/srv/clouds/od"
+cloud_env "# set by install.sh" "OMARCHY_CLOUD_ROOT=$T/srv/clouds"
+root_cases "$BISYNC" local_at vault-A
+local_at "$T/srv"
+runc "$BISYNC" run vault-A
+check "bisync run: LOCAL containing the configured root warns and runs" \
+  eval 'rc_is 0 && grep -q "^rclone bisync " "$FAKE_LOG/rclone" && [[ $OUT == *"contains the cloud location $T/srv/clouds; "*"continuing"* ]]'
+# The root through a symlink: LOCAL is the link's parent's real folder.
+fresh
+mkdir -p "$T/real/clouds" "$T/links"
+ln -s "$T/real/clouds" "$T/links/clouds"
+cloud_env "OMARCHY_CLOUD_ROOT=$T/links/clouds"
+local_at "$T/real"
+runc "$BISYNC" validate vault-A
+check "bisync validate: LOCAL containing the folder the configured root links to is refused" \
+  eval 'rc_is 64 && [[ $OUT == *"contains the cloud location $T/links/clouds"* ]]'
+# /mnt/cloud stays a target whatever the setting says (an old mount there).
+if [[ -d /mnt ]]; then
+  for env in "OMARCHY_CLOUD_ROOT=$T/srv/clouds" ""; do
+    fresh
+    lbl=without
+    [[ -n $env ]] && cloud_env "$env" && lbl=with
+    local_at /mnt
+    runc "$BISYNC" validate vault-A
+    check "bisync validate: LOCAL=/mnt contains /mnt/cloud: refused ($lbl a configured root)" \
+      eval 'rc_is 64 && [[ $OUT == *"LOCAL /mnt contains the cloud location /mnt/cloud;"* ]]'
+  done
+else
+  echo "skip LOCAL=/mnt cases (no /mnt)"
+fi
+# Invalid or unsafe settings are ignored (the guard falls back to /mnt/cloud
+# and ~/Cloud), and are never executed.
+for env in "OMARCHY_CLOUD_ROOT=\$(touch $T/canary)" "OMARCHY_CLOUD_ROOT=\"$T/srv/clouds\"" \
+  "OMARCHY_CLOUD_ROOT=\`touch $T/canary\`" "OMARCHY_CLOUD_ROOT=$T/srv/clouds/" "OMARCHY_CLOUD_ROOT=srv/clouds" \
+  "OMARCHY_CLOUD_ROOT=$T/srv/clouds x" " OMARCHY_CLOUD_ROOT=$T/srv/clouds" "OMARCHY_CLOUD_ROOT=\$HOME/../srv/clouds"; do
+  fresh
+  mkdir -p "$T/srv/clouds"
+  cloud_env "$env"
+  local_at "$T/srv"
+  runc "$BISYNC" validate vault-A
+  check "bisync validate: cloud.env '${env:0:40}' is invalid: ignored, never run (exit 0, no canary)" \
+    eval 'rc_is 0 && [[ -z $OUT && ! -e $T/canary ]]'
+done
+fresh
+mkdir -p "$T/srv/clouds" "$T/srv/old"
+cloud_env "OMARCHY_CLOUD_ROOT=$T/srv/old" "" "#OMARCHY_CLOUD_ROOT=$T/x" "OMARCHY_CLOUD_ROOT=$T/srv/clouds"$'\r'
+local_at "$T/srv/clouds/x"
+runc "$BISYNC" validate vault-A
+check "bisync: cloud.env, the last key line wins, \\r stripped, # lines skipped" \
+  eval 'rc_is 64 && [[ $OUT == *"inside the cloud location $T/srv/clouds;"* ]]'
+local_at "$T/srv/old"
+runc "$BISYNC" validate vault-A
+check "bisync: cloud.env, an earlier key line is overridden" eval 'rc_is 0'
+# A root setting inside HOME is invalid (valid_root): not used as a target.
+fresh
+cloud_env "OMARCHY_CLOUD_ROOT=$HOME/mnt"
+local_at "$HOME/mnt"
+runc "$BISYNC" validate vault-A
+check "bisync: a configured root inside HOME is invalid, ignored" eval 'rc_is 0 && [[ -z $OUT ]]'
+# Only the first 4096 bytes are read: a key line past them is not seen.
+fresh
+mkdir -p "$T/srv/clouds"
+cloud_env "#$(printf 'x%.0s' {1..4100})" "OMARCHY_CLOUD_ROOT=$T/srv/clouds"
+local_at "$T/srv"
+runc "$BISYNC" validate vault-A
+check "bisync: cloud.env is read up to 4096 bytes only" eval 'rc_is 0 && [[ -z $OUT ]]'
+# ~/Cloud and FUSE mounts, the containing direction.
+fresh
+mkdir -p "$HOME/Cloud"
+local_at "$HOME"
+runc "$BISYNC" validate vault-A
+check "bisync validate: LOCAL=\$HOME contains ~/Cloud: refused" \
+  eval 'rc_is 64 && [[ $OUT == *"LOCAL $HOME contains the cloud location $HOME/Cloud;"* ]]'
+fresh
+local_at "$HOME/sub"
+printf 'me@nas:/ %s fuse.sshfs rw 0 0\n' "$HOME/sub/nas" >"$OMARCHY_CLOUD_MOUNTS"
+for sub in setup validate; do
+  runc "$BISYNC" "$sub" vault-A
+  check "bisync $sub: LOCAL containing a FUSE mount is refused, naming it" \
+    eval 'rc_is 64 && [[ $OUT == *"LOCAL $HOME/sub contains the FUSE mount $HOME/sub/nas (fuse.sshfs)"* && $OUT != *continuing* ]]'
+done
+runc "$BISYNC" run vault-A
+check "bisync run: LOCAL containing a FUSE mount warns and runs" \
+  eval 'rc_is 0 && grep -q "^rclone bisync " "$FAKE_LOG/rclone" && [[ $OUT == *"contains the FUSE mount"*"; continuing"* ]]'
+
 # A hung FUSE mount (~/Mnt/hung, realpath hangs under it): the guards never
 # resolve a path at or under a FUSE mount point; a run completes, and setup
 # and validate still refuse the same overlaps (found as written).
@@ -722,7 +980,7 @@ fresh
 hung_mount
 pair vault-A
 mkdir -p "$HOME/Mnt/hung/x"
-sed -i 's|^LOCAL=.*|LOCAL=~/Mnt/hung/x|' "$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+sed -i 's|^LOCAL=.*|LOCAL=~/Mnt/hung/x|' "$HOME/.config/rclone-bisync/vault-A.conf"
 other_pair vault-B "~/Mnt/hung/x/sub"
 bk_dest archive-x "~/Mnt/hung/x/backups"
 runhung "$BISYNC" run vault-A
@@ -734,11 +992,11 @@ for sub in setup validate; do
   check "bisync $sub: the same overlap inside a hung FUSE mount is still refused (exit 64), nothing resolved there" \
     eval 'rc_is 64 && no_rclone && ! resolved_under "$HOME/Mnt" && [[ $OUT == *"overlaps DEST"*"archive-x"* && $OUT != *continuing* ]]'
 done
-rm "$XDG_CONFIG_HOME/rclone-backup/archive-x.conf"
+rm "$HOME/.config/rclone-backup/archive-x.conf"
 runhung "$BISYNC" validate vault-A
 check "bisync validate: another pair's LOCAL inside LOCAL, both in a hung FUSE mount, is refused" \
   eval 'rc_is 64 && ! resolved_under "$HOME/Mnt" && [[ $OUT == *"overlaps LOCAL"*"vault-B"* ]]'
-rm "$XDG_CONFIG_HOME/rclone-bisync/vault-B.conf"
+rm "$HOME/.config/rclone-bisync/vault-B.conf"
 runhung "$BISYNC" setup vault-A
 check "bisync setup: LOCAL inside a hung FUSE mount is refused, naming the mount" \
   eval 'rc_is 64 && ! resolved_under "$HOME/Mnt" && [[ $OUT == *"inside the FUSE mount $HOME/Mnt/hung (fuse.rclone)"* ]]'
@@ -770,14 +1028,14 @@ LIST_SHAPES=(
 job() { # job <name> [extra conf lines...]; files list from LIST_SHAPES
   local name=$1
   shift
-  mkdir -p "$XDG_CONFIG_HOME/rclone-backup"
+  mkdir -p "$HOME/.config/rclone-backup"
   {
     echo "REMOTE=work_drive:"
     echo "STRIP_PREFIX=acme/"
     echo "DEST=~/Backups/vaults"
     printf '%s\n' "$@"
-  } >"$XDG_CONFIG_HOME/rclone-backup/$name.conf"
-  { echo "# admin databases"; printf '%s\n' "${LIST_SHAPES[@]}"; } >"$XDG_CONFIG_HOME/rclone-backup/$name.files"
+  } >"$HOME/.config/rclone-backup/$name.conf"
+  { echo "# admin databases"; printf '%s\n' "${LIST_SHAPES[@]}"; } >"$HOME/.config/rclone-backup/$name.files"
 }
 
 fresh
@@ -822,7 +1080,7 @@ check "copyto <remote path> <local .part>, with retries" \
 check "read-only toward the remote: every rclone call is copyto <remote> <local DEST>" \
   eval '! grep -v "^rclone copyto work_drive:[^ ]* $(printf %q "$DEST")/[^ ]*\.part --retries 3 --log-level ERROR$" "$FAKE_LOG/rclone" | grep -q .'
 check "state: exit=0 ok=5 failed=0" \
-  eval 'grep -qx exit=0 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state" && grep -qx ok=5 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state" && grep -qx failed=0 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+  eval 'grep -qx exit=0 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx ok=5 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx failed=0 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 check "no notification on success" eval '[[ ! -s $FAKE_LOG/notify-send ]]'
 runc "$BACKUP" run archive-vaults
 check "a second run the same day replaces, does not duplicate" eval 'rc_is 0 && [[ $(find "$DEST" -name "*.$TODAY.kdbx" | wc -l) == 5 ]]'
@@ -843,7 +1101,7 @@ check "a failed copy: its .part removed, no copy under its name" \
 check "a failed copy: one normal notification from rclone-backup" \
   eval '[[ $(log notify-send | wc -l) == 1 && $(log notify-send) == "notify-send -u normal -a rclone-backup "* ]]'
 check "a failed copy: state exit=1 ok=4 failed=1" \
-  eval 'grep -qx exit=1 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state" && grep -qx ok=4 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state" && grep -qx failed=1 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+  eval 'grep -qx exit=1 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx ok=4 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx failed=1 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 
 fresh
 job archive-vaults "KEEP=1"
@@ -854,7 +1112,7 @@ echo old1 >"$DEST/$J.2026-11-01.kdbx"
 echo old2 >"$DEST/$J.2026-11-02.kdbx"
 PATH="$MVSTUB:$PATH" FAKE_MV_FAIL="$DEST/$J.$TODAY.kdbx" runc "$BACKUP" run archive-vaults
 check "a failed mv: exit 1, counted failed (state ok=4 failed=1)" \
-  eval 'rc_is 1 && grep -qx ok=4 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state" && grep -qx failed=1 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+  eval 'rc_is 1 && grep -qx ok=4 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx failed=1 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 check "a failed mv: its .part removed, its older copies not pruned" \
   eval '[[ -z $(find "$DEST" -name "*.part") && -f $DEST/$J.2026-11-01.kdbx && -f $DEST/$J.2026-11-02.kdbx && ! -e $DEST/$J.$TODAY.kdbx ]]'
 check "a failed mv: notified" eval '[[ $(log notify-send) == *"$(printf %q "1 of 5 files failed")"* ]]'
@@ -866,13 +1124,13 @@ holder=$!
 for _ in {1..50}; do flock -n "$XDG_RUNTIME_DIR/rclone-backup-archive-vaults.lock" true || break; sleep 0.05; done
 runc "$BACKUP" run archive-vaults
 check "backup lock busy: run exits 0 without rclone or state" \
-  eval 'rc_is 0 && no_rclone && [[ $OUT == *"another run is active"* && ! -e $XDG_STATE_HOME/rclone-backup/archive-vaults.state ]]'
+  eval 'rc_is 0 && no_rclone && [[ $OUT == *"another run is active"* && ! -e $HOME/.local/state/rclone-backup/archive-vaults.state ]]'
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 
 fresh
-mkdir -p "$XDG_CONFIG_HOME/rclone-backup"
-printf 'REMOTE=gd:Shared/docs\nDEST=%s/out\nFILES=~/list\n' "$T" >"$XDG_CONFIG_HOME/rclone-backup/j.conf"
+mkdir -p "$HOME/.config/rclone-backup"
+printf 'REMOTE=gd:Shared/docs\nDEST=%s/out\nFILES=~/list\n' "$T" >"$HOME/.config/rclone-backup/j.conf"
 printf 'a/report.pdf\nREADME\n.hidden\n' >"$HOME/list"
 runc "$BACKUP" run j
 check "prefix in REMOTE, other extensions, none, dotfile" \
@@ -884,7 +1142,7 @@ check "list: the validated paths" eval 'rc_is 0 && [[ $OUT == $'"'"'a/report.pdf
 bad_files() { # bad_files <description> <list line>
   fresh
   job j
-  printf '%s\n' "$2" >>"$XDG_CONFIG_HOME/rclone-backup/j.files"
+  printf '%s\n' "$2" >>"$HOME/.config/rclone-backup/j.files"
   runc "$BACKUP" run j
   check "files list $1: exit 64, nothing copied" eval 'rc_is 64 && no_rclone'
 }
@@ -894,19 +1152,19 @@ bad_files "with a trailing /" "acme/dir/"
 bad_files "with an empty segment" "acme//x.kdbx"
 bad_files "with a duplicate copy name" "acme/Admin/Segurança/Team.kdbx"
 check "invalid conf on run: notified and recorded (exit=64)" \
-  eval '[[ -s $FAKE_LOG/notify-send ]] && grep -qx exit=64 "$XDG_STATE_HOME/rclone-backup/j.state"'
+  eval '[[ -s $FAKE_LOG/notify-send ]] && grep -qx exit=64 "$HOME/.local/state/rclone-backup/j.state"'
 
 for kv in "KEEP=0" "KEEP=366" "KEEP=x" "SCHEDULE=daily;rm" "COLOR=red" "REMOTE=work_drive:x/" "REMOTE=work_drive:../x"; do
   fresh
   job j "$kv"
-  [[ $kv == REMOTE=* ]] && sed -i '1d' "$XDG_CONFIG_HOME/rclone-backup/j.conf"
+  [[ $kv == REMOTE=* ]] && sed -i '1d' "$HOME/.config/rclone-backup/j.conf"
   runc "$BACKUP" run j
   check "backup conf $kv: exit 64" eval 'rc_is 64 && no_rclone'
 done
 fresh
-mkdir -p "$XDG_CONFIG_HOME/rclone-backup"
-echo "REMOTE=work_drive:" >"$XDG_CONFIG_HOME/rclone-backup/j.conf"
-: >"$XDG_CONFIG_HOME/rclone-backup/j.files"
+mkdir -p "$HOME/.config/rclone-backup"
+echo "REMOTE=work_drive:" >"$HOME/.config/rclone-backup/j.conf"
+: >"$HOME/.config/rclone-backup/j.files"
 runc "$BACKUP" run j
 check "backup conf without DEST: exit 64" rc_is 64
 runc "$BACKUP" run ../j
@@ -916,26 +1174,26 @@ check "bad job name: exit 64" rc_is 64
 for local in "~/Backups/vaults/sub" "~/Backups/vaults" "~/Backups" "~/"; do
   fresh
   job archive-vaults
-  mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-  printf 'LOCAL=%s\nREMOTE=onedrive:x\n' "$local" >"$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+  mkdir -p "$HOME/.config/rclone-bisync"
+  printf 'LOCAL=%s\nREMOTE=onedrive:x\n' "$local" >"$HOME/.config/rclone-bisync/vault-A.conf"
   runc "$BACKUP" setup archive-vaults
   check "backup setup: DEST overlapping LOCAL $local is refused (exit 64, no rclone, no drop-in)" \
-    eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps LOCAL"*"vault-A"* && $OUT != *continuing* && ! -e $XDG_CONFIG_HOME/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
+    eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps LOCAL"*"vault-A"* && $OUT != *continuing* && ! -e $HOME/.config/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
   runc "$BACKUP" run archive-vaults
   check "backup run: DEST overlapping offline folder LOCAL $local warns and backs up (exit 0, copied, not notified)" \
-    eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"warning: archive-vaults: DEST"*"overlaps LOCAL"*"vault-A"*"; continuing"* && ! -s $FAKE_LOG/notify-send ]] && grep -qx exit=0 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+    eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"warning: archive-vaults: DEST"*"overlaps LOCAL"*"vault-A"*"; continuing"* && ! -s $FAKE_LOG/notify-send ]] && grep -qx exit=0 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 done
 fresh
 job archive-vaults
-mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-printf 'LOCAL=~/Backups/vaults-sync\nREMOTE=onedrive:x\n' >"$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+mkdir -p "$HOME/.config/rclone-bisync"
+printf 'LOCAL=~/Backups/vaults-sync\nREMOTE=onedrive:x\n' >"$HOME/.config/rclone-bisync/vault-A.conf"
 runc "$BACKUP" run archive-vaults
 check "backup run: a LOCAL next to DEST (vaults-sync vs vaults) is not an overlap" rc_is 0
 fresh
 job archive-vaults
-mkdir -p "$HOME/Vaults" "$HOME/Backups" "$XDG_CONFIG_HOME/rclone-bisync"
+mkdir -p "$HOME/Vaults" "$HOME/Backups" "$HOME/.config/rclone-bisync"
 ln -s "$HOME/Vaults" "$HOME/Backups/vaults"
-printf 'LOCAL=~/Vaults\nREMOTE=onedrive:x\n' >"$XDG_CONFIG_HOME/rclone-bisync/vault-A.conf"
+printf 'LOCAL=~/Vaults\nREMOTE=onedrive:x\n' >"$HOME/.config/rclone-bisync/vault-A.conf"
 runc "$BACKUP" setup archive-vaults
 check "backup setup: a DEST that is LOCAL through a symlink is refused" eval 'rc_is 64 && no_rclone'
 runc "$BACKUP" run archive-vaults
@@ -945,7 +1203,7 @@ check "backup run: a DEST that is LOCAL through a symlink warns and backs up" \
 fresh
 job archive-vaults "SCHEDULE=*-*-* 03:30"
 runc "$BACKUP" setup archive-vaults
-UD=$XDG_CONFIG_HOME/systemd/user
+UD=$HOME/.config/systemd/user
 check "backup setup: drop-in resets OnCalendar then sets SCHEDULE" \
   eval '[[ $(cat "$UD/rclone-backup@archive-vaults.timer.d/10-schedule.conf") == $'"'"'[Timer]\nOnCalendar=\nOnCalendar=*-*-* 03:30'"'"' ]]'
 check "backup setup: daemon-reload, rclone not called" eval '[[ $(log systemctl) == "systemctl --user daemon-reload" ]] && no_rclone'
@@ -954,27 +1212,27 @@ fresh
 job j "SCHEDULE=every day"
 runc "$BACKUP" setup j
 if command -v systemd-analyze >/dev/null; then
-  check "backup setup: a SCHEDULE systemd cannot parse is exit 64" eval 'rc_is 64 && [[ ! -e $XDG_CONFIG_HOME/systemd/user/rclone-backup@j.timer.d ]]'
+  check "backup setup: a SCHEDULE systemd cannot parse is exit 64" eval 'rc_is 64 && [[ ! -e $HOME/.config/systemd/user/rclone-backup@j.timer.d ]]'
 fi
 fresh
-mkdir -p "$XDG_CONFIG_HOME/systemd/user/rclone-backup@j.timer.d"
-echo x >"$XDG_CONFIG_HOME/systemd/user/rclone-backup@j.timer.d/10-schedule.conf"
+mkdir -p "$HOME/.config/systemd/user/rclone-backup@j.timer.d"
+echo x >"$HOME/.config/systemd/user/rclone-backup@j.timer.d/10-schedule.conf"
 runc "$BACKUP" teardown j
-check "backup teardown: drop-in dir gone, no conf needed" eval 'rc_is 0 && [[ ! -e $XDG_CONFIG_HOME/systemd/user/rclone-backup@j.timer.d ]]'
+check "backup teardown: drop-in dir gone, no conf needed" eval 'rc_is 0 && [[ ! -e $HOME/.config/systemd/user/rclone-backup@j.timer.d ]]'
 
 # An empty files list is an invalid conf everywhere: run notifies and records
 # exit=64; setup, validate and list are exit 64.
 fresh
 job archive-vaults
-printf '# nothing yet\n\n' >"$XDG_CONFIG_HOME/rclone-backup/archive-vaults.files"
+printf '# nothing yet\n\n' >"$HOME/.config/rclone-backup/archive-vaults.files"
 runc "$BACKUP" run archive-vaults
 check "empty files list: run exit 64, no rclone, notified, state exit=64" \
-  eval 'rc_is 64 && no_rclone && [[ $OUT == *"files list"*"is empty"* && -s $FAKE_LOG/notify-send ]] && grep -qx exit=64 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+  eval 'rc_is 64 && no_rclone && [[ $OUT == *"files list"*"is empty"* && -s $FAKE_LOG/notify-send ]] && grep -qx exit=64 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 check "empty files list: run creates no DEST" eval '[[ ! -e $HOME/Backups/vaults ]]'
 for sub in setup validate list; do
   runc "$BACKUP" "$sub" archive-vaults
   check "empty files list: $sub exit 64, no drop-in" \
-    eval 'rc_is 64 && [[ $OUT == *"is empty"* && ! -e $XDG_CONFIG_HOME/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
+    eval 'rc_is 64 && [[ $OUT == *"is empty"* && ! -e $HOME/.config/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
 done
 
 # validate: the conf, the list and every setup-time guard; nothing written.
@@ -992,7 +1250,7 @@ if command -v systemd-analyze >/dev/null; then
 fi
 
 # set_dest <job> <DEST value>
-set_dest() { sed -i "s|^DEST=.*|DEST=$2|" "$XDG_CONFIG_HOME/rclone-backup/$1.conf"; }
+set_dest() { sed -i "s|^DEST=.*|DEST=$2|" "$HOME/.config/rclone-backup/$1.conf"; }
 
 # DEST against the DEST of the other jobs.
 for other in "~/Backups/vaults" "~/Backups" "~/Backups/vaults/old" "@HOME@/Backups/vaults/"; do
@@ -1002,11 +1260,11 @@ for other in "~/Backups/vaults" "~/Backups" "~/Backups/vaults/old" "@HOME@/Backu
   for sub in setup validate; do
     runc "$BACKUP" "$sub" archive-vaults
     check "backup $sub: DEST overlapping the DEST $other of another job is refused (exit 64, no drop-in)" \
-      eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps DEST"*"backup job other-job"* && $OUT != *continuing* && ! -e $XDG_CONFIG_HOME/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
+      eval 'rc_is 64 && no_rclone && [[ $OUT == *"overlaps DEST"*"backup job other-job"* && $OUT != *continuing* && ! -e $HOME/.config/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
   done
   runc "$BACKUP" run archive-vaults
   check "backup run: DEST overlapping another job's DEST $other warns and backs up (exit 0)" \
-    eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"warning: archive-vaults: DEST"*"overlaps DEST"*"other-job"*"; continuing"* ]] && grep -qx exit=0 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+    eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"warning: archive-vaults: DEST"*"overlaps DEST"*"other-job"*"; continuing"* ]] && grep -qx exit=0 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 done
 fresh
 job archive-vaults
@@ -1048,6 +1306,65 @@ runc "$BACKUP" run archive-vaults
 check "backup run: DEST inside a FUSE mount warns and backs up" \
   eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"FUSE mount"*"; continuing"* ]]'
 
+# The cloud guard both ways (see the bisync cases): DEST containing the
+# configured root, /mnt/cloud, ~/Cloud or a FUSE mount.
+dest_at() { job archive-vaults; set_dest archive-vaults "$1"; }
+fresh
+mkdir -p "$T/srv/clouds/od"
+cloud_env "OMARCHY_CLOUD_ROOT=$T/srv/clouds"
+root_cases "$BACKUP" dest_at archive-vaults
+dest_at "$T/srv"
+runc "$BACKUP" run archive-vaults
+check "backup run: DEST containing the configured root warns and backs up" \
+  eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"contains the cloud location $T/srv/clouds; "*"continuing"* ]]'
+for at in /mnt /; do
+  fresh
+  dest_at "$at"
+  runc "$BACKUP" validate archive-vaults
+  check "backup validate: DEST=$at contains /mnt/cloud: refused (no setting)" \
+    eval 'rc_is 64 && [[ $OUT == *"DEST $at contains the cloud location /mnt/cloud;"* ]]'
+done
+for at in /mnt/cloudy/backups /mnt/cloud-backups; do
+  fresh
+  dest_at "$at"
+  runc "$BACKUP" validate archive-vaults
+  check "backup validate: DEST=$at (next to /mnt/cloud) is not a hit (exit 0)" eval 'rc_is 0 && [[ -z $OUT ]]'
+done
+fresh
+mkdir -p "$HOME/Cloud"
+dest_at "$HOME"
+runc "$BACKUP" validate archive-vaults
+check "backup validate: DEST=\$HOME contains ~/Cloud: refused" \
+  eval 'rc_is 64 && [[ $OUT == *"DEST $HOME contains the cloud location $HOME/Cloud;"* ]]'
+fresh
+job archive-vaults
+printf 'me@nas:/ %s fuse.sshfs rw 0 0\n' "$HOME/Backups/vaults/nas" >"$OMARCHY_CLOUD_MOUNTS"
+runc "$BACKUP" setup archive-vaults
+check "backup setup: DEST containing a FUSE mount is refused, naming it" \
+  eval 'rc_is 64 && [[ $OUT == *"DEST $HOME/Backups/vaults contains the FUSE mount $HOME/Backups/vaults/nas (fuse.sshfs)"* && $OUT != *continuing* ]]'
+fresh
+mkdir -p "$T/srv/clouds"
+cloud_env "OMARCHY_CLOUD_ROOT=\$(touch $T/canary)"
+dest_at "$T/srv"
+runc "$BACKUP" validate archive-vaults
+check "backup: an invalid cloud.env is ignored and never run (exit 0, no canary)" eval 'rc_is 0 && [[ -z $OUT && ! -e $T/canary ]]'
+
+# The failure notification strips < > & from the message (it carries paths)
+# and the job name; stderr (the journal) keeps the real text.
+fresh
+job archive-vaults "FILES=~/$HOSTILE"
+runc "$BACKUP" run archive-vaults
+check "backup notification: summary and body have no < > & (hostile path in the message)" \
+  eval 'rc_is 64 && [[ $(notify_arg 4) == "Backup archive-vaults" ]] && no_markup_chars "$(notify_arg 4)" && no_markup_chars "$(notify_arg 5)" && [[ $(notify_arg 5) == *"a href=\"https:#47;#47;evil.example\"Open the fix#47;a does not exist; see: journalctl --user -u rclone-backup@archive-vaults" ]]'
+check "backup stderr: the real path, unchanged" eval '[[ $OUT == *"files list $HOME/$HOSTILE does not exist"* ]]'
+if [[ -n $RENDER ]]; then
+  notify_arg 5 >"$T/body"
+  check "backup notification: the shell's Markup.render of the body has no link" \
+    eval '[[ $(render_markup "$T/body") != *"<a"* ]]'
+else
+  echo "skip Markup.render check (no $MARKUP_JS or no node)"
+fi
+
 # A hung FUSE mount (see the bisync tests): other jobs' DEST and pairs' LOCAL
 # in it are never resolved; a run completes; validate and setup still refuse.
 fresh
@@ -1057,7 +1374,7 @@ bk_dest other-job "~/Mnt/hung/b"
 other_pair vault-B "~/Mnt/hung/x"
 runhung "$BACKUP" run archive-vaults
 check "backup run: other jobs' DEST and pairs' LOCAL in a hung FUSE mount are never resolved, the backup completes" \
-  eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && ! resolved_under "$HOME/Mnt" && resolved_under "$HOME/Backups/vaults" && [[ $OUT != *warning:* ]] && grep -qx exit=0 "$XDG_STATE_HOME/rclone-backup/archive-vaults.state"'
+  eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && ! resolved_under "$HOME/Mnt" && resolved_under "$HOME/Backups/vaults" && [[ $OUT != *warning:* ]] && grep -qx exit=0 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 fresh
 hung_mount
 job archive-vaults
@@ -1073,7 +1390,7 @@ for sub in setup validate; do
   check "backup $sub: the same overlap inside a hung FUSE mount is still refused (exit 64), nothing resolved there" \
     eval 'rc_is 64 && no_rclone && ! resolved_under "$HOME/Mnt" && [[ $OUT == *"overlaps LOCAL"*"vault-B"* && $OUT != *continuing* ]]'
 done
-rm "$XDG_CONFIG_HOME/rclone-bisync/vault-B.conf"
+rm "$HOME/.config/rclone-bisync/vault-B.conf"
 runhung "$BACKUP" validate archive-vaults
 check "backup validate: another job's DEST inside DEST, both in a hung FUSE mount, is refused" \
   eval 'rc_is 64 && ! resolved_under "$HOME/Mnt" && [[ $OUT == *"overlaps DEST"*"other-job"* ]]'
@@ -1088,7 +1405,7 @@ check "backup run: a realpath that hangs outside the FUSE mounts is cut off (tim
 # A CRLF conf is invalid.
 fresh
 job j
-sed -i 's/$/\r/' "$XDG_CONFIG_HOME/rclone-backup/j.conf"
+sed -i 's/$/\r/' "$HOME/.config/rclone-backup/j.conf"
 runc "$BACKUP" validate j
 check "backup: a CRLF conf is invalid (exit 64)" eval 'rc_is 64 && [[ $OUT == *"not a KEY=VALUE line"* ]] && no_rclone'
 

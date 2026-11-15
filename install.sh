@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Installs the cloud plugin's helpers for the current user. Idempotent.
 #
-#   ./install.sh [--no-build | --from-source]
+#   ./install.sh [--no-build | --from-source] [--no-prompt | --mount-root PATH]
 #                               copy systemd/* into ~/.config/systemd/user and
 #                               bin/* into ~/.local/bin, create the config dirs,
 #                               install the omarchy-cloud TUI (the prebuilt
 #                               dist/ binary on x86_64 when its sha256, version
 #                               and source digest match this checkout, else
 #                               built with cargo; --from-source always builds;
-#                               --no-build installs no TUI)
+#                               --no-build installs no TUI), then set up the
+#                               mount root (below)
 #   ./install.sh --uninstall [--force]
 #                               remove what install.sh installed; never config
 #                               or data. Refuses while rclone-bisync@ or
@@ -16,6 +17,25 @@
 #                               while rclone-mount@ instances are enabled unless
 #                               --force (their unit goes: they stop mounting at
 #                               the next login)
+#
+# The mount root: mounts live at <root>/<remote>, outside $HOME, with
+# ~/Cloud/<remote> a symlink to them. The setting is the one line
+# OMARCHY_CLOUD_ROOT=<path> in ~/.config/omarchy-cloud/cloud.env (absent:
+# /mnt/cloud). After installing, with no setting yet: a /mnt/cloud you own
+# and can write to is adopted (one line says so); else, on a terminal, you
+# are asked for the root (Enter takes /mnt/cloud) and, when it does not exist
+# or you cannot write to it, shown the one sudo command that creates it (to
+# run yourself: install.sh never runs sudo). Without a terminal, or with
+# --no-prompt, nothing is written and the instructions are printed.
+# --mount-root PATH saves PATH (an existing directory you can write to,
+# outside $HOME) without asking; it refuses while a rclone-mount@ instance is
+# enabled or active, and it moves no mount and no ~/Cloud link (links into
+# the old root are listed). An existing cloud.env is never rewritten except
+# by --mount-root, and --uninstall keeps it.
+#
+# All paths are HOME-fixed: ~/.config, ~/.local/state, ~/.cache; the XDG_*
+# variables are not followed (the services run under the user manager, whose
+# environment usually lacks them).
 #
 # Every file is copied, not linked: the plugin folder can be updated, moved or
 # removed without changing what systemd runs. Each copy is atomic (a temporary
@@ -56,29 +76,49 @@ set -u
 
 PROG=install.sh
 REPO=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
-CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+CONFIG_HOME=$HOME/.config
 UNIT_DIR=$CONFIG_HOME/systemd/user
 BIN_DIR=$HOME/.local/bin
 APP=omarchy-cloud
-STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/$APP
+STATE_DIR=$HOME/.local/state/$APP
 MANIFEST=$STATE_DIR/installed-files
 MARKER=$STATE_DIR/installed-binary.sha256 # legacy (<= 0.3.1): the binary's sha256
 PREBUILT_NAME=$APP-x86_64-linux-musl
 DIST=$REPO/dist
-USAGE="usage: $PROG [--no-build | --from-source] | --uninstall [--force]"
+ROOT_DIR=$CONFIG_HOME/$APP
+CLOUD_ENV=$ROOT_DIR/cloud.env
+# The default mount root. OMARCHY_CLOUD_TEST_DEFAULT_ROOT is for
+# tests/install-test.sh only (a scratch stand-in, as this machine may own a
+# real /mnt/cloud); the unit's default is /mnt/cloud whatever it says.
+DEFAULT_ROOT=${OMARCHY_CLOUD_TEST_DEFAULT_ROOT:-/mnt/cloud}
+USAGE="usage: $PROG [--no-build | --from-source] [--no-prompt | --mount-root PATH] | --uninstall [--force]"
 
 BUILD=1
 FROM_SOURCE=0
 UNINSTALL=0
 FORCE=0
-for arg; do
+NO_PROMPT=0
+MOUNT_ROOT= SET_ROOT=0
+while (($#)); do
+  arg=$1
+  shift
   case $arg in
+    --no-prompt) NO_PROMPT=1 ;;
+    --mount-root)
+      if ((!$# || SET_ROOT)); then
+        echo "$USAGE" >&2
+        exit 64
+      fi
+      MOUNT_ROOT=$1 SET_ROOT=1
+      shift
+      ;;
     --no-build) BUILD=0 ;;
     --from-source) FROM_SOURCE=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --force) FORCE=1 ;;
     -h | --help)
-      sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      # The comment up to the copy rules: the usage, the mount root, the paths.
+      sed -n '2,/^# Every file is copied/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -87,7 +127,8 @@ for arg; do
       ;;
   esac
 done
-if ((FORCE && !UNINSTALL)) || ((UNINSTALL && (FROM_SOURCE || !BUILD))) || ((FROM_SOURCE && !BUILD)); then
+if ((FORCE && !UNINSTALL)) || ((UNINSTALL && (FROM_SOURCE || !BUILD || NO_PROMPT || SET_ROOT))) ||
+  ((FROM_SOURCE && !BUILD)) || ((NO_PROMPT && SET_ROOT)); then
   echo "$USAGE" >&2
   exit 64
 fi
@@ -146,6 +187,84 @@ sha256() {
   printf '%s' "${h%% *}"
 }
 
+# sq <string>: single-quoted for a shell, a ' inside as '\'' (pastes as is).
+sq() {
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
+}
+
+# --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, install.sh; tests/fixtures/roots.tsv) ---
+# valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
+# empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
+# backquote, not $HOME nor inside it, at most 255 bytes.
+valid_root() {
+  local LC_ALL=C p=$1 home=${HOME%/}
+  [[ $p == /?* && ${#p} -le 255 ]] || return 1
+  [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
+  [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
+  [[ -n $home && ($p == "$home" || $p == "$home"/*) ]] && return 1
+  return 0
+}
+# --- end valid_root ---
+
+# The mount-root setting (cloud.env), parsed, never sourced: at most 4096
+# bytes; empty and # lines skipped; one trailing \r dropped; the value of the
+# last OMARCHY_CLOUD_ROOT= line, verbatim. ROOT_STATE: absent (no file or no
+# such line), invalid (fails valid_root, not a regular file, or unreadable)
+# or valid; ROOT_VALUE.
+read_root_setting() {
+  local line text
+  ROOT_STATE=absent ROOT_VALUE=
+  [[ -e $CLOUD_ENV || -L $CLOUD_ENV ]] || return 0
+  # A regular file only: a FIFO (or a device) would block the read.
+  if [[ ! -f $CLOUD_ENV ]] || ! text=$(head -c 4096 -- "$CLOUD_ENV" 2>/dev/null); then
+    ROOT_STATE=invalid
+    return 0
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == '#'* ]] && continue
+    [[ $line == OMARCHY_CLOUD_ROOT=* ]] && ROOT_STATE=set ROOT_VALUE=${line#OMARCHY_CLOUD_ROOT=}
+  done <<<"$text"
+  if [[ $ROOT_STATE == set ]]; then
+    if valid_root "$ROOT_VALUE"; then ROOT_STATE=valid; else ROOT_STATE=invalid; fi
+  fi
+}
+
+# usable_root <path>: an existing directory this user can write to.
+usable_root() { [[ -d $1 && -w $1 ]]; }
+
+# mkroot_hint <path>: the one command that creates <path> for this user (run
+# by the user: install.sh never runs sudo).
+mkroot_hint() {
+  echo "  create it once, in a terminal (it needs root, so $PROG does not do it):"
+  echo "    sudo install -d -o \"\$USER\" -m 755 $(sq "$1")"
+}
+
+# save_root <path>: cloud.env, atomically, mode 600 in a 700 dir.
+save_root() {
+  local tmp
+  { install -d -m 700 -- "$ROOT_DIR" && chmod 700 -- "$ROOT_DIR"; } || return 1
+  tmp=$(mktemp -- "$ROOT_DIR/.cloud.env.XXXXXX") || return 1
+  if printf 'OMARCHY_CLOUD_ROOT=%s\n' "$1" >"$tmp" && chmod 600 -- "$tmp" && mv -f -T -- "$tmp" "$CLOUD_ENV"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+# mount_units: rclone-mount@ instances enabled (a *.wants/ link) or active
+# (running, starting, stopping or waiting to restart) now.
+mount_units() {
+  {
+    enabled_instances | grep '^rclone-mount@'
+    if command -v systemctl >/dev/null; then
+      systemctl --user list-units --all --plain --no-legend 'rclone-mount@*' 2>/dev/null |
+        awk '$1 ~ /^rclone-mount@./ && $3 != "inactive" && $3 != "failed" { print $1 }'
+    fi
+  } | sort -u
+}
+
 # The manifest, read once: path -> recorded sha256. Only well-formed lines
 # naming a file directly in one of the two dirs install.sh writes to count.
 declare -A RECORDED=()
@@ -189,12 +308,16 @@ atomic_copy() {
 }
 
 # write_manifest <lines...>: atomically, the two header lines (#version=,
-# #repo=) first, then the lines sorted by path.
+# #repo=) first, then, when the mount-root setting exists, `#config=<its
+# path>` (user config: never removed, never rewritten unasked), then the
+# lines sorted by path.
 write_manifest() {
   local tmp
   mkdir -p -- "$STATE_DIR" || return 1
   tmp=$(mktemp -- "$STATE_DIR/.installed-files.XXXXXX") || return 1
-  if { printf '#version=%s\n#repo=%s\n' "$VERSION" "$REPO" && printf '%s\n' "$@" | sort -k 2; } >"$tmp" &&
+  if { printf '#version=%s\n#repo=%s\n' "$VERSION" "$REPO" &&
+    { [[ ! -f $CLOUD_ENV ]] || printf '#config=%s\n' "$CLOUD_ENV"; } &&
+    printf '%s\n' "$@" | sort -k 2; } >"$tmp" &&
     chmod 644 -- "$tmp" && mv -f -T -- "$tmp" "$MANIFEST"; then
     return 0
   fi
@@ -322,7 +445,7 @@ if ((UNINSTALL)); then
   done
   rm -f -- "$MANIFEST" "$MARKER"
   reload
-  echo "$PROG: uninstalled; config (~/.config/rclone-*), drop-ins, enabled-instance links, state and data were kept"
+  echo "$PROG: uninstalled; config (~/.config/rclone-*, the mount root in $CLOUD_ENV), drop-ins, enabled-instance links, state and data were kept"
   exit 0
 fi
 
@@ -336,6 +459,37 @@ fi
 if [[ $REPO == *[[:cntrl:]]* ]]; then
   echo "$PROG: stopping, nothing was changed: the checkout's path contains a control character" >&2
   exit 1
+fi
+
+# --- --mount-root: decided before anything changes ----------------------------
+read_root_setting
+OLD_ROOT=$DEFAULT_ROOT
+[[ $ROOT_STATE == valid ]] && OLD_ROOT=$ROOT_VALUE
+if ((SET_ROOT)); then
+  if ! valid_root "$MOUNT_ROOT"; then
+    echo "$PROG: stopping, nothing was changed: --mount-root $(sq "$MOUNT_ROOT") cannot be the mount root." >&2
+    echo "  It must be an absolute path outside your home ($HOME), not /, with no empty, . or .." >&2
+    echo "  component, no space, control character, \$ % \\ \" ' or backquote, at most 255 bytes." >&2
+    exit 1
+  fi
+  if ! usable_root "$MOUNT_ROOT"; then
+    echo "$PROG: stopping, nothing was changed: $(sq "$MOUNT_ROOT") is not a directory you can write to;" >&2
+    mkroot_hint "$MOUNT_ROOT" >&2
+    echo "  then run $PROG --mount-root $(sq "$MOUNT_ROOT") again" >&2
+    exit 1
+  fi
+  if [[ $ROOT_STATE == valid && $ROOT_VALUE == "$MOUNT_ROOT" ]]; then
+    SET_ROOT=0 # already the setting: nothing to change, nothing to refuse
+  else
+    mapfile -t busy_mounts < <(mount_units)
+    if ((${#busy_mounts[@]})); then
+      echo "$PROG: stopping, nothing was changed: these mounts are enabled or running at the current" >&2
+      echo "root ($OLD_ROOT), and a unit started there must stop there. Stop and disable them first," >&2
+      echo "then run $PROG --mount-root $(sq "$MOUNT_ROOT") again (and enable them again after):" >&2
+      for u in "${busy_mounts[@]}"; do echo "  systemctl --user disable --now $u" >&2; done
+      exit 1
+    fi
+  fi
 fi
 
 # --- the binary: the prebuilt one when it fits, else a build -----------------
@@ -429,7 +583,7 @@ if ((BUILD)); then
       exit 1
     fi
     echo "building $APP from source ($why)"
-    target=${XDG_CACHE_HOME:-$HOME/.cache}/$APP/target
+    target=$HOME/.cache/$APP/target
     CARGO_TARGET_DIR=$target "$cargo" build --release --locked --manifest-path "$REPO/app/Cargo.toml" || exit 1
     built=$target/release/$APP
     if [[ ! -f $built ]]; then
@@ -459,7 +613,7 @@ for i in "${!DSTS[@]}"; do
   if [[ -f $d ]] && cmp -s -- "$d" "$s"; then
     continue # identical content (a regular file, or a link to one)
   fi
-  in_the_way "$d" "compare:  diff -u '$d' '$s'" \
+  in_the_way "$d" "compare:  diff -u $(sq "$d") $(sq "$s")" \
     "once it is migrated (its instances stopped, the file moved aside), run $PROG again"
 done
 if [[ -n $built ]] && [[ -e $BIN || -L $BIN ]] &&
@@ -545,4 +699,82 @@ elif ((changed)); then
   echo "$PROG: installed files changed; systemd reads the unit files from the daemon-reload above"
   echo "(running units keep running and use them from their next start; no restart needed)."
 fi
+# --- the mount root ---------------------------------------------------------------
+# root_not_set_up <path>: the instructions when no usable root is set.
+root_not_set_up() {
+  echo "$PROG: the mount root is not set up, so no mount can start yet. Mounts go to <root>/<remote>"
+  echo "(outside your home; ~/Cloud/<remote> links to them), and $(sq "$1") is not a directory you"
+  echo "own and can write to. Nothing was written."
+  mkroot_hint "$1"
+  echo "  then run $PROG again; or choose a folder outside your home you can write to:"
+  echo "    $PROG --mount-root PATH"
+}
+# ask_root: on a terminal, until a root is saved or the input ends.
+ask_root() {
+  local proposed=$DEFAULT_ROOT ans
+  echo "Mounts go to <root>/<remote>, outside your home (~/Cloud/<remote> links to them)."
+  while :; do
+    printf 'Mount root [%s] (Enter to accept, or type another path): ' "$proposed"
+    if ! IFS= read -r ans; then
+      echo
+      root_not_set_up "$proposed"
+      return 0
+    fi
+    [[ -n $ans ]] && proposed=$ans
+    if ! valid_root "$proposed"; then
+      echo "  $(sq "$proposed") cannot be the mount root: it must be an absolute path outside your home,"
+      echo "  not /, with no space, \$ % \\ \" ' or backquote and no . or .. component."
+      proposed=$DEFAULT_ROOT
+      continue
+    fi
+    if usable_root "$proposed"; then
+      save_root "$proposed" || exit 1
+      ROOT_WRITTEN=1
+      echo "$PROG: mount root set to $proposed (in $CLOUD_ENV)"
+      return 0
+    fi
+    echo "  $(sq "$proposed") is not a directory you can write to;"
+    mkroot_hint "$proposed"
+    echo "  Run it in another terminal, then press Enter to check again, or type another path."
+  done
+}
+ROOT_WRITTEN=0
+if ((SET_ROOT)); then
+  save_root "$MOUNT_ROOT" || exit 1
+  ROOT_WRITTEN=1
+  echo "$PROG: mount root set to $MOUNT_ROOT (was $OLD_ROOT; in $CLOUD_ENV). Mounts start there from their next start."
+  stale=()
+  for l in "$HOME/Cloud"/*; do
+    [[ -L $l ]] || continue
+    t=$(readlink -- "$l") || continue
+    [[ $t == "$OLD_ROOT" || $t == "$OLD_ROOT"/* ]] && stale+=("$l -> $t")
+  done
+  if ((${#stale[@]})); then
+    echo "$PROG: these links still point into the old root and were not changed (re-point them yourself):"
+    for l in "${stale[@]}"; do echo "  $l"; done
+  fi
+elif [[ $ROOT_STATE == valid ]]; then
+  if ! usable_root "$ROOT_VALUE"; then
+    echo "$PROG: the mount root $(sq "$ROOT_VALUE") (from $CLOUD_ENV) is not a directory you can write to;"
+    mkroot_hint "$ROOT_VALUE"
+  fi
+# A cloud.env without the line is not set up either (the TUI and the panel
+# read an absent key as no root): no default is assumed for it.
+elif [[ $ROOT_STATE == invalid || -e $CLOUD_ENV || -L $CLOUD_ENV ]]; then
+  echo "$PROG: $CLOUD_ENV holds no usable OMARCHY_CLOUD_ROOT=<path> line; it was left as it is."
+  echo "  Edit it, or set the root with: $PROG --mount-root PATH"
+elif valid_root "$DEFAULT_ROOT" && [[ -d $DEFAULT_ROOT && -O $DEFAULT_ROOT && -w $DEFAULT_ROOT ]]; then
+  save_root "$DEFAULT_ROOT" || exit 1
+  ROOT_WRITTEN=1
+  echo "$PROG: mount root: adopted your existing $DEFAULT_ROOT (saved in $CLOUD_ENV)"
+# Asked only on a terminal. OMARCHY_CLOUD_TEST_TTY=1 is for
+# tests/install-test.sh only: it answers from a pipe as if stdin were one.
+elif ((NO_PROMPT)) || ! { [[ -t 0 ]] || [[ ${OMARCHY_CLOUD_TEST_TTY:-} == 1 ]]; }; then
+  root_not_set_up "$DEFAULT_ROOT"
+else
+  ask_root
+fi
+# The manifest names the setting once it exists (as user config).
+((ROOT_WRITTEN)) && { write_manifest "${lines[@]}" || exit 1; }
+
 echo "$PROG: done; nothing was enabled. Configure with: $APP"

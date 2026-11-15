@@ -1,5 +1,5 @@
 [Unit]
-Description=rclone mount of %i: at /mnt/cloud/%i
+Description=rclone mount of %i:
 # No network-online.target: the user manager has no such unit, so ordering
 # on it does nothing. A mount started before the network is up fails and is
 # restarted every RestartSec until it comes up; with no start limit it never
@@ -22,15 +22,37 @@ Environment=RCLONE_VFS_CACHE_MAX_SIZE=10G
 Environment=RCLONE_VFS_CACHE_MAX_AGE=72h
 Environment=RCLONE_VFS_WRITE_BACK=1s
 EnvironmentFile=-%h/.config/rclone-mount/%i.env
-ExecStartPre=/usr/bin/mkdir -p /mnt/cloud/%i
-ExecStart=/usr/bin/rclone mount %i: /mnt/cloud/%i \
+# The mount root: mounts go to ${OMARCHY_CLOUD_ROOT}/<remote>, outside $HOME
+# (~/Cloud/<remote> is a symlink to it), so tools that walk the home
+# directory do not crawl the network mount. The Environment= below is the
+# default; the setting in %h/.config/omarchy-cloud/cloud.env (one
+# OMARCHY_CLOUD_ROOT=<path> line, written by install.sh) wins. Nothing here
+# creates the root: it must already be a directory the user can write to
+# (created once, by the user, when it is a place like /mnt). Without it the
+# ExecCondition= checks skip the start (a skipped unit is neither failed nor
+# restarted) instead of retrying every RestartSec forever. Change the setting
+# only while no mount runs (install.sh --mount-root refuses otherwise):
+# ExecStop= must unmount the path ExecStart= mounted.
+# The first ExecCondition= skips a root that install.sh, the TUI and the
+# panel refuse: not absolute, "/", an empty, "." or ".." component, or the
+# home directory or inside it. The script gets the root and %h as $1 and $2
+# ($$ is a literal $ to systemd); a missing value arrives as "" and is refused.
+# The others: an existing directory the user can write to and search.
+Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud
+EnvironmentFile=-%h/.config/omarchy-cloud/cloud.env
+ExecCondition=/usr/bin/sh -c 'case $$1 in /?*) ;; *) exit 1 ;; esac; case $$1/ in *//* | */./* | */../*) exit 1 ;; esac; case $$1 in "$$2" | "$$2"/*) exit 1 ;; esac' _ ${OMARCHY_CLOUD_ROOT} %h
+ExecCondition=/usr/bin/test -d ${OMARCHY_CLOUD_ROOT}
+ExecCondition=/usr/bin/test -w ${OMARCHY_CLOUD_ROOT}
+ExecCondition=/usr/bin/test -x ${OMARCHY_CLOUD_ROOT}
+ExecStartPre=/usr/bin/mkdir -p ${OMARCHY_CLOUD_ROOT}/%i
+ExecStart=/usr/bin/rclone mount %i: ${OMARCHY_CLOUD_ROOT}/%i \
     --cache-dir %h/.cache/rclone \
     --vfs-cache-mode full \
     --vfs-read-chunk-size 8M \
     --vfs-read-chunk-size-limit 32M \
     --vfs-read-ahead 8M \
     --buffer-size 4M
-ExecStop=/usr/bin/fusermount3 -uz /mnt/cloud/%i
+ExecStop=/usr/bin/fusermount3 -uz ${OMARCHY_CLOUD_ROOT}/%i
 Restart=on-failure
 RestartSec=15
 

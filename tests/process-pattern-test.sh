@@ -25,13 +25,20 @@
 #      SCAN_MAX_FILES of them, a forged marker line inside a file or in
 #      systemctl's template listing (a stand-in) is content, the TUI binary
 #      found only when executable, nothing runs, and a hung read is cut by
-#      timeout and refused.
+#      timeout and refused; the mount-root setting (cloud.env) is read the
+#      same way (regular file, byte bound, never sourced).
 #   6. Model.VERSIONS_SCRIPT on a crafted plugin folder and state dir: the
 #      plugin's manifest.json version and install.sh's header read, a FIFO
 #      skipped, a symlink to a regular file followed, the legacy record and
 #      install.sh found, nothing runs, a hung read cut by timeout and refused;
 #      and Model.INSTALL_SCRIPT (without the terminal) runs a stand-in
 #      install.sh given as "$1", prints its exit status and waits for Enter.
+#   7. Model.ROOT_CHECK_SCRIPT on crafted (valid) roots: the root arrives as one
+#      argument, nothing in it runs, a writable directory is ok and anything
+#      else missing; Model.BOUNDED_SCRIPT around stand-in journalctl and
+#      systemctl: the command's argv arrives intact, its output is capped by
+#      head -c, a forged end line is content, and a hung command is cut by
+#      timeout and refused.
 #
 # Nothing here touches the real cache, a mount, a unit or the real config.
 
@@ -336,6 +343,40 @@ max=$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8");consol
 ((n == max)) && grep -q "^$TOKEN more$" <<<"$out" && grep -q "^$TOKEN end$" <<<"$out" &&
   pass "at most $max files read, then 'more'" || fail "file bound: $n files read (max $max)"
 [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"more":true'* ]] && pass "the parsed scan reports 'more'" || fail "'more' not parsed"
+# The mount-root setting: parsed, never sourced (a command in it never runs),
+# the last line of the key wins, a forged marker inside it is content.
+# parse_setting <home> <state dir> <token>: Model.rootSetting of the parsed scan.
+parse_setting() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { parseScan, scanDirs, rootSetting }")()
+    const r = m.parseScan(fs.readFileSync(0, "utf8"), process.argv[4], m.scanDirs(process.argv[2], process.argv[3]))
+    process.stdout.write(JSON.stringify(m.rootSetting(r, process.argv[2])))
+  ' "$PLUGIN_DIR/Model.js" "$1" "$2" "$3"
+}
+mkdir -p "$SHOME/.config/omarchy-cloud"
+SETTING=$SHOME/.config/omarchy-cloud/cloud.env
+[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]] &&
+  pass "no cloud.env: the setting is absent, the default root" || fail "absent setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+printf '# by install.sh\r\nOMARCHY_CLOUD_ROOT=/srv/$(touch PWNED)\nOMARCHY_CLOUD_ROOT=/srv/cloud\r\ncmscan-zzzzzzzzzzzz setting 9\n' >"$SETTING"
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]] &&
+  pass "cloud.env parsed: the last line wins, CRLF stripped, a forged marker is content" || fail "setting: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in cloud.env ran" || pass "nothing in cloud.env ran"
+{ printf 'OMARCHY_CLOUD_ROOT=/srv/first\n'; for ((i = 0; i < 200; i++)); do printf '# padding padding padding\n'; done; printf 'OMARCHY_CLOUD_ROOT=/srv/past-the-bound\n'; } >"$SETTING"
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+grep -q "^$TOKEN setting $(wc -c <"$SETTING")$" <<<"$out" && ! grep -q past-the-bound <<<"$out" &&
+  [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"path":"/srv/first"'* ]] &&
+  pass "cloud.env is read up to its byte bound only" || fail "setting bound: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+rm "$SETTING"
+mkfifo "$SETTING"
+start=$SECONDS
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+status=$?
+((status == 0 && SECONDS - start < 5)) && [[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"state":"absent"'* ]] &&
+  pass "a FIFO cloud.env is skipped, not read" || fail "FIFO setting: status $status"
+rm "$SETTING"
 # A read that hangs (a stand-in head) is cut by timeout; without its end line
 # the scan is refused.
 HANGBIN=$SCRATCH/hangbin
@@ -349,6 +390,59 @@ out=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null)
 status=$?
 ((status == 124 && SECONDS - start < 5)) && pass "a hung read is cut by timeout (status $status)" || fail "hung scan: status $status after $((SECONDS - start)) s"
 [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"ok":false'* ]] && pass "a scan without its end line is refused" || fail "a cut scan was accepted"
+# A key line cut by the byte bound is kept, as bash and Rust keep it (C1).
+{ printf 'OMARCHY_CLOUD_ROOT=/srv/first\n'; for ((i = 0; i < 4039; i++)); do printf '\n'; done; printf 'OMARCHY_CLOUD_ROOT=/srv/cut-here-past-the-bound\n'; } >"$SETTING"
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+[[ $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == '{"state":"valid","path":"/srv/cut","value":"/srv/cut"}' ]] &&
+  pass "a key line cut by the byte bound is kept, and wins" || fail "cut line: $(parse_setting "$SHOME" "$SSTATE" "$TOKEN" <<<"$out")"
+rm "$SETTING"
+
+# The setting read alone (Model.SETTING_SCRIPT, on a poll while the root is
+# not set up): the same read, the crafted HOME's path one argument, nothing in
+# it or in the file runs, a FIFO skipped, a hung read cut and refused.
+# setting_read <home> <token>: Model.settingArgv, NUL-separated.
+setting_read_argv() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { settingArgv }")()
+    process.stdout.write(m.settingArgv(process.argv[2], process.argv[3]).map(a => a + "\0").join(""))
+  ' "$PLUGIN_DIR/Model.js" "$1" "$2"
+}
+# parse_setting_read <home> <token>: rootSetting of Model.parseSettingRead over stdin, or "refused".
+parse_setting_read() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { parseSettingRead, withSetting, rootSetting, emptyScan }")()
+    const r = m.parseSettingRead(fs.readFileSync(0, "utf8"), process.argv[3])
+    const scan = m.emptyScan(); scan.ok = true
+    process.stdout.write(r.ok ? JSON.stringify(m.rootSetting(m.withSetting(scan, r.setting), process.argv[2])) : "refused")
+  ' "$PLUGIN_DIR/Model.js" "$1" "$2"
+}
+mapfile -d '' -t argv < <(setting_read_argv "$SHOME" "$TOKEN")
+[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[9]} == "$SETTING" && ${#argv[@]} == 11 ]] &&
+  pass "the setting read runs under timeout -k through sh, the path one argument" || fail "setting read argv: ${argv[*]}"
+[[ ${argv[6]} == *"$SHOME"* ]] && fail "the home is inside the setting script"
+[[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"absent","path":"/mnt/cloud","value":""}' ]] &&
+  pass "setting read: no cloud.env is absent" || fail "setting read absent"
+printf 'OMARCHY_CLOUD_ROOT=/srv/$(touch PWNED)\nOMARCHY_CLOUD_ROOT=/srv/cloud\r\ncmscan-zzzzzzzzzzzz end\n' >"$SETTING"
+[[ $(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN") == '{"state":"valid","path":"/srv/cloud","value":"/srv/cloud"}' ]] &&
+  pass "setting read: Set up's file is read on the next poll, a forged end line is content" || fail "setting read valid"
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the setting read ran" || pass "nothing in the setting read ran"
+rm "$SETTING"
+mkfifo "$SETTING"
+start=$SECONDS
+got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | parse_setting_read "$SHOME" "$TOKEN")
+((SECONDS - start < 5)) && [[ $got == *'"state":"absent"'* ]] && pass "setting read: a FIFO is skipped, not read" || fail "setting read FIFO: $got"
+rm "$SETTING"
+printf 'OMARCHY_CLOUD_ROOT=/srv/cloud\n' >"$SETTING"
+cut=("${argv[@]}")
+cut[3]=1
+start=$SECONDS
+got=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null | parse_setting_read "$SHOME" "$TOKEN")
+((SECONDS - start < 5)) && [[ $got == refused ]] && pass "setting read: a hung read is cut by timeout and refused" || fail "hung setting read: $got after $((SECONDS - start)) s"
+rm "$SETTING"
 
 # --- 6. the installed-parts read and the install terminal script -------------
 # versions_argv <plugin dir> <state dir> <token>: Model.versionsArgv, NUL-separated.
@@ -439,6 +533,101 @@ sleep 1
 kill -0 "$WAITER_PID" 2>/dev/null && pass "the script waits for Enter after install.sh exits" || fail "the script did not wait"
 kill "$WAITER_PID" 2>/dev/null
 wait "$WAITER_PID" 2>/dev/null
+
+# --- 7. the mount-root check and the bounded commands ------------------------
+# model_argv <expr>: the argv a Model expression builds (process.argv[2...] as
+# a, b, c), NUL-separated.
+model_argv() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { rootCheckArgv, logArgv, pollArgv, parseRootCheck, parseBounded, logView, journalArgv, showArgv }")()
+    const [a, b, c] = process.argv.slice(3)
+    process.stdout.write(new Function("m", "a", "b", "c", "return " + process.argv[2])(m, a, b, c).map(x => x + "\0").join(""))
+  ' "$PLUGIN_DIR/Model.js" "$@"
+}
+# model_eval <expr> < stdin: a Model expression over stdin (as s), printed.
+model_eval() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { parseRootCheck, parseBounded, logView }")()
+    const s = fs.readFileSync(0, "utf8")
+    const [a] = process.argv.slice(3)
+    process.stdout.write(String(new Function("m", "s", "a", "return " + process.argv[2])(m, s, a)))
+  ' "$PLUGIN_DIR/Model.js" "$@"
+}
+RHOME=$SCRATCH/roothome
+mkdir -p "$RHOME" "$SCRATCH/roots"
+for r in "$SCRATCH/roots/a;id>PWNED" "$SCRATCH/roots/(id)>PWNED|x&y" "$SCRATCH/roots/-n" "$SCRATCH/roots/ok"; do
+  [[ $r == */ok ]] && mkdir -p "$r"
+  mapfile -d '' -t argv < <(model_argv 'm.rootCheckArgv(a, b)' "$r" "$RHOME")
+  if [[ ${argv[0]} != timeout || ${argv[4]} != sh || ${argv[5]} != -c || ${argv[-1]} != "$r" || ${#argv[@]} != 9 ]]; then
+    fail "root check argv for $r: ${argv[*]}"
+    continue
+  fi
+  [[ ${argv[6]} == *"$r"* ]] && fail "the root is inside the script: $r"
+  got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | model_eval 'm.parseRootCheck(s)')
+  want=missing
+  [[ $r == */ok ]] && want=ok
+  [[ $got == "$want" ]] && pass "root check: $want for $(basename -- "$r")" || fail "root check for $r: $got"
+done
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED || -n $(find "$SCRATCH/roots" -name PWNED) ]] && fail "a command in a root ran" || pass "nothing in a root ran"
+mapfile -d '' -t argv < <(model_argv 'm.rootCheckArgv(a, b)' "$RHOME/inside" "$RHOME")
+((${#argv[@]} == 0)) && pass "a root inside HOME is never checked" || fail "root inside HOME: ${argv[*]}"
+# BOUNDED_SCRIPT around a stand-in journalctl: argv intact, a forged end line
+# (another token's, and this run's own mid-stream) is content, output capped.
+BBIN=$SCRATCH/boundbin
+mkdir -p "$BBIN"
+cat >"$BBIN/journalctl" <<EOF2
+#!/bin/sh
+printf '%s\n' "\$@" >"$SCRATCH/journalctl.argv"
+printf 'line one\ncmscan-zzzzzzzzzzzz end\n'
+[ -n "\$CM_FLOOD" ] && yes 'flood flood flood'
+[ -n "\$CM_HANG" ] && exec sleep 60
+exit 0
+EOF2
+chmod +x "$BBIN/journalctl"
+mapfile -d '' -t argv < <(model_argv 'm.logArgv(a, b)' "rclone-mount@gdrive.service" "$TOKEN")
+mapfile -d '' -t want < <(model_argv 'm.journalArgv(a)' "rclone-mount@gdrive.service")
+[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && "${argv[*]:10}" == "${want[*]}" ]] &&
+  pass "the journal runs under timeout -k through the bounded script" || fail "log argv: ${argv[*]}"
+# The output goes to a file: $(...) would drop the end line's newline.
+BOUT=$SCRATCH/bounded.out
+(cd "$SCRATCH/cwd" && PATH=$BBIN:$PATH "${argv[@]}") >"$BOUT"
+[[ $(<"$SCRATCH/journalctl.argv") == "$(printf '%s\n' "${want[@]:1}")" ]] && pass "journalctl gets its argv intact" || fail "journalctl argv: $(<"$SCRATCH/journalctl.argv")"
+got=$(model_eval 'm.logView(s, a)' "$TOKEN" <"$BOUT")
+[[ $got == $'line one\ncmscan-zzzzzzzzzzzz end' ]] && pass "a finished journal is shown; another token's end line is content" || fail "log view: $got"
+start=$SECONDS
+(cd "$SCRATCH/cwd" && CM_FLOOD=1 PATH=$BBIN:$PATH "${argv[@]}") >"$BOUT"
+cap=$(node -e 'const s=require("fs").readFileSync(process.argv[1],"utf8");console.log(new Function(s+"\nreturn LOG_READ_MAX_BYTES")())' "$PLUGIN_DIR/Model.js")
+n=$(($(wc -c <"$BOUT") - ${#TOKEN} - 6))
+((SECONDS - start < 5 && n == cap)) && [[ $(model_eval 'm.parseBounded(s, a, '"$cap"').ok' "$TOKEN" <"$BOUT") == true ]] &&
+  pass "a flooding journal is cut at $cap bytes at the source" || fail "flood: $n bytes (cap $cap) after $((SECONDS - start)) s"
+cut=("${argv[@]}")
+cut[3]=1
+start=$SECONDS
+(cd "$SCRATCH/cwd" && CM_HANG=1 PATH=$BBIN:$PATH "${cut[@]}") >"$BOUT"
+status=$?
+got=$(model_eval 'm.logView(s, a)' "$TOKEN" <"$BOUT")
+((status == 124 && SECONDS - start < 5)) && [[ $got == "Log timed out" ]] &&
+  pass "a hung journalctl is cut by timeout: Log timed out" || fail "hung journal: status $status, $got"
+# The poll the same way: a hung systemctl leaves no answer to apply.
+cat >"$BBIN/systemctl" <<EOF2
+#!/bin/sh
+printf 'Id=default.target\n\n'
+exec sleep 60
+EOF2
+chmod +x "$BBIN/systemctl"
+mapfile -d '' -t argv < <(model_argv 'm.pollArgv([a], b)' "gdrive" "$TOKEN")
+cut=("${argv[@]}")
+cut[3]=1
+start=$SECONDS
+(cd "$SCRATCH/cwd" && PATH=$BBIN:$PATH "${cut[@]}") >"$BOUT"
+status=$?
+((status == 124 && SECONDS - start < 5)) && [[ $(model_eval 'm.parseBounded(s, a, 262144).ok' "$TOKEN" <"$BOUT") == false ]] &&
+  pass "a hung systemctl show is cut by timeout and its answer refused" || fail "hung poll: status $status"
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command ran" || pass "nothing ran"
 
 if ((FAILURES)); then
   echo "FAILED $FAILURES shell-string tests"

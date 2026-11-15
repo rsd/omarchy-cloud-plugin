@@ -1,9 +1,15 @@
 #!/bin/bash
 
-# install.sh, hermetic: stand-ins for systemctl, cargo and uname come first on
-# PATH and record their argv; HOME and the XDG_* dirs point into a scratch
-# dir. Nothing outside the scratch dir is written, no unit is touched, and the
-# real cargo is never run.
+# install.sh, hermetic: stand-ins for systemctl, cargo, uname and sudo come
+# first on PATH and record their argv; HOME and the XDG_* dirs point into a
+# scratch dir (the XDG_* ones away from HOME: install.sh must not follow them).
+# Nothing outside the scratch dir is written, no unit is touched, and the
+# real cargo is never run. install.sh runs from a scratch copy of this
+# checkout without dist/ (R0), so the result does not depend on whether the
+# checkout's dist/ prebuilt matches its app/ sources (a release commit makes
+# it match, the next app/ change makes it stale); section 5 builds its own
+# dist/. Its stdin is /dev/null, and the default mount root a scratch path
+# (OMARCHY_CLOUD_TEST_DEFAULT_ROOT), unless a test sets them.
 #
 #   1. bash -n, and shellcheck when installed; option errors.
 #   2. Fresh install: regular copies (not links), modes 644/755, the manifest
@@ -30,6 +36,12 @@
 #      XDG_RUNTIME_DIR) makes install.sh wait, then stop with exit 75 and
 #      nothing changed; a released one lets it install.
 #   9. The repository holds no symlinks and gets no build output.
+#  10. The mount root (cloud.env): silent adoption of an owned default, the
+#      instructions without a terminal or with --no-prompt, the prompt (the
+#      exact sudo command, never run; Enter re-checks; a typed path),
+#      --mount-root and its refusals, an existing cloud.env never rewritten,
+#      kept by --uninstall; tests/fixtures/roots.tsv through install.sh's
+#      valid_root; the diff hint for a path with a '; the mount unit.
 #
 # The checks are eval'd single-quoted strings, expanded when they run.
 # shellcheck disable=SC2016,SC2034
@@ -37,11 +49,21 @@
 set -o pipefail
 
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-INSTALL=$PLUGIN_DIR/install.sh
 FAILURES=0
 SCRATCH=$(mktemp -d) || exit 1
+SCRATCH=$(cd "$SCRATCH" && pwd -P)
 HOLDER= # the PID of a background lock holder (section 8), stopped on exit
 trap '[[ -n $HOLDER ]] && kill "$HOLDER" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+
+# R0: the checkout as install.sh sees it, minus dist/ (and a snapshot, so a
+# file edited while the suite runs does not change under it). The root's
+# other files (preview.png, docs/) come along when present: never installed.
+R0=$SCRATCH/checkout
+mkdir -p "$R0/app"
+cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R0/"
+cp -r "$PLUGIN_DIR/app/Cargo.toml" "$PLUGIN_DIR/app/Cargo.lock" "$PLUGIN_DIR/app/src" "$R0/app/"
+for f in preview.png docs; do [[ -e $PLUGIN_DIR/$f ]] && cp -r "$PLUGIN_DIR/$f" "$R0/"; done
+INSTALL=$R0/install.sh
 
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; FAILURES=$((FAILURES + 1)); }
@@ -54,10 +76,18 @@ check() { # check <description> <command...>
 # --- stand-ins --------------------------------------------------------------
 STUBS=$SCRATCH/stubs
 mkdir -p "$STUBS"
+# systemctl list-units prints FAKE_UNITS (the units "loaded" now); sudo
+# only records that it ran.
 cat >"$STUBS/systemctl" <<'EOF'
 #!/bin/bash
 { printf 'systemctl'; printf ' %q' "$@"; printf '\n'; } >>"$FAKE_LOG/systemctl"
+for a; do [[ $a == list-units && -n ${FAKE_UNITS:-} ]] && printf '%s\n' "$FAKE_UNITS"; done
 exit 0
+EOF
+cat >"$STUBS/sudo" <<'EOF'
+#!/bin/bash
+{ printf 'sudo'; printf ' %q' "$@"; printf '\n'; } >>"$FAKE_LOG/sudo"
+exit 1
 EOF
 cat >"$STUBS/cargo" <<'EOF'
 #!/bin/bash
@@ -73,7 +103,7 @@ chmod +x "$STUBS"/*
 # The same stand-ins without cargo, on a PATH without the real one.
 NOCARGO=$SCRATCH/nocargo
 mkdir -p "$NOCARGO"
-cp "$STUBS/systemctl" "$STUBS/uname" "$NOCARGO/"
+cp "$STUBS/systemctl" "$STUBS/uname" "$STUBS/sudo" "$NOCARGO/"
 NOCARGO_PATH=$NOCARGO:/usr/bin:/bin
 export PATH="$STUBS:$PATH"
 
@@ -82,17 +112,28 @@ N=0
 fresh() {
   N=$((N + 1))
   T=$SCRATCH/t$N
-  mkdir -p "$T/home/.config" "$T/state" "$T/cache" "$T/log" "$T/run"
+  mkdir -p "$T/home/.config" "$T/xdg/config" "$T/xdg/state" "$T/xdg/cache" "$T/log" "$T/run"
+  # The XDG_* dirs exist but are not HOME's (install.sh is HOME-fixed);
   # XDG_RUNTIME_DIR too: the real one may hold the locks of real runs.
-  export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_STATE_HOME=$T/state \
-    XDG_CACHE_HOME=$T/cache FAKE_LOG=$T/log XDG_RUNTIME_DIR=$T/run
-  unset FAKE_BUILD FAKE_ARCH OMARCHY_CLOUD_INSTALL_WAIT_S
-  UD=$XDG_CONFIG_HOME/systemd/user BD=$HOME/.local/bin
-  MAN=$XDG_STATE_HOME/omarchy-cloud/installed-files
-  MARK=$XDG_STATE_HOME/omarchy-cloud/installed-binary.sha256
+  export HOME=$T/home XDG_CONFIG_HOME=$T/xdg/config XDG_STATE_HOME=$T/xdg/state \
+    XDG_CACHE_HOME=$T/xdg/cache FAKE_LOG=$T/log XDG_RUNTIME_DIR=$T/run \
+    OMARCHY_CLOUD_TEST_DEFAULT_ROOT=$T/mnt/cloud
+  unset FAKE_BUILD FAKE_ARCH FAKE_UNITS OMARCHY_CLOUD_INSTALL_WAIT_S OMARCHY_CLOUD_TEST_TTY
+  UD=$HOME/.config/systemd/user BD=$HOME/.local/bin
+  MAN=$HOME/.local/state/omarchy-cloud/installed-files
+  MARK=$HOME/.local/state/omarchy-cloud/installed-binary.sha256
+  ENVF=$HOME/.config/omarchy-cloud/cloud.env
 }
-# runc <cmd...>: OUT = stdout+stderr, RC = status.
-runc() { OUT=$("$@" 2>&1); RC=$?; }
+# runc <cmd...>: OUT = stdout+stderr, RC = status; stdin is /dev/null.
+runc() { OUT=$("$@" 2>&1 </dev/null); RC=$?; }
+# runi <input> <cmd...>: runc on a "terminal" (OMARCHY_CLOUD_TEST_TTY=1)
+# that answers <input>.
+runi() {
+  local in=$1
+  shift
+  OUT=$(printf '%s' "$in" | OMARCHY_CLOUD_TEST_TTY=1 "$@" 2>&1)
+  RC=$?
+}
 log() { cat "$FAKE_LOG/$1" 2>/dev/null; }
 q() { printf ' %q' "$@"; }
 rc_is() { ((RC == $1)); }
@@ -101,7 +142,7 @@ only_reload() { [[ $(log systemctl) == "systemctl --user daemon-reload" ]]; }
 
 # copies_ok [repo]: every systemd/ and bin/ file is a regular copy with its mode.
 copies_ok() {
-  local r=${1:-$PLUGIN_DIR} f
+  local r=${1:-$R0} f
   for f in "$r"/systemd/*; do
     [[ -f $UD/${f##*/} && ! -L $UD/${f##*/} ]] && cmp -s "$f" "$UD/${f##*/}" &&
       [[ $(stat -c %a "$UD/${f##*/}") == 644 ]] || return 1
@@ -112,24 +153,24 @@ copies_ok() {
   done
 }
 # manifest_ok <path...>: the manifest lists exactly these paths, each with
-# the sha256 the file has now (after the two header lines, checked by
+# the sha256 the file has now (besides the # header lines, checked by
 # header_ok).
 manifest_ok() {
   local want got p
   want=$(for p; do printf '%s  %s\n' "$(sha "$p")" "$p"; done | sort -k 2)
-  got=$(tail -n +3 "$MAN" 2>/dev/null)
+  got=$(grep -v '^#' "$MAN" 2>/dev/null)
   [[ -n $want && $got == "$want" ]] || { diff <(echo "$want") <(echo "$got") | sed "s/^/     /" | head -6; return 1; }
 }
 # header_ok [repo] [version]: the manifest's first two lines are the version
 # record (default: this checkout and its manifest.json version).
 header_ok() {
   local want
-  want=$(printf '#version=%s\n#repo=%s' "${2:-$PLUGIN_VERSION}" "${1:-$PLUGIN_DIR}")
+  want=$(printf '#version=%s\n#repo=%s' "${2:-$PLUGIN_VERSION}" "${1:-$R0}")
   [[ $(head -n 2 "$MAN" 2>/dev/null) == "$want" ]] || { head -n 2 "$MAN" 2>/dev/null | sed "s/^/     got /"; return 1; }
 }
 PLUGIN_VERSION=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/manifest.json" | head -n 1)
 all_files() { # the paths install.sh installs from a repo, besides the binary
-  local r=${1:-$PLUGIN_DIR} f
+  local r=${1:-$R0} f
   for f in "$r"/systemd/*; do echo "$UD/${f##*/}"; done
   for f in "$r"/bin/*; do echo "$BD/${f##*/}"; done
 }
@@ -146,8 +187,8 @@ no_link_into() { # no_link_into <dir>: nothing under UD or BD resolves into it
   done < <(find "$UD" "$BD" -type l 2>/dev/null)
   return 0
 }
-snapshot() { # a listing of UD, BD and the state dir: types, link targets, hashes
-  find "$UD" "$BD" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" 2>/dev/null | sort | while IFS= read -r p; do
+snapshot() { # UD, BD, the state and config dirs and the XDG ones: types, link targets, hashes
+  find "$UD" "$BD" "$HOME/.local/state" "$HOME/.config" "$T/xdg" 2>/dev/null | sort | while IFS= read -r p; do
     if [[ -L $p ]]; then echo "L $p -> $(readlink "$p")"
     elif [[ -f $p ]]; then echo "F $p $(stat -c %a "$p") $(sha "$p")"
     else echo "D $p $(stat -c %a "$p")"; fi
@@ -155,16 +196,18 @@ snapshot() { # a listing of UD, BD and the state dir: types, link targets, hashe
 }
 
 # --- 1. syntax, lint, options -------------------------------------------------
-check "bash -n install.sh" bash -n "$INSTALL"
-check "install.sh is executable" test -x "$INSTALL"
+check "bash -n install.sh" bash -n "$PLUGIN_DIR/install.sh"
+check "install.sh is executable" test -x "$PLUGIN_DIR/install.sh"
 SHELLCHECK=$(command -v shellcheck)
 if [[ -n $SHELLCHECK ]] && "$SHELLCHECK" --version >/dev/null 2>&1; then
-  check "shellcheck" "$SHELLCHECK" "$INSTALL" "${BASH_SOURCE[0]}"
+  check "shellcheck" "$SHELLCHECK" "$PLUGIN_DIR/install.sh" "${BASH_SOURCE[0]}"
 else
   echo "skip shellcheck (not installed or not runnable)"
 fi
 fresh
-for args in "--bogus" "--force" "--no-build --from-source" "--uninstall --from-source" "--uninstall --no-build"; do
+for args in "--bogus" "--force" "--no-build --from-source" "--uninstall --from-source" "--uninstall --no-build" \
+  "--mount-root" "--no-prompt --mount-root /srv" "--mount-root /srv --mount-root /opt" "--uninstall --no-prompt" \
+  "--uninstall --mount-root /srv"; do
   # shellcheck disable=SC2086
   runc "$INSTALL" $args
   check "install.sh $args: exit 64, nothing written" eval 'rc_is 64 && [[ ! -e $UD && ! -e $BD && ! -e $MAN ]]'
@@ -176,11 +219,11 @@ runc "$INSTALL" --no-build
 check "install: exit 0" rc_is 0
 check "install: every systemd/ and bin/ file copied (regular files, 644 / 755), none linked" \
   eval 'copies_ok && [[ -z $(find "$UD" "$BD" -type l) ]]'
-check "install: the manifest records each installed file with its sha256" manifest_all "$PLUGIN_DIR"
+check "install: the manifest records each installed file with its sha256" manifest_all "$R0"
 check "install: the manifest starts with #version=<manifest.json version> and #repo=<checkout>" header_ok
-check "install: no temporary file left behind" eval '[[ -z $(find "$UD" "$BD" "$XDG_STATE_HOME" -name ".*") ]]'
+check "install: no temporary file left behind" eval '[[ -z $(find "$UD" "$BD" "$HOME/.local/state" -name ".*") ]]'
 check "install: config dirs created 700" \
-  eval '[[ $(stat -c %a "$XDG_CONFIG_HOME/rclone-bisync") == 700 && $(stat -c %a "$XDG_CONFIG_HOME/rclone-backup") == 700 ]]'
+  eval '[[ $(stat -c %a "$HOME/.config/rclone-bisync") == 700 && $(stat -c %a "$HOME/.config/rclone-backup") == 700 ]]'
 check "install: daemon-reload only, nothing enabled or started" only_reload
 check "install --no-build: no cargo, no binary" eval '[[ ! -s $FAKE_LOG/cargo && ! -e $BD/omarchy-cloud ]]'
 snapshot >"$T/before"
@@ -198,7 +241,7 @@ check "install: an existing ~/.local/bin keeps its mode (700)" eval 'rc_is 0 && 
 # --- 3. identical-or-stop -----------------------------------------------------------
 fresh
 mkdir -p "$UD" "$BD"
-cp "$PLUGIN_DIR/bin/rclone-backup" "$BD/rclone-backup"
+cp "$R0/bin/rclone-backup" "$BD/rclone-backup"
 chmod 700 "$BD/rclone-backup"
 runc "$INSTALL" --no-build
 check "install: an identical regular file is taken over (mode set, recorded)" \
@@ -237,14 +280,14 @@ printf '# an older version\n' >"$UD/rclone-bisync@.timer"
 sed -i "s|^[0-9a-f]\{64\}  $UD/rclone-bisync@.timer\$|$(sha "$UD/rclone-bisync@.timer")  $UD/rclone-bisync@.timer|" "$MAN"
 runc "$INSTALL" --no-build
 check "install: a recorded file with an older content is updated, the manifest follows" \
-  eval 'rc_is 0 && copies_ok && [[ $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && manifest_all "$PLUGIN_DIR"'
+  eval 'rc_is 0 && copies_ok && [[ $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && manifest_all "$R0"'
 
 # --- 4. migration from a link install ------------------------------------------------
 fresh
-mkdir -p "$UD/default.target.wants" "$UD/timers.target.wants" "$BD" "$XDG_STATE_HOME/omarchy-cloud"
-for f in "$PLUGIN_DIR"/systemd/*; do ln -s "$f" "$UD/${f##*/}"; done
-for f in "$PLUGIN_DIR"/bin/*; do ln -s "$f" "$BD/${f##*/}"; done
-S=$PLUGIN_DIR/systemd
+mkdir -p "$UD/default.target.wants" "$UD/timers.target.wants" "$BD" "${MAN%/*}"
+for f in "$R0"/systemd/*; do ln -s "$f" "$UD/${f##*/}"; done
+for f in "$R0"/bin/*; do ln -s "$f" "$BD/${f##*/}"; done
+S=$R0/systemd
 ln -s "$S/rclone-bisync@.path" "$UD/rclone-bisync@personal.path"
 ln -s "$S/rclone-bisync@.timer" "$UD/rclone-bisync@personal.timer"
 ln -s "$S/rclone-backup@.timer" "$UD/rclone-backup@team-vaults.timer"
@@ -275,11 +318,11 @@ check "migrate: links that already pointed at the installed template are unchang
   eval '[[ $(readlink "$UD/default.target.wants/rclone-mount@onedrive.service") == "$UD/rclone-mount@.service" && $(readlink "$UD/timers.target.wants/rclone-bisync@rel.timer.bak") == ../rclone-bisync@.timer ]]'
 check "migrate: a foreign link and the drop-ins are untouched" \
   eval '[[ $(readlink "$UD/default.target.wants/foreign.service") == /usr/lib/systemd/user/foo.service && $(cd "$UD" && find ./*.d -type f -exec sha256sum {} + | sort) == "$DROPINS" ]]'
-check "migrate: nothing under the unit or bin dir resolves into the repo" no_link_into "$PLUGIN_DIR"
+check "migrate: nothing under the unit or bin dir resolves into the repo" no_link_into "$R0"
 check "migrate: the doubled legacy marker is accepted: the old binary is replaced" \
   eval '[[ $(cat "$BD/omarchy-cloud") == *"tui v2"* ]]'
 check "migrate: the marker moved into the manifest (binary recorded, marker removed)" \
-  eval 'manifest_all "$PLUGIN_DIR" "$BD/omarchy-cloud" && [[ ! -e $MARK ]]'
+  eval 'manifest_all "$R0" "$BD/omarchy-cloud" && [[ ! -e $MARK ]]'
 check "migrate: daemon-reload only, says nothing needs restarting" \
   eval 'only_reload && [[ $OUT == *"nothing needs restarting"* ]]'
 check "migrate: no temporary link left behind" eval '[[ -z $(find "$UD" -name "*omarchy-cloud-tmp*" -o -name ".*" -type f) ]]'
@@ -289,7 +332,7 @@ check "migrate, again: idempotent" eval 'rc_is 0 && [[ $OUT != *installed\ /* &&
 
 # A legacy marker that names another binary: still refused.
 fresh
-mkdir -p "$BD" "$XDG_STATE_HOME/omarchy-cloud"
+mkdir -p "$BD" "${MAN%/*}"
 printf '#!/bin/sh\necho mine\n' >"$BD/omarchy-cloud"
 printf '%064d' 0 >"$MARK"
 runc "$INSTALL"
@@ -300,8 +343,8 @@ check "install: a binary that is not the one the legacy marker names stops it" \
 # A scratch copy of the repo with a dist/ (the real repo never gets one here).
 R2=$SCRATCH/repo
 mkdir -p "$R2/app" "$R2/dist"
-cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R2/"
-cp -r "$PLUGIN_DIR/app/Cargo.toml" "$PLUGIN_DIR/app/Cargo.lock" "$PLUGIN_DIR/app/src" "$R2/app/"
+cp -r "$R0/install.sh" "$R0/manifest.json" "$R0/systemd" "$R0/bin" "$R2/"
+cp -r "$R0/app/Cargo.toml" "$R0/app/Cargo.lock" "$R0/app/src" "$R2/app/"
 VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' "$R2/app/Cargo.toml" | head -n 1)
 PB=omarchy-cloud-x86_64-linux-musl
 # src_digest: the app source digest as defined (sha256 of the `sha256sum`
@@ -327,7 +370,7 @@ check "fixture: app/src is flat (src_digest's glob covers it)" eval '[[ -z $(fin
 # (twice there: written by the build job, checked by the publish job).
 DIGEST_LINE="{ echo app/Cargo.toml; echo app/Cargo.lock; find app/src -type f -name '*.rs'; } | LC_ALL=C sort | xargs -d '\\n' sha256sum -- | sha256sum"
 check "source digest: the same pipeline in install.sh and release.yml (build and publish)" \
-  eval 'grep -qF -- "$DIGEST_LINE" "$INSTALL" && (($(grep -cF -- "$DIGEST_LINE" "$PLUGIN_DIR/.github/workflows/release.yml") == 2))'
+  eval 'grep -qF -- "$DIGEST_LINE" "$PLUGIN_DIR/install.sh" && (($(grep -cF -- "$DIGEST_LINE" "$PLUGIN_DIR/.github/workflows/release.yml") == 2))'
 check "source digest: release.yml writes it into BUILD-INFO as src_sha256=" \
   eval 'grep -qF "echo \"src_sha256=\$SRC_SHA256\"" "$PLUGIN_DIR/.github/workflows/release.yml"'
 
@@ -355,7 +398,7 @@ FAKE_ARCH=x86_64 FAKE_BUILD=src runc "$R2/install.sh"
 check "prebuilt: another version builds with cargo instead (and says why)" \
   eval 'rc_is 0 && [[ $(cat "$BD/omarchy-cloud") == *"tui src"* && $OUT == *"version 0.0.1"* ]]'
 check "build: cargo build --release --locked, target dir in the cache" \
-  eval '[[ $(log cargo) == "cargo$(q build --release --locked --manifest-path "$R2/app/Cargo.toml") CARGO_TARGET_DIR=$(printf %q "$XDG_CACHE_HOME/omarchy-cloud/target")" ]]'
+  eval '[[ $(log cargo) == "cargo$(q build --release --locked --manifest-path "$R2/app/Cargo.toml") CARGO_TARGET_DIR=$(printf %q "$HOME/.cache/omarchy-cloud/target")" ]]'
 
 fresh
 dist
@@ -369,7 +412,7 @@ check "prebuilt: src_sha256 mismatch and no cargo: exit 1, says why, suggests Ru
   eval 'rc_is 1 && [[ $OUT == *"other app/ sources"*"cargo was not found"*"Install Rust"*"--no-build"* && ! -e $UD && ! -e $BD && ! -e $MAN ]]'
 FAKE_ARCH=x86_64 PATH=$NOCARGO_PATH runc "$R2/install.sh" --no-build
 check "prebuilt: src_sha256 mismatch, --no-build: installs the rest, no TUI" eval 'rc_is 0 && copies_ok "$R2" && [[ ! -e $BD/omarchy-cloud ]]'
-cp "$PLUGIN_DIR/app/src/main.rs" "$R2/app/src/main.rs"
+cp "$R0/app/src/main.rs" "$R2/app/src/main.rs"
 mkdir "$R2/app/src/sub"
 echo '// a new module' >"$R2/app/src/sub/new.rs"
 fresh
@@ -382,7 +425,7 @@ rm "$R2/app/Cargo.lock"
 FAKE_ARCH=x86_64 FAKE_BUILD=src runc "$R2/install.sh"
 check "prebuilt: an unreadable source (no Cargo.lock) never matches (builds)" \
   eval 'rc_is 0 && [[ $(cat "$BD/omarchy-cloud") == *"tui src"* && $OUT == *"this checkout unreadable"* ]]'
-cp "$PLUGIN_DIR/app/Cargo.lock" "$R2/app/"
+cp "$R0/app/Cargo.lock" "$R2/app/"
 
 fresh
 dist "" -
@@ -431,7 +474,7 @@ check "build: binary installed 755, recorded" \
   eval 'rc_is 0 && [[ -f $BD/omarchy-cloud && ! -L $BD/omarchy-cloud && $(stat -c %a "$BD/omarchy-cloud") == 755 ]] && grep -qF "  $BD/omarchy-cloud" "$MAN"'
 FAKE_BUILD=v2 runc "$INSTALL"
 check "build: a different build replaces the recorded binary" \
-  eval 'rc_is 0 && [[ $(cat "$BD/omarchy-cloud") == *"tui v2"* ]] && manifest_all "$PLUGIN_DIR" "$BD/omarchy-cloud"'
+  eval 'rc_is 0 && [[ $(cat "$BD/omarchy-cloud") == *"tui v2"* ]] && manifest_all "$R0" "$BD/omarchy-cloud"'
 cp "$BD/omarchy-cloud" "$T/ours.bak"
 printf '#!/bin/sh\necho someone else\n' >"$BD/omarchy-cloud"
 cp "$BD/omarchy-cloud" "$T/foreign"
@@ -450,15 +493,15 @@ FAKE_BUILD=v2 runc "$INSTALL"
 check "build: a symlink at omarchy-cloud stops it" eval 'rc_is 1 && [[ -L $BD/omarchy-cloud ]]'
 rm -f "$BD/omarchy-cloud"
 FAKE_BUILD=v2 runc "$INSTALL"
-check "build: identical to the build is taken over" eval 'rc_is 0 && manifest_all "$PLUGIN_DIR" "$BD/omarchy-cloud"'
+check "build: identical to the build is taken over" eval 'rc_is 0 && manifest_all "$R0" "$BD/omarchy-cloud"'
 runc "$INSTALL" --no-build
-check "--no-build: the recorded binary stays recorded" eval 'rc_is 0 && manifest_all "$PLUGIN_DIR" "$BD/omarchy-cloud"'
+check "--no-build: the recorded binary stays recorded" eval 'rc_is 0 && manifest_all "$R0" "$BD/omarchy-cloud"'
 
 # --- 6. --uninstall -------------------------------------------------------------------
 mkdir -p "$UD/default.target.wants"
 ln -s "$UD/rclone-mount@.service" "$UD/default.target.wants/rclone-mount@onedrive.service"
-mkdir -p "$XDG_CONFIG_HOME/rclone-bisync"
-echo "LOCAL=~/x" >"$XDG_CONFIG_HOME/rclone-bisync/p.conf"
+mkdir -p "$HOME/.config/rclone-bisync"
+echo "LOCAL=~/x" >"$HOME/.config/rclone-bisync/p.conf"
 echo keep >"$UD/my-own.service"
 snapshot >"$T/before"
 runc "$INSTALL" --uninstall
@@ -483,15 +526,15 @@ check "uninstall: the recorded files that still match are removed" \
 check "uninstall: an edited unit and a replaced binary are left, and named" \
   eval '[[ -f $UD/rclone-backup@.service && $(cat "$BD/omarchy-cloud") == "#!/bin/sh" && $OUT == *"left $UD/rclone-backup@.service"* && $OUT == *"left $BD/omarchy-cloud"* ]]'
 check "uninstall: enablement links, config, other units kept; manifest gone; daemon-reload" \
-  eval '[[ -L $UD/default.target.wants/rclone-mount@onedrive.service && -L $UD/rclone-bisync@vault-A.path && -f $XDG_CONFIG_HOME/rclone-bisync/p.conf && -f $UD/my-own.service && ! -e $MAN ]] && only_reload'
+  eval '[[ -L $UD/default.target.wants/rclone-mount@onedrive.service && -L $UD/rclone-bisync@vault-A.path && -f $HOME/.config/rclone-bisync/p.conf && -f $UD/my-own.service && ! -e $MAN ]] && only_reload'
 runc "$INSTALL" --uninstall --force
 check "uninstall again: exit 0, removes nothing more" eval 'rc_is 0 && [[ -f $UD/rclone-backup@.service && -f $UD/my-own.service ]]'
 
 # An install by an older install.sh (links, legacy marker): still removed.
 fresh
-mkdir -p "$UD" "$BD" "$XDG_STATE_HOME/omarchy-cloud"
-for f in "$PLUGIN_DIR"/systemd/*; do ln -s "$f" "$UD/${f##*/}"; done
-for f in "$PLUGIN_DIR"/bin/*; do ln -s "$f" "$BD/${f##*/}"; done
+mkdir -p "$UD" "$BD" "${MAN%/*}"
+for f in "$R0"/systemd/*; do ln -s "$f" "$UD/${f##*/}"; done
+for f in "$R0"/bin/*; do ln -s "$f" "$BD/${f##*/}"; done
 printf '#!/bin/sh\necho old tui\n' >"$BD/omarchy-cloud"
 h=$(sha "$BD/omarchy-cloud")
 printf '%s%s' "$h" "$h" >"$MARK"
@@ -514,7 +557,7 @@ check "fixture: manifest.json has an N.N.N version" eval '[[ $PLUGIN_VERSION =~ 
 # A scratch checkout whose manifest.json can be edited.
 R3=$SCRATCH/repo3
 mkdir -p "$R3"
-cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R3/"
+cp -r "$R0/install.sh" "$R0/manifest.json" "$R0/systemd" "$R0/bin" "$R3/"
 R3=$(cd "$R3" && pwd -P)
 set_version() { # set_version <version|->: the version line of R3's manifest.json ("-": none)
   if [[ $1 == - ]]; then
@@ -534,7 +577,7 @@ sed -i "s|^[0-9a-f]\{64\}  $UD/rclone-bisync@.timer\$|$(sha "$UD/rclone-bisync@.
 check "fixture: a 0.3.2-format manifest (no # line)" eval '! grep -q "^#" "$MAN" && [[ -s $MAN ]]'
 runc "$INSTALL" --no-build
 check "0.3.2 manifest: read as before (the recorded file is still ours and updated)" \
-  eval 'rc_is 0 && copies_ok && [[ $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && manifest_all "$PLUGIN_DIR"'
+  eval 'rc_is 0 && copies_ok && [[ $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && manifest_all "$R0"'
 check "0.3.2 manifest: rewritten with the version header" header_ok
 snapshot >"$T/before"
 runc "$INSTALL" --no-build
@@ -550,7 +593,7 @@ set_version 1.2.4
 runc "$R3/install.sh" --no-build
 check "a version-only change: nothing reinstalled, the new version recorded" \
   eval 'rc_is 0 && [[ $OUT != *installed\ /* ]] && header_ok "$R3" 1.2.4 && manifest_all "$R3"'
-check "a version-only change: no temporary file left behind" eval '[[ -z $(find "$XDG_STATE_HOME" -name ".*") ]]'
+check "a version-only change: no temporary file left behind" eval '[[ -z $(find "$HOME/.local/state" -name ".*") ]]'
 
 # An invalid version: refused before any change, installed or not.
 for v in 1.2 1.2.3-rc1 v1.2.3 "1.2.3 " -; do
@@ -566,10 +609,10 @@ for v in 1.2 1.2.3-rc1 v1.2.3 "1.2.3 " -; do
     runc "$R3/install.sh" --no-build
     check "invalid version '$v' ($state): exit 1, says why, nothing changed" \
       eval 'rc_is 1 && [[ $OUT == *"nothing was changed"*"N.N.N"* ]] && cmp -s <(snapshot) "$T/before" && [[ ! -s $FAKE_LOG/systemctl ]]'
-    [[ $v == - ]] && cp "$PLUGIN_DIR/manifest.json" "$R3/manifest.json"
+    [[ $v == - ]] && cp "$R0/manifest.json" "$R3/manifest.json"
   done
 done
-cp "$PLUGIN_DIR/manifest.json" "$R3/manifest.json"
+cp "$R0/manifest.json" "$R3/manifest.json"
 
 # --- 8. running syncs and backups ------------------------------------------------------
 # hold <lock file>: an exclusive flock on it, held by a background process
@@ -617,7 +660,7 @@ check "bisync lock held: an idle lock file is not named; no lock file created" \
 release
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
 check "bisync lock released: installs (the update goes in)" \
-  eval 'rc_is 0 && [[ $OUT != *waiting* && $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && copies_ok && manifest_all "$PLUGIN_DIR" && header_ok'
+  eval 'rc_is 0 && [[ $OUT != *waiting* && $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && copies_ok && manifest_all "$R0" && header_ok'
 
 # Released while install.sh waits: it goes on.
 fresh
@@ -639,7 +682,7 @@ check "backup lock held, wait 0: exit 75 at once, names the job, nothing changed
   eval 'rc_is 75 && ((SECONDS - start <= 2)) && [[ $OUT == *"backup team-vaults is running"*"nothing was changed"* ]] && cmp -s <(snapshot) "$T/before" && [[ ! -s $FAKE_LOG/systemctl ]]'
 release
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
-check "backup lock released: installs" eval 'rc_is 0 && copies_ok && manifest_all "$PLUGIN_DIR" && header_ok'
+check "backup lock released: installs" eval 'rc_is 0 && copies_ok && manifest_all "$R0" && header_ok'
 
 # --uninstall waits the same way.
 check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
@@ -698,6 +741,252 @@ fi
 
 # A lock file owned by another user (with XDG_RUNTIME_DIR unset the dir is
 # the shared /tmp) is ignored: not tested, a foreign owner needs root.
+
+# --- 10. the mount root -------------------------------------------------------------
+# The default root is a scratch stand-in ($T/mnt/cloud, via
+# OMARCHY_CLOUD_TEST_DEFAULT_ROOT); a "terminal" is OMARCHY_CLOUD_TEST_TTY=1
+# answering from a pipe. ALT is another root outside the scratch HOME.
+mkroot_cmd() { printf 'sudo install -d -o "$USER" -m 755 %s' "'$1'"; } # C3, for a path without '
+env_is() { [[ $(cat "$ENVF" 2>/dev/null) == "OMARCHY_CLOUD_ROOT=$1" ]]; }
+env_modes_ok() { [[ $(stat -c %a "$ENVF") == 600 && $(stat -c %a "${ENVF%/*}") == 700 ]]; }
+no_sudo() { [[ ! -s $FAKE_LOG/sudo ]]; }
+
+fresh
+ALT=$T/srv/cloud
+check "fixture: the scratch roots are outside HOME" eval '[[ $T/mnt/cloud != "$HOME"/* && $ALT != "$HOME"/* ]]'
+runc "$INSTALL" --no-build
+check "root, no terminal, none set up: exit 0, nothing asked or written, the exact sudo command and --mount-root printed" \
+  eval 'rc_is 0 && [[ $OUT != *"Mount root ["* && ! -e $ENVF && ! -e ${ENVF%/*} && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* && $OUT == *"--mount-root PATH"* && $OUT == *"Nothing was written"* ]] && no_sudo'
+check "root, no terminal: the manifest names no config" eval '! grep -q "^#config=" "$MAN"'
+mkdir -p "$ALT"
+runi "$ALT"$'\n' "$INSTALL" --no-build --no-prompt
+check "root, --no-prompt on a terminal: nothing read, nothing written, instructions" \
+  eval 'rc_is 0 && [[ ! -e $ENVF && $OUT != *"Mount root ["* && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* ]]'
+
+# Silent adoption: the default exists, is ours and writable. The "terminal"
+# would answer another valid root, so a prompt read would show.
+fresh
+ALT=$T/srv/cloud
+mkdir -p "$T/mnt/cloud" "$ALT"
+runi "$ALT"$'\n' "$INSTALL" --no-build
+check "root adopted: an owned, writable default is saved without a prompt, 600 in a 700 dir, one line says so" \
+  eval 'rc_is 0 && env_is "$T/mnt/cloud" && env_modes_ok && [[ $OUT != *"Mount root ["* && $(grep -c "adopted" <<<"$OUT") == 1 ]]'
+check "root adopted: the manifest records cloud.env as user config, not as a file to remove" \
+  eval 'grep -qxF "#config=$ENVF" "$MAN" && ! grep -qF "  $ENVF" "$MAN" && header_ok && manifest_all "$R0"'
+check "root adopted: no temporary file left behind" eval '[[ -z $(find "${ENVF%/*}" -name ".*") ]]'
+snapshot >"$T/before"
+runc "$INSTALL" --no-build
+check "root adopted, again: idempotent, nothing said about the root" \
+  eval 'rc_is 0 && cmp -s <(snapshot) "$T/before" && [[ $OUT != *adopted* && $OUT != *"mount root"* ]]'
+check "root adopted, again: daemon-reload only (no list-units without --mount-root)" \
+  eval '[[ $(log systemctl | sort -u) == "systemctl --user daemon-reload" ]]'
+
+# A default that is not ours is never adopted (here: not writable).
+fresh
+mkdir -p "$T/mnt/cloud"
+chmod 555 "$T/mnt/cloud"
+runc "$INSTALL" --no-build
+check "root: a default we cannot write to is not adopted, the sudo command is printed" \
+  eval 'rc_is 0 && [[ ! -e $ENVF && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* ]]'
+chmod 755 "$T/mnt/cloud"
+
+# The prompt, the root missing: Enter prints the exact command and never runs
+# sudo; the input ends: nothing written.
+fresh
+runi $'\n' "$INSTALL" --no-build
+check "root prompt, Enter, the root missing: proposes the default, prints the exact sudo command, exit 0, nothing written" \
+  eval 'rc_is 0 && [[ $OUT == *"Mount root [$T/mnt/cloud]"* && $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"* && ! -e $ENVF ]]'
+check "root prompt: sudo is never run (the sudo stand-in recorded nothing)" no_sudo
+# Enter again after the root was created (in "another terminal"): re-checked
+# and saved.
+fresh
+(
+  printf '\n'
+  for ((i = 0; i < 100; i++)); do grep -qF "sudo install" "$T/out" 2>/dev/null && break; sleep 0.05; done
+  mkdir -p "$T/mnt/cloud"
+  printf '\n'
+) | OMARCHY_CLOUD_TEST_TTY=1 "$INSTALL" --no-build >"$T/out" 2>&1
+RC=$? OUT=$(cat "$T/out")
+check "root prompt: created in another terminal, Enter re-checks and saves it" \
+  eval 'rc_is 0 && [[ $OUT == *"$(mkroot_cmd "$T/mnt/cloud")"*"set to $T/mnt/cloud"* ]] && env_is "$T/mnt/cloud" && env_modes_ok && no_sudo'
+# A typed root that exists: saved. A typed root inside HOME: refused, asked again.
+fresh
+ALT=$T/srv/cloud
+mkdir -p "$ALT"
+runi "$HOME/cloud"$'\n'"$ALT"$'\n' "$INSTALL" --no-build
+check "root prompt: a path inside HOME is refused and asked again; a typed existing path is saved" \
+  eval 'rc_is 0 && [[ $OUT == *"$HOME/cloud'"'"' cannot be the mount root"* ]] && env_is "$ALT" && env_modes_ok && grep -qxF "#config=$ENVF" "$MAN"'
+fresh
+ALT=$T/srv/cloud
+runi "$ALT"$'\n' "$INSTALL" --no-build
+check "root prompt: a typed path that does not exist: its sudo command, nothing written" \
+  eval 'rc_is 0 && [[ $OUT == *"$(mkroot_cmd "$ALT")"* && ! -e $ENVF ]] && no_sudo'
+
+# An existing cloud.env is the user's: never rewritten by a plain install,
+# whether its setting is valid, invalid or absent, terminal or not.
+for content in "# mine"$'\n'"OMARCHY_CLOUD_ROOT=@ALT" "OMARCHY_CLOUD_ROOT=relative/path" "# only a comment"; do
+  fresh
+  ALT=$T/srv/cloud
+  mkdir -p "$T/mnt/cloud" "$ALT" "${ENVF%/*}"
+  printf '%s\n' "${content//@ALT/$ALT}" >"$ENVF"
+  chmod 640 "$ENVF"
+  before=$(sha "$ENVF")
+  runc "$INSTALL" --no-build
+  rc1=$RC
+  runi "$T/mnt/cloud"$'\n' "$INSTALL" --no-build
+  check "root: an edited cloud.env (${content//$'\n'/ \\n }) is never rewritten (no terminal, terminal)" \
+    eval '((rc1 == 0)) && rc_is 0 && [[ $(sha "$ENVF") == "$before" && $(stat -c %a "$ENVF") == 640 && $OUT != *"Mount root ["* && $OUT != *adopted* ]]'
+done
+check "root: an invalid cloud.env is named and left as it is" eval '[[ $OUT == *"$ENVF"*"left as it is"* ]]'
+# The last one has no OMARCHY_CLOUD_ROOT= line: not set up (as the TUI and
+# the panel read it), so no default root is claimed for it.
+check "root: a cloud.env with no OMARCHY_CLOUD_ROOT= line is named, points to --mount-root PATH, claims no default" \
+  eval '[[ $OUT == *"$ENVF holds no usable"* && $OUT == *"--mount-root PATH"* && $OUT != *"mounts use"* && $OUT != *"$T/mnt/cloud"* ]]'
+
+# A cloud.env that is not a regular file (a FIFO) is never read: no hang.
+fresh
+mkdir -p "$T/mnt/cloud" "${ENVF%/*}"
+mkfifo "$ENVF"
+OUT=$(timeout 20 "$INSTALL" --no-build 2>&1 </dev/null)
+RC=$?
+check "root: a FIFO cloud.env does not block (exit 0 within the timeout), is named and left as it is" \
+  eval 'rc_is 0 && [[ -p $ENVF && $OUT == *"$ENVF holds no usable"*"left as it is"* && $OUT == *"--mount-root PATH"* ]]'
+
+# --mount-root.
+fresh
+ALT=$T/srv/cloud
+mkdir -p "$T/mnt/cloud" "$ALT" "$HOME/Cloud"
+runc "$INSTALL" --no-build # adopts $T/mnt/cloud
+mkdir -p "$UD/default.target.wants"
+ln -s "$UD/rclone-mount@.service" "$UD/default.target.wants/rclone-mount@od.service"
+ln -s "$T/mnt/cloud/od" "$HOME/Cloud/od"
+ln -s /elsewhere "$HOME/Cloud/other"
+snapshot >"$T/before"
+runc "$INSTALL" --no-build --mount-root "$ALT"
+check "--mount-root with a mount enabled: refused (exit 1), names it, nothing changed" \
+  eval 'rc_is 1 && [[ $OUT == *"rclone-mount@od.service"* && $OUT == *"nothing was changed"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
+rm "$UD/default.target.wants/rclone-mount@od.service"
+snapshot >"$T/before"
+FAKE_UNITS="rclone-mount@gd.service loaded activating auto-restart rclone mount of gd:
+rclone-mount@old.service loaded inactive dead rclone mount of old:" runc "$INSTALL" --no-build --mount-root "$ALT"
+check "--mount-root with a mount active (waiting to restart): refused (exit 1), names it, not the inactive one" \
+  eval 'rc_is 1 && [[ $OUT == *"rclone-mount@gd.service"* && $OUT != *"rclone-mount@old"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
+runc "$INSTALL" --no-build --mount-root "$HOME/inside"
+check "--mount-root inside HOME: refused (exit 1), nothing changed" eval 'rc_is 1 && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before"'
+runc "$INSTALL" --no-build --mount-root "$T/missing"
+check "--mount-root, a path that does not exist: refused (exit 1) with its sudo command, nothing changed" \
+  eval 'rc_is 1 && [[ $OUT == *"$(mkroot_cmd "$T/missing")"* ]] && env_is "$T/mnt/cloud" && cmp -s <(snapshot) "$T/before" && no_sudo'
+FAKE_UNITS="rclone-mount@old.service loaded inactive dead rclone mount of old:" runc "$INSTALL" --no-build --mount-root "$ALT"
+check "--mount-root, no mount running: saved (600 in 700), says the old root" \
+  eval 'rc_is 0 && env_is "$ALT" && env_modes_ok && [[ $OUT == *"set to $ALT (was $T/mnt/cloud"* ]] && grep -qxF "#config=$ENVF" "$MAN"'
+check "--mount-root: a ~/Cloud link into the old root is reported, not rewritten; others are not named" \
+  eval '[[ $OUT == *"$HOME/Cloud/od -> $T/mnt/cloud/od"* && $OUT != *"Cloud/other"* && $(readlink "$HOME/Cloud/od") == "$T/mnt/cloud/od" ]]'
+ln -s "$UD/rclone-mount@.service" "$UD/default.target.wants/rclone-mount@od.service"
+runc "$INSTALL" --no-build --mount-root "$ALT"
+check "--mount-root, the current setting again: nothing to refuse (exit 0), unchanged" eval 'rc_is 0 && env_is "$ALT"'
+
+# --uninstall keeps cloud.env.
+rm "$UD/default.target.wants/rclone-mount@od.service"
+before=$(sha "$ENVF")
+runc "$INSTALL" --uninstall
+check "uninstall: cloud.env and its dir are kept (content, modes); said so" \
+  eval 'rc_is 0 && [[ ! -e $MAN && $(sha "$ENVF") == "$before" ]] && env_modes_ok && [[ $OUT == *"$ENVF"* ]]'
+
+# The root validator: install.sh's copy against tests/fixtures/roots.tsv.
+VALID_ROOT=$(sed -n '/^# --- valid_root (shared: /,/^# --- end valid_root ---$/p' "$INSTALL")
+check "fixture: install.sh carries the marked valid_root block" eval '[[ $VALID_ROOT == *"valid_root() {"* ]]'
+roots_n=0 roots_bad=0
+while IFS=$'\t' read -r kind path; do
+  [[ $kind == valid || $kind == invalid ]] || continue
+  roots_n=$((roots_n + 1))
+  if HOME=/home/tester bash -c "$VALID_ROOT"$'\nvalid_root "$1"' _ "$path"; then got=valid; else got=invalid; fi
+  [[ $got == "$kind" ]] || { echo "     roots.tsv: '$path' is $kind, valid_root says $got"; roots_bad=$((roots_bad + 1)); }
+done <"$PLUGIN_DIR/tests/fixtures/roots.tsv"
+check "valid_root: every case of tests/fixtures/roots.tsv ($roots_n)" eval '((roots_n > 20 && roots_bad == 0))'
+
+# The diff hint pastes as is when a path holds a '.
+R4="$SCRATCH/it's here"
+cp -r "$R0" "$R4"
+fresh
+mkdir -p "$UD"
+printf '[Service]\nExecStart=/bin/true\n' >"$UD/rclone-mount@.service"
+runc "$R4/install.sh" --no-build
+hint=$(sed -n 's/^ *compare:  //p' <<<"$OUT" | head -n 1)
+check "the diff hint for a path with a ': it pastes into a shell and runs diff on the two files" \
+  eval 'rc_is 1 && [[ -n $hint ]] && (cd / && bash -c "$hint" >"$T/diff" 2>&1; (($? == 1))) && grep "^+++ " "$T/diff" | grep -qF -- "$R4/systemd/rclone-mount@.service"'
+
+# HOME-fixed (D6): with XDG_* elsewhere, nothing lands there.
+fresh
+mkdir -p "$T/mnt/cloud"
+runc "$INSTALL" --no-build
+check "HOME-fixed: units in ~/.config/systemd/user, state, config and cloud.env under HOME, nothing under XDG_*" \
+  eval 'rc_is 0 && copies_ok && [[ -f $MAN && -f $ENVF && -z $(find "$T/xdg" -mindepth 2) ]]'
+check "the root's other files (preview.png, docs/) are not installed" \
+  eval '[[ -z $(find "$HOME" -name "*.png") ]] && manifest_all "$R0"'
+
+# The mount unit, on a scratch copy as an instance.
+UNIT=$R0/systemd/rclone-mount@.service
+UV=$SCRATCH/unit
+mkdir -p "$UV"
+cp "$UNIT" "$UV/rclone-mount@x.service"
+if command -v systemd-analyze >/dev/null && [[ -x /usr/bin/rclone && -x /usr/bin/fusermount3 ]]; then
+  check "unit: systemd-analyze --user verify (a scratch instance)" eval 'systemd-analyze --user verify "$UV/rclone-mount@x.service" >"$T/verify" 2>&1 || { sed "s/^/     /" "$T/verify"; false; }'
+else
+  echo "skip unit: systemd-analyze --user verify (systemd-analyze, rclone or fusermount3 missing)"
+fi
+# exec_line <key>: the unit's <key>= line(s), continuations joined.
+exec_line() { sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$UNIT" | grep "^$1="; }
+check "unit: ExecStart mounts at \${OMARCHY_CLOUD_ROOT}/%i, ExecStop unmounts it" \
+  eval '[[ $(exec_line ExecStart) == "ExecStart=/usr/bin/rclone mount %i: \${OMARCHY_CLOUD_ROOT}/%i "* && $(exec_line ExecStop) == "ExecStop=/usr/bin/fusermount3 -uz \${OMARCHY_CLOUD_ROOT}/%i" ]]'
+ROOT_COND="ExecCondition=/usr/bin/sh -c 'case \$\$1 in /?*) ;; *) exit 1 ;; esac; case \$\$1/ in *//* | */./* | */../*) exit 1 ;; esac; case \$\$1 in \"\$\$2\" | \"\$\$2\"/*) exit 1 ;; esac' _ \${OMARCHY_CLOUD_ROOT} %h"
+WANT_COND="$ROOT_COND"'
+ExecCondition=/usr/bin/test -d ${OMARCHY_CLOUD_ROOT}
+ExecCondition=/usr/bin/test -w ${OMARCHY_CLOUD_ROOT}
+ExecCondition=/usr/bin/test -x ${OMARCHY_CLOUD_ROOT}'
+WANT_ENV='Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud
+EnvironmentFile=-%h/.config/omarchy-cloud/cloud.env'
+check "unit: ExecCondition: the root is one the readers accept, an existing directory, writable and searchable; ExecStartPre makes only the remote's dir" \
+  eval '[[ $(exec_line ExecCondition) == "$WANT_COND" && $(exec_line ExecStartPre) == "ExecStartPre=/usr/bin/mkdir -p \${OMARCHY_CLOUD_ROOT}/%i" ]]'
+check "unit: the default Environment=, then cloud.env (which wins), after it" \
+  eval '[[ $(grep -e "^Environment=OMARCHY_CLOUD_ROOT=" -e "^EnvironmentFile=-%h/.config/omarchy-cloud/" "$UNIT") == "$WANT_ENV" ]]'
+check "unit: no literal /mnt/cloud besides the default Environment= line" \
+  eval '[[ $(grep -F /mnt/cloud "$UNIT") == "Environment=OMARCHY_CLOUD_ROOT=/mnt/cloud" ]]'
+# The conditions as systemd runs them: $$ is a literal $, ${OMARCHY_CLOUD_ROOT}
+# and %h one word each (no other $ or specifier in them, checked first),
+# then the words as a shell splits them (single quotes only). A refused
+# root skips (1-254), an accepted one passes.
+check "unit: the ExecCondition lines use no \$ but \$\$ and \${OMARCHY_CLOUD_ROOT}, no specifier but %h" \
+  eval '! exec_line ExecCondition | sed -e "s/[$][$]//g" -e "s/[$]{OMARCHY_CLOUD_ROOT}//g" -e "s/%h//g" | grep -q "[$%]"'
+cond_run() { # cond_run <root> <home> <line>: <line>'s status, run as systemd would
+  local c=${3#ExecCondition=}
+  c=${c//\$\$/\$}
+  c=${c//\$\{OMARCHY_CLOUD_ROOT\}/$(printf %q "$1")}
+  c=${c//%h/$(printf %q "$2")}
+  eval "$c"
+}
+cond_rc() { # cond_rc <root> [home]: the first failing ExecCondition's status, else 0
+  local l
+  while IFS= read -r l; do
+    cond_run "$1" "${2:-$HOME}" "$l" || return $?
+  done < <(exec_line ExecCondition)
+  return 0
+}
+skips() { local r; cond_rc "$@"; r=$?; ((r >= 1 && r <= 254)); }
+UNIT_ROOT_COND=$(exec_line ExecCondition | head -n 1) # the unit's own, not $ROOT_COND
+mkdir -p "$SCRATCH/rw-root" "$SCRATCH/ro-root" "$SCRATCH/nx-root" "$HOME/mnt"
+chmod 555 "$SCRATCH/ro-root"
+chmod 600 "$SCRATCH/nx-root"
+check "unit: the conditions skip a missing, read-only or unsearchable root (exit 1-254) and pass a writable one" \
+  eval 'cond_rc "$SCRATCH/rw-root" && skips "$SCRATCH/none" && skips "$SCRATCH/ro-root" && skips "$SCRATCH/nx-root"'
+chmod 755 "$SCRATCH/ro-root" "$SCRATCH/nx-root"
+check "unit: the root condition passes an absolute root outside home (/mnt/x, which need not exist)" \
+  eval 'cond_run /mnt/x "$HOME" "$UNIT_ROOT_COND"'
+for bad in "" relative mnt/x / /mnt/../etc /mnt/./x /mnt//x /mnt/x/ "$HOME" "$HOME/mnt"; do
+  check "unit: the conditions skip the root '$bad' (exit 1-254), even when it is a writable directory" \
+    eval '{ cond_run "$bad" "$HOME" "$UNIT_ROOT_COND"; r=$?; ((r >= 1 && r <= 254)); } && skips "$bad"'
+done
+check "fixture: \$HOME and \$HOME/mnt are writable directories (only the root condition skips them)" \
+  eval '[[ -d $HOME/mnt && -w $HOME/mnt && -x $HOME/mnt ]]'
 
 # --- 9. the repository ---------------------------------------------------------------
 if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then

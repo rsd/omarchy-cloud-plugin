@@ -1,8 +1,56 @@
 //! The per-remote mount settings file, ~/.config/rclone-mount/<remote>.env
 //! (a systemd EnvironmentFile). Parsing and rendering are pure and keep every
 //! line the TUI does not manage — comments, blank lines, other keys — as is.
+//! Also the mount-root setting, ~/.config/omarchy-cloud/cloud.env (parsed
+//! only; install.sh is its one writer).
 
-use crate::validate::{is_valid_duration, is_valid_size};
+use crate::validate::{is_valid_duration, is_valid_root, is_valid_size};
+use std::path::{Path, PathBuf};
+
+/// The key of the mount-root setting in cloud.env.
+pub const ROOT_KEY: &str = "OMARCHY_CLOUD_ROOT";
+/// The root the unit uses when cloud.env sets none (its `Environment=`).
+pub const DEFAULT_ROOT: &str = "/mnt/cloud";
+/// cloud.env is read up to this many bytes, as every other reader does.
+pub const ROOT_FILE_MAX: usize = 4096;
+
+/// What cloud.env says about the mount root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSetting {
+    /// No file, or no `OMARCHY_CLOUD_ROOT=` line.
+    Absent,
+    /// The value, which fails `validate::is_valid_root`.
+    Invalid(String),
+    Valid(PathBuf),
+}
+
+/// Parses cloud.env without sourcing it: the first ROOT_FILE_MAX bytes,
+/// one trailing `\r` stripped per line, empty and `#` lines skipped; the
+/// value is everything after `OMARCHY_CLOUD_ROOT=` verbatim (no quotes
+/// removed, nothing expanded), and the last such line wins (systemd's
+/// rule). Then checked with `is_valid_root`. Pure.
+pub fn parse_root(bytes: &[u8], home: &Path) -> RootSetting {
+    let bytes = &bytes[..bytes.len().min(ROOT_FILE_MAX)];
+    let prefix = format!("{ROOT_KEY}=");
+    let mut found: Option<&[u8]> = None;
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix(prefix.as_bytes()) {
+            found = Some(v);
+        }
+    }
+    match found.map(std::str::from_utf8) {
+        None => RootSetting::Absent,
+        Some(Ok(v)) if is_valid_root(v, home) => RootSetting::Valid(PathBuf::from(v)),
+        Some(Ok(v)) => RootSetting::Invalid(v.to_string()),
+        Some(Err(_)) => {
+            RootSetting::Invalid(String::from_utf8_lossy(found.unwrap_or_default()).into_owned())
+        }
+    }
+}
 
 /// A setting the TUI edits: env key, form label, unit default, value kind.
 pub struct Managed {
@@ -228,6 +276,64 @@ RCLONE_POLL_INTERVAL=1m\n";
         assert_eq!(e.render(), "A=3\n");
         assert_eq!(EnvFile::parse("B=\"5m\"\n").get("B").as_deref(), Some("5m"));
         assert_eq!(EnvFile::parse("").get("B"), None);
+    }
+
+    #[test]
+    fn root_setting_is_parsed_not_sourced() {
+        let h = Path::new("/home/tester");
+        let valid = |p: &str| RootSetting::Valid(PathBuf::from(p));
+        assert_eq!(parse_root(b"", h), RootSetting::Absent);
+        assert_eq!(
+            parse_root(b"# OMARCHY_CLOUD_ROOT=/srv/x\nOTHER=1\n", h),
+            RootSetting::Absent
+        );
+        assert_eq!(
+            parse_root(b"OMARCHY_CLOUD_ROOT=/srv/cloud\n", h),
+            valid("/srv/cloud")
+        );
+        // No trailing newline; CRLF; last line wins; blank lines skipped.
+        assert_eq!(parse_root(b"OMARCHY_CLOUD_ROOT=/srv/c", h), valid("/srv/c"));
+        assert_eq!(
+            parse_root(b"OMARCHY_CLOUD_ROOT=/srv/c\r\n", h),
+            valid("/srv/c")
+        );
+        assert_eq!(
+            parse_root(b"OMARCHY_CLOUD_ROOT=/a\n\nOMARCHY_CLOUD_ROOT=/b\n", h),
+            valid("/b")
+        );
+        // Verbatim: no quote removal, no expansion, no trimming, no export.
+        for (text, v) in [
+            (&b"OMARCHY_CLOUD_ROOT=\"/srv/c\"\n"[..], "\"/srv/c\""),
+            (b"OMARCHY_CLOUD_ROOT=$HOME/c\n", "$HOME/c"),
+            (b"OMARCHY_CLOUD_ROOT= /srv/c\n", " /srv/c"),
+            (b"OMARCHY_CLOUD_ROOT=/srv/c\r\r\n", "/srv/c\r"),
+            (
+                b"OMARCHY_CLOUD_ROOT=/home/tester/Cloud\n",
+                "/home/tester/Cloud",
+            ),
+            (b"OMARCHY_CLOUD_ROOT=\n", ""),
+        ] {
+            assert_eq!(parse_root(text, h), RootSetting::Invalid(v.into()), "{v:?}");
+        }
+        assert_eq!(
+            parse_root(b"export OMARCHY_CLOUD_ROOT=/srv/c\n", h),
+            RootSetting::Absent
+        );
+        assert_eq!(
+            parse_root(b" OMARCHY_CLOUD_ROOT=/srv/c\n", h),
+            RootSetting::Absent
+        );
+        assert!(matches!(
+            parse_root(b"OMARCHY_CLOUD_ROOT=/srv/\xff\n", h),
+            RootSetting::Invalid(_)
+        ));
+        // Only the first 4096 bytes count.
+        let mut big = vec![b'#'; ROOT_FILE_MAX];
+        big.extend_from_slice(b"\nOMARCHY_CLOUD_ROOT=/srv/c\n");
+        assert_eq!(parse_root(&big, h), RootSetting::Absent);
+        let mut fits = b"OMARCHY_CLOUD_ROOT=/srv/c\n".to_vec();
+        fits.resize(ROOT_FILE_MAX, b'#');
+        assert_eq!(parse_root(&fits, h), valid("/srv/c"));
     }
 
     #[test]

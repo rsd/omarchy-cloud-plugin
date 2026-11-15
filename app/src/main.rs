@@ -6,6 +6,7 @@ mod app;
 mod cmd;
 mod conf;
 mod envfile;
+mod rclone_conf;
 mod secret;
 mod sys;
 mod ui;
@@ -13,7 +14,6 @@ mod validate;
 mod version;
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
@@ -44,20 +44,11 @@ fn main() {
             }
         }
     }
-    let home = match std::env::var_os("HOME").map(PathBuf::from) {
-        Some(h) if h.is_absolute() && validate::expand_local(&h.to_string_lossy(), &h).is_ok() => h,
-        _ => {
-            eprintln!("omarchy-cloud: HOME is not set to an absolute path");
-            std::process::exit(1);
-        }
+    // HOME-fixed: only HOME is read, never XDG_* (see cmd::Paths).
+    let Some(paths) = cmd::Paths::from_env(|k| std::env::var_os(k)) else {
+        eprintln!("omarchy-cloud: HOME is not set to an absolute path");
+        std::process::exit(1);
     };
-    let xdg = |k: &str| std::env::var_os(k).map(PathBuf::from);
-    let paths = cmd::Paths::new(
-        home,
-        xdg("XDG_CONFIG_HOME"),
-        xdg("XDG_STATE_HOME"),
-        xdg("XDG_CACHE_HOME"),
-    );
     let mut app = App::new(paths);
     app.notice = version::check(&app.paths);
     app.refresh();

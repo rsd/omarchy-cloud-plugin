@@ -13,7 +13,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cmd::{self, Paths};
 use crate::conf::{self, JobConf, PairConf};
-use crate::envfile::{self, EnvFile, MANAGED};
+use crate::envfile::{self, DEFAULT_ROOT, EnvFile, MANAGED, RootSetting};
+use crate::rclone_conf;
 use crate::secret::{self, Secret};
 use crate::sys::{self, Busy, Output, State, UnitProps};
 use crate::validate;
@@ -503,6 +504,21 @@ impl App {
         });
     }
 
+    /// Re-reads cloud.env (install.sh may have just run) and checks the
+    /// mount root (`root_ready`); when it is not usable, shows why and what
+    /// to run. True when a mount may be enabled.
+    fn root_ok_or_explain(&mut self) -> bool {
+        self.paths.root_setting = sys::read_root(&self.paths);
+        match root_ready(&self.paths) {
+            Ok(()) => true,
+            Err(why) => {
+                self.view("Mount root not set up", &why);
+                self.msg(Level::Warn, "Not mounted: the mount root is not set up");
+                false
+            }
+        }
+    }
+
     fn confirm(&mut self, title: &str, body: Vec<String>, yes: &str, action: Action) {
         self.mode = Mode::Confirm(Confirm {
             title: title.into(),
@@ -550,6 +566,8 @@ impl App {
     // ------------------------------------------------------------ refresh
 
     pub fn refresh(&mut self) {
+        // install.sh may have set the mount root since the last refresh.
+        self.paths.root_setting = sys::read_root(&self.paths);
         let out = sys::run_for(&cmd::listremotes_cmd(), REFRESH_LIMIT);
         self.remotes_ok = out.ok();
         if out.ok() {
@@ -1032,7 +1050,7 @@ impl App {
                         "Unmount",
                         Action::StopMount(name),
                     );
-                } else {
+                } else if self.root_ok_or_explain() {
                     self.spawn(&format!("Mounting {name}"), move |_| {
                         let o = sys::run(&cmd::start_cmd(&cmd::mount_unit(&name)));
                         if o.ok() {
@@ -1190,7 +1208,10 @@ impl App {
                         "local",
                         "Local folder",
                         "~/",
-                        "absolute or ~/…, not under ~/Cloud or /mnt/cloud",
+                        &format!(
+                            "absolute or ~/…, not under ~/Cloud or {}",
+                            self.paths.root().display()
+                        ),
                     ),
                     Field::text(
                         "include",
@@ -1593,7 +1614,7 @@ impl App {
                 self.spawn(&format!("Inspecting the cache of {item}"), move |paths| {
                     let stopped = mount_stopped(
                         &sys::unit_active_state(&cmd::mount_unit(&item)),
-                        sys::is_mounted(&Paths::mount_point(&item)),
+                        sys::is_mounted(&paths.mount_point(&item)),
                     )
                     .map_err(|e| format!("{item}: {e}"));
                     let dirty = sys::count_dirty(&paths.vfs_meta_dir(&item));
@@ -1708,6 +1729,10 @@ impl App {
             .iter()
             .any(|r| r.name == remote && r.file_state == "enabled");
         let active = self.remote_active(&remote);
+        if login && !was_enabled {
+            self.paths.root_setting = sys::read_root(&self.paths);
+            root_ready(&self.paths).map_err(|e| format!("Start at login: {e}"))?;
+        }
         self.spawn(&format!("Saving settings of {remote}"), move |paths| {
             let file = paths.mount_env(&remote);
             let mut env = sys::read_small(&file)
@@ -1750,19 +1775,17 @@ impl App {
             return Err("Client ID: letters, digits, . _ - only".into());
         }
         if !validate::is_valid_client_secret(secret.expose()) {
-            return Err("Client secret: printable characters without spaces or =".into());
+            return Err(CLIENT_SECRET_RULE.into());
         }
         self.spawn(
             &format!("Setting the OAuth client of {remote}"),
             move |_| {
-                let argv = cmd::client_update_cmd(&remote, &id, &secret);
-                let o = sys::run(argv.expose());
-                drop(argv);
-                if o.ok() {
-                    Outcome::Reconnect(remote)
-                } else {
-                    let err = secret::scrub(&o.last_line(), &secret);
-                    Outcome::Msg(Level::Error, format!("rclone config update failed: {err}"))
+                match set_client(&remote, &id, &secret, &mut |a: &[String]| sys::run(a)) {
+                    Ok(()) => Outcome::Reconnect(remote),
+                    Err(e) => {
+                        let err = secret::scrub(&e, &secret);
+                        Outcome::Msg(Level::Error, format!("Setting the client failed: {err}"))
+                    }
                 }
                 // `secret` is dropped (zeroed) here
             },
@@ -1834,7 +1857,7 @@ impl App {
         let is_new = name.is_none();
         let job = name.unwrap_or_else(|| f.get("name"));
         let conf = build_job(
-            &self.paths.home,
+            &self.paths,
             &sys::fuse_mounts(),
             &job,
             &f.get("remote"),
@@ -1894,10 +1917,10 @@ impl App {
                     // Decided now, not from the (possibly paused) poll.
                     let live = mount_stopped(
                         &sys::unit_active_state(&cmd::mount_unit(&r)),
-                        sys::is_mounted(&Paths::mount_point(&r)),
+                        sys::is_mounted(&paths.mount_point(&r)),
                     );
                     let busy = if live.is_err() {
-                        check_busy(&r)
+                        check_busy(paths, &r)
                     } else {
                         Busy::Free
                     };
@@ -1942,7 +1965,7 @@ impl App {
                 })
             }
             Action::StopMount(r) => self.spawn(&format!("Unmounting {r}"), move |paths| {
-                let busy = check_busy(&r);
+                let busy = check_busy(paths, &r);
                 let dirty = sys::count_dirty(&paths.vfs_meta_dir(&r));
                 if !clear_to_stop(&busy, dirty) {
                     return Outcome::Busy {
@@ -1958,7 +1981,7 @@ impl App {
                 self.spawn(&format!("Unmounting {r}"), move |_| stop_mount(&r))
             }
             Action::RestartMount(r) => self.spawn(&format!("Restarting {r}"), move |paths| {
-                let busy = check_busy(&r);
+                let busy = check_busy(paths, &r);
                 let dirty = sys::count_dirty(&paths.vfs_meta_dir(&r));
                 if !clear_to_stop(&busy, dirty) {
                     return Outcome::Busy {
@@ -1998,7 +2021,7 @@ impl App {
                     let verdict = |meta: &Path| {
                         clear_cache_verdict(
                             &sys::unit_active_state(&cmd::mount_unit(&r)),
-                            sys::is_mounted(&Paths::mount_point(&r)),
+                            sys::is_mounted(&paths.mount_point(&r)),
                             sys::count_dirty(meta),
                         )
                     };
@@ -2042,7 +2065,7 @@ impl App {
                 busy,
                 dirty,
             } => {
-                let mnt = Paths::mount_point(&remote).display().to_string();
+                let mnt = self.paths.mount_point(&remote).display().to_string();
                 let (title, body, yes, action) = busy_dialog(what, &remote, &mnt, &busy, dirty);
                 match action {
                     Some(action) => self.confirm(&title, body, &yes, action),
@@ -2254,6 +2277,8 @@ impl App {
                     self.msg(Level::Info, "No new remote");
                     return;
                 }
+                // refresh() just re-read cloud.env.
+                let ready = root_ready(&self.paths);
                 self.spawn("Setting up the new mount(s)", move |paths| {
                     let mut log = Vec::new();
                     let mut level = Level::Ok;
@@ -2266,13 +2291,17 @@ impl App {
                             log.push(format!("{r}: {e}"));
                             continue;
                         }
+                        if ready.is_err() {
+                            log.push(format!("{r}: settings saved, not mounted"));
+                            continue;
+                        }
                         let o = sys::run(&cmd::mount_enable_cmd(r));
                         if !o.ok() {
                             level = Level::Error;
                             log.push(format!("{r}: enable failed: {}", o.last_line()));
                             continue;
                         }
-                        match sys::create_cloud_link(&paths.cloud_link(r), &Paths::mount_point(r)) {
+                        match sys::create_cloud_link(&paths.cloud_link(r), &paths.mount_point(r)) {
                             Ok(true) => log.push(format!("{r} mounted, ~/Cloud/{r} linked")),
                             Ok(false) => {
                                 log.push(format!("{r} mounted (~/Cloud/{r} already exists)"))
@@ -2282,6 +2311,14 @@ impl App {
                                 log.push(format!("{r} mounted; link: {e}"));
                             }
                         }
+                    }
+                    if let Err(why) = ready {
+                        return Outcome::View {
+                            title: "Mount root not set up".into(),
+                            text: format!("{why}\n\n{}", log.join("\n")),
+                            level: Level::Warn,
+                            msg: "New remote(s) not mounted: the mount root is not set up — press m to mount once it is".into(),
+                        };
                     }
                     Outcome::Msg(level, log.join("; "))
                 });
@@ -2357,7 +2394,7 @@ pub fn build_pair(
     if local_abs == paths.home || local_abs == Path::new("/") {
         return Err("Local folder: choose a folder, not your home or /".into());
     }
-    cloud_loop(&paths.home, &local_abs, fuse).map_err(|e| format!("Local folder: {e}"))?;
+    cloud_loop(paths, &local_abs, fuse).map_err(|e| format!("Local folder: {e}"))?;
     let patterns =
         validate::parse_patterns(include).map_err(|e| format!("Include patterns: {e}"))?;
     let interval = if interval.is_empty() {
@@ -2386,7 +2423,7 @@ pub fn build_pair(
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_job(
-    home: &Path,
+    paths: &Paths,
     fuse: &[PathBuf],
     name: &str,
     remote: &str,
@@ -2397,6 +2434,7 @@ pub fn build_job(
     strip: &str,
     files: &str,
 ) -> Result<JobConf, String> {
+    let home = paths.home.as_path();
     if !validate::is_valid_name(name) {
         return Err(
             "Name: letters, digits, _ . - (starting with a letter or digit), up to 64".into(),
@@ -2410,7 +2448,7 @@ pub fn build_job(
     if dest_abs == home || dest_abs == Path::new("/") {
         return Err("Destination: choose a folder, not your home or /".into());
     }
-    cloud_loop(home, &dest_abs, fuse).map_err(|e| format!("Destination: {e}"))?;
+    cloud_loop(paths, &dest_abs, fuse).map_err(|e| format!("Destination: {e}"))?;
     let keep = if keep.is_empty() {
         None
     } else {
@@ -2678,33 +2716,79 @@ pub fn can_resume(paths: &Paths, pair: &str, local: &Path, remote: &str) -> bool
     listings_exist(paths, local, remote) && paths.pair_state(pair).is_file()
 }
 
-/// Refuses a folder inside a cloud location: /mnt/cloud, ~/Cloud, or any
-/// FUSE mount point (`fuse`, from `sys::fuse_mounts`). A pair would sync a
-/// remote with itself through the mount; a backup would write (and prune)
-/// on a remote, or into a bare mount point the next mount hides. Checked
-/// on the path as given and with symlinks resolved; the error names the
-/// mount. The FUSE mount points come from /proc, already canonical, and are
-/// never resolved: that would stat through a possibly hung mount.
-pub fn cloud_loop(home: &Path, dir: &Path, fuse: &[PathBuf]) -> Result<(), String> {
-    let mut roots: Vec<(PathBuf, String)> = Vec::new();
-    let mnt = PathBuf::from("/mnt/cloud");
-    let cloud = home.join("Cloud");
-    for (r, label) in [(mnt, "/mnt/cloud".to_string()), (cloud, "~/Cloud".into())] {
-        let canon = sys::canonical_lenient(&r);
-        roots.push((r, label.clone()));
-        roots.push((canon, label));
+/// Refuses a folder that overlaps a cloud location (is it, is inside it,
+/// or contains it): the configured mount root, /mnt/cloud (an old mount
+/// may still live there), ~/Cloud, or any FUSE mount point (`fuse`, from
+/// `sys::fuse_mounts`). A pair would sync a remote with itself through the
+/// mount (and a folder *containing* a mount, like /mnt or the root's
+/// parent, still crosses into it); a backup would write (and prune) on a
+/// remote, or into a bare mount point the next mount hides. Checked on the
+/// path as given and with symlinks resolved; the error names the location.
+/// The FUSE mount points come from /proc, already canonical, and are never
+/// resolved: that would stat through a possibly hung mount.
+pub fn cloud_loop(paths: &Paths, dir: &Path, fuse: &[PathBuf]) -> Result<(), String> {
+    let mut targets: Vec<(PathBuf, String)> = Vec::new();
+    let mut fixed: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(root) = paths.configured_root() {
+        fixed.push((root.to_path_buf(), root.display().to_string()));
     }
-    roots.extend(fuse.iter().map(|m| (m.clone(), m.display().to_string())));
+    fixed.push((PathBuf::from(DEFAULT_ROOT), DEFAULT_ROOT.to_string()));
+    fixed.push((paths.cloud_dir(), "~/Cloud".into()));
+    for (r, label) in fixed {
+        let canon = sys::canonical_lenient(&r);
+        targets.push((r, label.clone()));
+        targets.push((canon, label));
+    }
+    targets.extend(fuse.iter().map(|m| (m.clone(), m.display().to_string())));
     let canon = sys::canonical_lenient(dir);
     for p in [dir, canon.as_path()] {
-        if let Some((_, label)) = roots.iter().find(|(r, _)| validate::is_within(p, r)) {
+        if let Some((_, label)) = targets.iter().find(|(t, _)| validate::overlaps(p, t)) {
             return Err(format!(
-                "{} is inside a cloud location ({label}); choose a local folder",
+                "{} overlaps a cloud location ({label}); choose a local folder that is not inside one and contains none",
                 p.display()
             ));
         }
     }
     Ok(())
+}
+
+/// C3: the one command that creates the mount root, the path single-quoted
+/// (`'` becomes `'\''`). `"$USER"` is literal: the user's shell expands it.
+/// Shown, never run.
+pub fn root_setup_command(root: &Path) -> String {
+    let q = root.to_string_lossy().replace('\'', r"'\''");
+    format!("sudo install -d -o \"$USER\" -m 755 '{q}'")
+}
+
+/// Whether a mount may be enabled now: the mount root is set in cloud.env,
+/// valid, and an existing directory this user can write to (the unit only
+/// creates `<root>/<remote>` inside it, never the root). Err: what to do, on
+/// several lines.
+pub fn root_ready(paths: &Paths) -> Result<(), String> {
+    let file = paths.tilde(&paths.cloud_env());
+    let setup = "Run install.sh from the plugin folder (the bar panel's Set up… button runs it) to choose it, or install.sh --mount-root PATH.";
+    match &paths.root_setting {
+        RootSetting::Absent => Err(format!(
+            "The mount root is not set up: {file} sets no OMARCHY_CLOUD_ROOT.\n{setup}"
+        )),
+        RootSetting::Invalid(v) => {
+            let v: String = v.chars().take(120).collect();
+            Err(format!(
+                "The mount root is not set up: OMARCHY_CLOUD_ROOT={v} in {file} is not valid\n\
+                 (it must be an absolute path outside your home, without spaces, quotes, $, % or \\).\n{setup}"
+            ))
+        }
+        RootSetting::Valid(r) => match sys::dir_problem(r) {
+            None => Ok(()),
+            Some(why) => Err(format!(
+                "The mount root is not set up: {} {why}.\n\
+                 Create it once, in a terminal (nothing here runs sudo for you):\n  {}\n\
+                 then try again.",
+                r.display(),
+                root_setup_command(r)
+            )),
+        },
+    }
 }
 
 /// The units the poll names for a pair. The .path only once its drop-in
@@ -2731,14 +2815,79 @@ pub fn files_list_verdict(text: &str) -> Result<usize, String> {
 
 // ------------------------------------------------------- worker bodies
 
+/// Sets a Drive remote's OAuth client in rclone.conf without putting the
+/// secret on any argument vector: `run` gets only `rclone config file` (to
+/// find the file); the file is edited in-process (`write_client`). The
+/// reconnect that follows (`Outcome::Reconnect`) gets a new token.
+pub fn set_client(
+    remote: &str,
+    id: &str,
+    secret: &Secret,
+    run: &mut dyn FnMut(&[String]) -> Output,
+) -> Result<(), String> {
+    let o = run(&cmd::config_file_cmd());
+    if !o.ok() {
+        return Err(format!("rclone config file failed: {}", o.last_line()));
+    }
+    let path =
+        rclone_conf::config_path(&o.stdout).ok_or("rclone config file printed no absolute path")?;
+    write_client(&path, remote, id, secret)
+}
+
+/// Writes `client_id` / `client_secret` into the `[remote]` section of the
+/// rclone.conf at `path` (`rclone_conf::set_client`: nothing else changes).
+/// Refuses an encrypted config (rclone would have to decrypt it) and a
+/// symlink (`sys::write_atomic`, mode 600). The file is read again right
+/// before the write, since rclone rewrites it on every token refresh; when
+/// it changed in between, the edit is redone on the new text. Every copy of
+/// the new text is zeroed.
+pub fn write_client(path: &Path, remote: &str, id: &str, secret: &Secret) -> Result<(), String> {
+    use zeroize::Zeroize;
+    let shown = path.display();
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{shown} is a symlink; refusing to write it — set the client in rclone config instead"
+        ));
+    }
+    for _ in 0..3 {
+        let mut before = sys::read_small(path).ok_or_else(|| format!("cannot read {shown}"))?;
+        if rclone_conf::is_encrypted(&before) {
+            before.zeroize();
+            return Err(format!(
+                "{shown} is encrypted; set the client in rclone config (edit the remote {remote})"
+            ));
+        }
+        let mut new = match rclone_conf::set_client(&before, remote, id, secret.expose()) {
+            Ok(t) => t,
+            Err(e) => {
+                before.zeroize();
+                return Err(e);
+            }
+        };
+        let mut again = sys::read_small(path).unwrap_or_default();
+        let same = again == before;
+        before.zeroize();
+        again.zeroize();
+        if same {
+            let res = sys::write_atomic(path, &new);
+            new.zeroize();
+            return res;
+        }
+        new.zeroize();
+    }
+    Err(format!(
+        "{shown} kept changing while it was edited; try again"
+    ))
+}
+
 fn show_units(units: &[String]) -> Option<HashMap<String, UnitProps>> {
     let out = sys::run_for(&cmd::systemctl_show_cmd(units), REFRESH_LIMIT);
     let props = sys::parse_show(&out.stdout);
     (out.ok() || !props.is_empty()).then_some(props)
 }
 
-fn check_busy(remote: &str) -> Busy {
-    let o = sys::run(&cmd::fuser_cmd(&Paths::mount_point(remote)));
+fn check_busy(paths: &Paths, remote: &str) -> Busy {
+    let o = sys::run(&cmd::fuser_cmd(&paths.mount_point(remote)));
     sys::parse_fuser(o.code, &o.stdout)
 }
 
@@ -2766,7 +2915,7 @@ fn remove_mount(paths: &Paths, r: &str) -> Outcome {
         return Outcome::Msg(Level::Error, format!("disable {r}: {}", o.last_line()));
     }
     let mut log = vec![format!("{r} stopped and disabled")];
-    match sys::remove_cloud_link(&paths.cloud_link(r), &Paths::mount_point(r)) {
+    match sys::remove_cloud_link(&paths.cloud_link(r), &paths.mount_point(r)) {
         Ok(true) => log.push(format!("~/Cloud/{r} removed")),
         Ok(false) => {}
         Err(e) => log.push(e),
@@ -2795,8 +2944,7 @@ fn pair_local(paths: &Paths, pair: &str) -> Result<(PairConf, PathBuf), String> 
         .ok_or_else(|| format!("cannot read {pair}.conf"))?;
     let c = PairConf::parse(&text, &paths.home)?;
     let local = validate::expand_local(&c.local, &paths.home)?;
-    cloud_loop(&paths.home, &local, &sys::fuse_mounts())
-        .map_err(|e| format!("{pair}: LOCAL {e}"))?;
+    cloud_loop(paths, &local, &sys::fuse_mounts()).map_err(|e| format!("{pair}: LOCAL {e}"))?;
     Ok((c, local))
 }
 
@@ -3077,9 +3225,7 @@ pub fn pair_leftovers(
         && let Ok(local) = validate::expand_local(&c.local, &paths.home)
     {
         let session = cmd::bisync_session(&local, &c.remote);
-        for d in paths.bisync_workdirs() {
-            v.extend(cmd::bisync_session_files(&d, &session));
-        }
+        v.extend(cmd::bisync_session_files(&paths.bisync_workdir(), &session));
     }
     (filter_is_own, v)
 }
@@ -3155,12 +3301,17 @@ fn finish_job(paths: &Paths, job: &str, file: &Path, setup: bool, enable: bool) 
     )
 }
 
+/// The client-secret refusal: names exactly what `is_valid_client_secret`
+/// refuses, never the value.
+const CLIENT_SECRET_RULE: &str =
+    "Client secret: 1-256 printable ASCII characters, none of space = \" ' or `";
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn paths() -> Paths {
-        Paths::new(PathBuf::from("/home/u"), None, None, None)
+        Paths::new(PathBuf::from("/home/u"))
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -3188,6 +3339,23 @@ mod tests {
             error: None,
         });
         a
+    }
+
+    #[test]
+    fn client_secret_refusal_names_the_refused_set_not_the_value() {
+        let mut a = App::new(paths());
+        for bad in ["a b", "a=b", "a\"b", "a'b", "a`b"] {
+            let mut sec = Secret::new();
+            bad.chars().for_each(|c| sec.push(c));
+            let e = a.submit_client("r".into(), "id".into(), sec).unwrap_err();
+            assert_eq!(e, CLIENT_SECRET_RULE);
+            assert!(!e.contains(bad), "{e}");
+        }
+        // The message names every refused character, matching the validator.
+        for c in ["space", "=", "\"", "'", "`"] {
+            assert!(CLIENT_SECRET_RULE.contains(c), "{c}");
+        }
+        assert!(!CLIENT_SECRET_RULE.contains("without spaces or ="));
     }
 
     fn form_text(a: &App, key: &str) -> String {
@@ -3648,7 +3816,7 @@ mod tests {
     #[test]
     fn listings_decide_resume() {
         let d = scratch("listings");
-        let p = Paths::new(d.join("home"), None, None, Some(d.join("xdgcache")));
+        let p = Paths::new(d.join("home"));
         let local = Path::new("/home/u/K");
         assert!(!listings_exist(&p, local, "od:Backup/K"));
         let wd = d.join("home/.cache/rclone/bisync");
@@ -3670,26 +3838,12 @@ mod tests {
         );
         std::fs::write(p.pair_state("kp"), "exit=0\n").unwrap();
         assert!(can_resume(&p, "kp", local, "od:Backup/K"));
-        // Only the pinned work dir counts, not XDG_CACHE_HOME's.
-        let l2 = Path::new("/home/u/L");
-        let legacy = d.join("xdgcache/rclone/bisync");
-        std::fs::create_dir_all(&legacy).unwrap();
-        let s2 = cmd::bisync_session(l2, "od:L");
-        for k in ["path1", "path2"] {
-            std::fs::write(legacy.join(format!("{s2}.{k}.lst")), "").unwrap();
-        }
-        assert!(!listings_exist(&p, l2, "od:L"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
     fn removing_a_pair_forgets_its_sync_history() {
-        let p = Paths::new(
-            PathBuf::from("/home/user"),
-            None,
-            None,
-            Some(PathBuf::from("/xc")),
-        );
+        let p = Paths::new(PathBuf::from("/home/user"));
         let home = Path::new("/home/user");
         let conf = PairConf::parse(
             "LOCAL=~/Vaults\nREMOTE=personal-drive:Vaults\nFILTER=~/.config/rclone-bisync/personal.filter\n",
@@ -3705,8 +3859,6 @@ mod tests {
             format!("/home/user/.cache/rclone/bisync/{s}.path1.lst"),
             format!("/home/user/.cache/rclone/bisync/{s}.path2.lst-old"),
             format!("/home/user/.cache/rclone/bisync/{s}.lck"),
-            format!("/xc/rclone/bisync/{s}.path2.lst"),
-            format!("/xc/rclone/bisync/{s}.path1.lst-err"),
         ] {
             assert!(files.contains(&want), "{want} not in {files:?}");
         }
@@ -3831,7 +3983,7 @@ mod tests {
         }
         // Editing a job: its own DEST is not an overlap.
         let d = scratch("dests");
-        let mut b = App::new(Paths::new(d.clone(), None, None, None));
+        let mut b = App::new(Paths::new(d.clone()));
         b.jobs.push(job_entry("other", "~/Elsewhere"));
         b.jobs.push(job_entry("team-vaults", "~/Backups/vaults"));
         let own = job_form(Some("team-vaults"), "~/Backups/vaults");
@@ -3879,7 +4031,7 @@ mod tests {
 
     #[test]
     fn destination_not_in_a_cloud_location() {
-        let h = Path::new("/home/u");
+        let h = &paths();
         let fuse = vec![
             PathBuf::from("/run/user/1000/gvfs"),
             PathBuf::from("/srv/sshfs"),
@@ -3952,7 +4104,7 @@ mod tests {
             ]
         );
         let d = scratch("units");
-        let mut a = App::new(Paths::new(d.clone(), None, None, None));
+        let mut a = App::new(Paths::new(d.clone()));
         for n in ["set-up", "half"] {
             a.pairs.push(Pair {
                 name: n.into(),
@@ -3999,6 +4151,277 @@ mod tests {
         }
     }
 
+    /// D4: the guard checks both directions (equal, inside, containing),
+    /// against the configured root, /mnt/cloud, ~/Cloud and FUSE mounts.
+    #[test]
+    fn cloud_guard_refuses_overlaps_both_ways() {
+        let d = scratch("cloudguard");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join("Cloud")).unwrap();
+        std::fs::create_dir_all(home.join("sub/inner")).unwrap();
+        let mut p = Paths::new(home.clone());
+        p.root_setting = RootSetting::Valid(PathBuf::from("/srv/cloudroot"));
+        let refused = |dir: &Path, fuse: &[PathBuf]| cloud_loop(&p, dir, fuse).unwrap_err();
+        // Containing /mnt/cloud, the configured root, ~/Cloud, a FUSE mount.
+        let e = refused(Path::new("/mnt"), &[]);
+        assert!(e.contains("overlaps a cloud location (/mnt/cloud)"), "{e}");
+        let e = refused(Path::new("/srv"), &[]);
+        assert!(e.contains("(/srv/cloudroot)"), "root's parent: {e}");
+        refused(Path::new("/srv/cloudroot"), &[]);
+        refused(Path::new("/srv/cloudroot/od/x"), &[]);
+        let e = refused(&home, &[]);
+        assert!(e.contains("(~/Cloud)"), "$HOME contains ~/Cloud: {e}");
+        let fuse = [home.join("sub/inner/sshfs")];
+        let e = refused(&home.join("sub"), &fuse);
+        assert!(e.contains("sub/inner/sshfs"), "contains a FUSE mount: {e}");
+        refused(Path::new("/"), &[]);
+        // Siblings that only share a prefix are fine.
+        for ok in [
+            "/mnt/cloudy",
+            "/mnt/cloud-other/x",
+            "/srv/cloudroot2",
+            "/srv/other",
+        ] {
+            assert!(cloud_loop(&p, Path::new(ok), &[]).is_ok(), "{ok}");
+        }
+        assert!(cloud_loop(&p, &home.join("sub"), &[]).is_ok());
+        assert!(cloud_loop(&p, &home.join("sub2"), &fuse).is_ok());
+        // An invalid setting is not a target, /mnt/cloud still is.
+        p.root_setting = RootSetting::Invalid("/srv/cloudroot".into());
+        assert!(cloud_loop(&p, Path::new("/srv"), &[]).is_ok());
+        assert!(cloud_loop(&p, Path::new("/mnt"), &[]).is_err());
+        // Through a symlink: ~/up → /mnt contains /mnt/cloud.
+        std::os::unix::fs::symlink("/mnt", home.join("up")).unwrap();
+        assert!(cloud_loop(&p, &home.join("up"), &[]).is_err());
+        // The forms refuse them too.
+        let p2 = Paths::new(home.clone());
+        assert!(build_pair(&p2, &[], "w", "od", "", "/mnt", "", "").is_err());
+        assert!(build_job(&p2, &[], "j", "r", "", "/mnt", "", "", "", "").is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn root_setup_command_is_quoted() {
+        assert_eq!(
+            root_setup_command(Path::new("/mnt/cloud")),
+            r#"sudo install -d -o "$USER" -m 755 '/mnt/cloud'"#
+        );
+        assert_eq!(
+            root_setup_command(Path::new("/mnt/it's")),
+            r#"sudo install -d -o "$USER" -m 755 '/mnt/it'\''s'"#
+        );
+    }
+
+    /// D1: a mount is enabled only under a set, valid, existing, writable
+    /// root; otherwise the instructions (C3) are shown.
+    #[test]
+    fn mount_root_must_be_ready() {
+        let d = scratch("rootready");
+        let home = d.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut p = Paths::new(home.clone());
+        // Absent.
+        let e = root_ready(&p).unwrap_err();
+        assert!(e.contains("not set up") && e.contains("install.sh"), "{e}");
+        assert!(e.contains("~/.config/omarchy-cloud/cloud.env"), "{e}");
+        // Invalid (inside home).
+        p.root_setting = RootSetting::Invalid(home.join("Cloud").display().to_string());
+        let e = root_ready(&p).unwrap_err();
+        assert!(
+            e.contains("is not valid") && e.contains("install.sh"),
+            "{e}"
+        );
+        // Valid but missing: the exact command.
+        let root = d.join("root");
+        p.root_setting = RootSetting::Valid(root.clone());
+        let e = root_ready(&p).unwrap_err();
+        let cmd = format!("sudo install -d -o \"$USER\" -m 755 '{}'", root.display());
+        assert!(e.contains("does not exist") && e.contains(&cmd), "{e}");
+        // A file, not a directory.
+        std::fs::write(&root, "").unwrap();
+        let e = root_ready(&p).unwrap_err();
+        assert!(e.contains("is not a directory") && e.contains(&cmd), "{e}");
+        std::fs::remove_file(&root).unwrap();
+        // Ready.
+        std::fs::create_dir(&root).unwrap();
+        assert!(root_ready(&p).is_ok());
+        // Not writable (root bypasses the mode, so only checked as a user).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            let e = root_ready(&p).unwrap_err();
+            assert!(e.contains("is not writable") && e.contains(&cmd), "{e}");
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The app re-reads cloud.env and refuses with the text in a view.
+        let mut a = App::new(Paths::new(home.clone()));
+        assert!(!a.root_ok_or_explain(), "absent");
+        match &a.mode {
+            Mode::View(v) => {
+                assert_eq!(v.title, "Mount root not set up");
+                assert!(
+                    v.lines.iter().any(|l| l.contains("install.sh")),
+                    "{:?}",
+                    v.lines
+                );
+            }
+            _ => panic!("no view"),
+        }
+        let env = home.join(".config/omarchy-cloud/cloud.env");
+        let missing = d.join("missing");
+        std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+        std::fs::write(&env, format!("OMARCHY_CLOUD_ROOT={}\n", missing.display())).unwrap();
+        a.mode = Mode::Normal;
+        assert!(!a.root_ok_or_explain(), "missing");
+        let want = format!(
+            "  sudo install -d -o \"$USER\" -m 755 '{}'",
+            missing.display()
+        );
+        match &a.mode {
+            Mode::View(v) => assert!(v.lines.contains(&want), "{:?}", v.lines),
+            _ => panic!("no view"),
+        }
+        assert_eq!(a.paths.mount_point("od"), missing.join("od"));
+        std::fs::write(&env, format!("OMARCHY_CLOUD_ROOT={}\n", root.display())).unwrap();
+        a.mode = Mode::Normal;
+        assert!(a.root_ok_or_explain(), "ready");
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.paths.mount_point("od"), root.join("od"));
+        std::fs::write(&env, format!("OMARCHY_CLOUD_ROOT={}/x\n", home.display())).unwrap();
+        assert!(!a.root_ok_or_explain(), "inside home");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    const RCLONE_CONF: &str = "# hand-written note\n\
+[work]\n\
+type = drive\n\
+token = {\"access_token\":\"ya29.w\",\"expiry\":\"2026-01-01T00:00:00Z\"}\n\
+\n\
+[gdrive]\n\
+type = drive\n\
+client_id = old.apps.googleusercontent.com\n\
+client_secret = OLD-secret\n\
+scope = drive\n\
+token = {\"access_token\":\"ya29.g\",\"refresh_token\":\"1//r\"}\n\
+\n\
+; media below\n\
+[media]\n\
+type = s3\n";
+
+    fn secret_of(s: &str) -> Secret {
+        let mut x = Secret::new();
+        for c in s.chars() {
+            x.push(c);
+        }
+        x
+    }
+
+    /// D7: the secret goes into rclone.conf in-process; the only commands
+    /// of the flow (rclone config file, then the reconnect) never carry it.
+    #[test]
+    fn client_secret_never_on_argv() {
+        let d = scratch("client");
+        let conf = d.join("rclone/rclone.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, RCLONE_CONF).unwrap();
+        let secret = secret_of("GOCSPX-t0pS3cret");
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let stdout = format!("Configuration file is stored at:\n{}\n", conf.display());
+        let mut run = |a: &[String]| {
+            seen.push(a.to_vec());
+            Output {
+                code: Some(0),
+                stdout: stdout.clone(),
+                stderr: String::new(),
+            }
+        };
+        set_client(
+            "gdrive",
+            "new.apps.googleusercontent.com",
+            &secret,
+            &mut run,
+        )
+        .unwrap();
+        seen.push(cmd::reconnect_cmd("gdrive"));
+        assert_eq!(seen[0], ["rclone", "config", "file"]);
+        assert_eq!(seen.len(), 2);
+        for a in &seen {
+            assert!(
+                a.iter().all(|x| !x.contains("t0pS3cret")),
+                "secret on argv: {a:?}"
+            );
+        }
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(
+            text,
+            RCLONE_CONF
+                .replace(
+                    "client_id = old.apps.googleusercontent.com\n",
+                    "client_id = new.apps.googleusercontent.com\n"
+                )
+                .replace(
+                    "client_secret = OLD-secret\n",
+                    "client_secret = GOCSPX-t0pS3cret\n"
+                )
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&conf).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Keys absent from the section are added; nothing else moves.
+        write_client(&conf, "media", "m.apps.googleusercontent.com", &secret).unwrap();
+        let text2 = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(
+            text2,
+            format!(
+                "{text}client_id = m.apps.googleusercontent.com\nclient_secret = GOCSPX-t0pS3cret\n"
+            )
+        );
+        // A failing `rclone config file` writes nothing.
+        let mut fail = |_: &[String]| Output {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "boom".into(),
+        };
+        let e = set_client("gdrive", "x", &secret, &mut fail).unwrap_err();
+        assert!(e.contains("rclone config file failed"), "{e}");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), text2);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn client_write_refuses_encrypted_and_symlinked_configs() {
+        let d = scratch("clientref");
+        let secret = secret_of("GOCSPX-zz9");
+        let enc = d.join("enc.conf");
+        let enc_text = "# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nAAAA\n";
+        std::fs::write(&enc, enc_text).unwrap();
+        let e = write_client(&enc, "gdrive", "i", &secret).unwrap_err();
+        assert!(
+            e.contains("encrypted") && e.contains("rclone config"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read_to_string(&enc).unwrap(), enc_text);
+        let real = d.join("real.conf");
+        std::fs::write(&real, RCLONE_CONF).unwrap();
+        let link = d.join("link.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = write_client(&link, "gdrive", "i", &secret).unwrap_err();
+        assert!(e.contains("symlink"), "{e}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), RCLONE_CONF);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let e = write_client(&real, "nope", "i", &secret).unwrap_err();
+        assert!(e.contains("no [nope] section") && !e.contains("zz9"), "{e}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), RCLONE_CONF);
+        assert!(write_client(&d.join("absent.conf"), "gdrive", "i", &secret).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn local_not_in_a_mount() {
         let d = scratch("cloud");
@@ -4007,19 +4430,19 @@ mod tests {
         std::fs::create_dir_all(home.join("real")).unwrap();
         // ~/link → ~/Cloud: a folder under it is inside the mount dir.
         std::os::unix::fs::symlink(home.join("Cloud"), home.join("link")).unwrap();
-        let p = Paths::new(home.clone(), None, None, None);
-        assert!(cloud_loop(&p.home, &home.join("real/x"), &[]).is_ok());
-        assert!(cloud_loop(&p.home, &home.join("Cloud/od/K"), &[]).is_err());
-        assert!(cloud_loop(&p.home, &home.join("link/od"), &[]).is_err());
-        assert!(cloud_loop(&p.home, Path::new("/mnt/cloud/od/K"), &[]).is_err());
-        assert!(cloud_loop(&p.home, Path::new("/mnt/cloudy"), &[]).is_ok());
+        let p = Paths::new(home.clone());
+        assert!(cloud_loop(&p, &home.join("real/x"), &[]).is_ok());
+        assert!(cloud_loop(&p, &home.join("Cloud/od/K"), &[]).is_err());
+        assert!(cloud_loop(&p, &home.join("link/od"), &[]).is_err());
+        assert!(cloud_loop(&p, Path::new("/mnt/cloud/od/K"), &[]).is_err());
+        assert!(cloud_loop(&p, Path::new("/mnt/cloudy"), &[]).is_ok());
         // A FUSE mount point is used as /proc lists it, never resolved (that
         // would stat through the mount): here a symlink standing in for one
         // is not followed, while the folder itself still is.
         std::os::unix::fs::symlink(home.join("real"), home.join("fuse")).unwrap();
         let fuse = [home.join("fuse")];
-        assert!(cloud_loop(&p.home, &home.join("real/x"), &fuse).is_ok());
-        let e = cloud_loop(&p.home, &home.join("fuse/x"), &fuse).unwrap_err();
+        assert!(cloud_loop(&p, &home.join("real/x"), &fuse).is_ok());
+        let e = cloud_loop(&p, &home.join("fuse/x"), &fuse).unwrap_err();
         assert!(
             e.contains(&format!("({})", home.join("fuse").display())),
             "{e}"
@@ -4090,7 +4513,7 @@ mod tests {
 
     #[test]
     fn job_from_form() {
-        let h = Path::new("/home/u");
+        let h = &paths();
         let c = build_job(
             h,
             &[],

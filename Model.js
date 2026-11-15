@@ -8,17 +8,25 @@
 //
 // What it controls (and never changes): rclone remotes, each mounted by the
 // systemd user template unit rclone-mount@<remote>.service at
-// /mnt/cloud/<remote>, linked from ~/Cloud/<remote>; offline folders, one
+// <root>/<remote> (the mount root: OMARCHY_CLOUD_ROOT in
+// ~/.config/omarchy-cloud/cloud.env, default /mnt/cloud), linked from
+// ~/Cloud/<remote>; offline folders, one
 // rclone-bisync@<pair>.{service,timer,path} per ~/.config/rclone-bisync/<pair>.conf;
 // and backups, one rclone-backup@<job>.{service,timer} per
 // ~/.config/rclone-backup/<job>.conf. No instance name is written here: all
 // of them are discovered (unit globs, config file names) and validated.
 //
 // Every command is an argv array; a remote, pair or job name reaches one only
-// after isValidRemote. The three shell scripts (PENDING_SCRIPT, FUSER_SCRIPT,
-// SCAN_SCRIPT) are constants and take their values as positional parameters;
-// all run under `timeout -k`, so a hung FUSE mount or a FIFO cannot leave them
-// behind.
+// after isValidRemote, the mount root only after isValidRoot. The shell
+// scripts (PENDING_SCRIPT, FUSER_SCRIPT, SCAN_SCRIPT, VERSIONS_SCRIPT,
+// ROOT_CHECK_SCRIPT, BOUNDED_SCRIPT) are constants and take their values as
+// positional parameters; all run under `timeout -k`, so a hung FUSE mount or a
+// FIFO cannot leave them behind.
+//
+// Every path is HOME-fixed (~/.config, ~/.local/state, ~/.cache), as the
+// helper scripts, the TUI and the units resolve them: XDG_* variables are
+// never read, since the systemd user manager that runs the services usually
+// does not have the shell's.
 
 // ---------------------------------------------------------------- constants
 
@@ -35,7 +43,15 @@ var UNIT_SUFFIX = ".service"
 // systemctl matches it against the units it has loaded, which is how remotes
 // with no env file are found.
 var UNIT_GLOB = "rclone-mount@*.service"
-var MOUNT_ROOT = "/mnt/cloud"
+// The mount root when the setting is absent or invalid (the unit's own
+// Environment= default). The setting itself is ROOT_SETTING_KEY in
+// ROOT_SETTING_FILE, written by install.sh only, parsed here (never sourced)
+// by parseRootSetting and held to isValidRoot.
+var DEFAULT_MOUNT_ROOT = "/mnt/cloud"
+var ROOT_SETTING_FILE = ".config/omarchy-cloud/cloud.env"
+var ROOT_SETTING_KEY = "OMARCHY_CLOUD_ROOT"
+var ROOT_SETTING_MAX_BYTES = 4096
+var ROOT_MAX_BYTES = 255
 
 // Relative to $HOME.
 var CLOUD_LINKS = "Cloud"
@@ -46,8 +62,8 @@ var BISYNC_CONF_DIR = ".config/rclone-bisync"
 var BACKUP_CONF_DIR = ".config/rclone-backup"
 // The omarchy-cloud TUI, as install.sh installs it.
 var APP_BIN = ".local/bin/omarchy-cloud"
-// Under ${XDG_STATE_HOME:-~/.local/state}, as bin/rclone-bisync and
-// bin/rclone-backup write them: <dir>/<name>.state.
+// Under ~/.local/state (HOME-fixed, never XDG_STATE_HOME), as bin/rclone-bisync
+// and bin/rclone-backup write them: <dir>/<name>.state.
 var STATE_DEFAULT = ".local/state"
 var BISYNC_STATE_DIR = "rclone-bisync"
 var BACKUP_STATE_DIR = "rclone-backup"
@@ -102,6 +118,8 @@ var MAX_CONFLICTS_SHOWN = 5
 var LOG_LINES = 20
 var LOG_LINE_MAX = 240
 var LOG_MAX_CHARS = 4000
+// What the journal read keeps at the source (formatLog looks at no more).
+var LOG_READ_MAX_BYTES = LOG_MAX_CHARS * 8
 var NAME_MAX_CHARS = 120
 var PENDING_MAX_FILES = 100000
 // The config and state scan: at most SCAN_MAX_FILES files, the first
@@ -111,7 +129,7 @@ var PENDING_MAX_FILES = 100000
 var SCAN_FILE_MAX_BYTES = 8192
 var SCAN_MAX_FILES = 2 * (MAX_PAIRS + MAX_JOBS)
 var SCAN_FILE_MAX_LINES = 400
-var SCAN_MAX_CHARS = SCAN_MAX_FILES * (SCAN_FILE_MAX_BYTES + 512) + 4096
+var SCAN_MAX_CHARS = SCAN_MAX_FILES * (SCAN_FILE_MAX_BYTES + 512) + ROOT_SETTING_MAX_BYTES + 4096
 // A state file this much older than the unit's own last exit belongs to an
 // earlier run (the script writes it just before it exits).
 var STATE_SKEW_S = 5
@@ -145,17 +163,30 @@ var FUSER_SCRIPT = "fuser -v -M -m \"$1\" 2>&1; echo \"" + FUSER_EXIT_TAG + " $?
 // helper scripts follow it, and read only when it ends at a regular file: a
 // FIFO, device, directory or dangling link is skipped), at most "$3" files,
 // the first "$2" bytes of each, each preceded by its byte size; whether the
-// TUI binary "$4" is installed; and the list-unit-files lines of the two
+// TUI binary "$4" is installed; the mount-root setting "$5" (a regular file,
+// its first "$6" bytes, preceded by its size like the others); and the
+// list-unit-files lines of the two
 // service templates (constants, at most TEMPLATE_MAX_LINES lines). Every
 // marker line starts with "$1", a token the widget draws at random for each
 // run, so no file content, file name or systemctl line can forge one; the
 // "end" line marks a run that finished. Nothing is interpolated into the
 // script: paths and bounds are positional parameters, and the only expansions
 // are of the script's own variables.
+// The mount-root setting read, shared by SCAN_SCRIPT and SETTING_SCRIPT:
+// "$e" when it is a regular file, its first "$r" bytes behind a
+// "<token> setting <size>" marker.
+var SETTING_READ_LINES = [
+  "if [ -f \"$e\" ] && s=$(wc -c <\"$e\"); then",
+  "  printf '%s setting %s\\n' \"$t\" \"$s\"",
+  "  head -c \"$r\" -- \"$e\"",
+  "  printf '\\n%s eof\\n' \"$t\"",
+  "fi"
+]
 var SCAN_SCRIPT = [
-  "t=$1 c=$2 m=$3 a=$4",
-  "shift 4",
-  "[ -f \"$a\" ] && [ -x \"$a\" ] && printf '%s app\\n' \"$t\"",
+  "t=$1 c=$2 m=$3 a=$4 e=$5 r=$6",
+  "shift 6",
+  "[ -f \"$a\" ] && [ -x \"$a\" ] && printf '%s app\\n' \"$t\""
+].concat(SETTING_READ_LINES).concat([
   "systemctl --user list-unit-files --no-legend --plain -- '" + BISYNC_TEMPLATE + "' '" + BACKUP_TEMPLATE
     + "' 2>/dev/null | head -n " + TEMPLATE_MAX_LINES + " | while IFS= read -r l; do printf '%s unitfile %s\\n' \"$t\" \"$l\"; done",
   "n=0",
@@ -171,7 +202,15 @@ var SCAN_SCRIPT = [
   "  done",
   "done",
   "printf '%s end\\n' \"$t\""
-].join("\n")
+]).join("\n")
+
+// The mount-root setting alone (token "$1", the file "$2", its first "$3"
+// bytes), read the way SCAN_SCRIPT reads it, then an "end" line. Run on a
+// poll only while the root is not set up (rootNeedsReread), so Set up
+// (install.sh writing cloud.env) clears the notice on the next poll without a
+// full scan; never while the root is ready.
+var SETTING_SCRIPT = ["t=$1 e=$2 r=$3"].concat(SETTING_READ_LINES).concat(["printf '%s end\\n' \"$t\""]).join("\n")
+var SETTING_MAX_CHARS = ROOT_SETTING_MAX_BYTES + 1024
 
 // The installed-parts check: which version install.sh last recorded against
 // the plugin's own. One small process, read when the first bar attaches and
@@ -219,6 +258,29 @@ var INSTALL_SCRIPT = [
   "read -r _"
 ].join("\n")
 
+// Whether the mount root "$1" is a directory this user can create the
+// per-remote folders in (what the unit's ExecCondition asks). Run only for a
+// root that passed isValidRoot, and the root is "$1", never part of the
+// script. The answer is one constant word: ROOT_CHECK_OK or ROOT_CHECK_MISSING.
+var ROOT_CHECK_OK = "root-ok"
+var ROOT_CHECK_MISSING = "root-missing"
+var ROOT_CHECK_SCRIPT = "if [ -d \"$1\" ] && [ -w \"$1\" ] && [ -x \"$1\" ]; then echo " + ROOT_CHECK_OK
+  + "; else echo " + ROOT_CHECK_MISSING + "; fi"
+
+// A plain command (systemctl show, du, journalctl) bounded at the source: its
+// argv is "$@" after the token "$1" and the byte cap "$2", its stdout cut by
+// `head -c`, and an end line "<token> end" printed once the pipeline is done.
+// It runs under `timeout -k`, which kills the whole group, so a run cut by the
+// timeout has no end line (parseBounded refuses it). The command's own argv
+// is built by the model and validated there; nothing is interpolated into
+// the script.
+var BOUNDED_SCRIPT = [
+  "t=$1 c=$2",
+  "shift 2",
+  "\"$@\" 2>/dev/null | head -c \"$c\"",
+  "printf '\\n%s end\\n' \"$t\""
+].join("\n")
+
 // Nerd Font (Material Design) glyphs, the bar's own icon font.
 var ICON = {
   all: "󰅠",      // md-cloud_check
@@ -257,6 +319,40 @@ function isSafeHome(home) {
 function cleanHome(home) {
   if (!isSafeHome(home)) return ""
   return home.length > 1 && home.charAt(home.length - 1) === "/" ? home.slice(0, -1) : home
+}
+
+// The UTF-8 length of a string, in bytes.
+function utf8Bytes(s) {
+  var n = 0
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) { n += 4; i++ }
+    else n += 3
+  }
+  return n
+}
+
+// A usable mount root (the one rule of tests/fixtures/roots.tsv, shared with
+// the TUI's validate::is_valid_root and the scripts' valid_root): absolute;
+// not "/"; no empty, "." or ".." component (so no "//" and no trailing "/");
+// none of the bytes 0x00-0x20 and 0x7f, nor $ % \ " ' or a backquote (ASCII
+// only: "é" is allowed); not `home` nor inside it, component-wise (a root
+// inside $HOME would be crawled by everything that walks the home
+// directory); at most ROOT_MAX_BYTES UTF-8 bytes. `home` may be "" (then only
+// the home rule is skipped), as the scripts skip it without a $HOME.
+function isValidRoot(path, home) {
+  if (typeof path !== "string" || path.length < 2 || path.charAt(0) !== "/") return false
+  if (utf8Bytes(path) > ROOT_MAX_BYTES) return false
+  if (/[\u0000-\u0020\u007f$%\\"'`]/.test(path)) return false
+  var parts = path.split("/")
+  for (var i = 1; i < parts.length; i++)
+    if (parts[i] === "" || parts[i] === "." || parts[i] === "..") return false
+  var h = typeof home === "string" ? home : ""
+  while (h.length > 1 && h.charAt(h.length - 1) === "/") h = h.slice(0, -1)
+  if (h !== "" && h !== "/" && (path === h || path.indexOf(h + "/") === 0)) return false
+  return true
 }
 
 // The remote of "rclone-mount@<remote>.service", or "".
@@ -374,8 +470,12 @@ function unitRemotes(units) {
 
 // ------------------------------------------------------------------ paths
 
-function mountPath(remote) {
-  return isValidRemote(remote) ? MOUNT_ROOT + "/" + remote : ""
+// <root>/<remote>, where root is the mount root in use (CloudState.mountRoot,
+// from mountRoot); anything that is not a valid root (checked again here,
+// without the home rule) means DEFAULT_MOUNT_ROOT.
+function mountPath(remote, root) {
+  var r = isValidRoot(root, "") ? root : DEFAULT_MOUNT_ROOT
+  return isValidRemote(remote) ? r + "/" + remote : ""
 }
 
 function homePath(home, rel, remote) {
@@ -390,24 +490,25 @@ function cacheDir(home, remote) { return homePath(home, CACHE_DIR, remote) }
 function metaDir(home, remote) { return homePath(home, META_DIR, remote) }
 function envDir(home) { return homePath(home, ENV_DIR) }
 function appPath(home) { return homePath(home, APP_BIN) }
+function rootSettingPath(home) { return homePath(home, ROOT_SETTING_FILE) }
 
-// ${XDG_STATE_HOME:-$HOME/.local/state}, as the helper scripts resolve it; a
-// value that is not a clean absolute path is ignored (XDG says relative
-// values are invalid), and "" without a usable $HOME.
-function stateHome(home, xdgStateHome) {
-  var x = cleanHome(xdgStateHome)
-  if (x !== "") return x
+// $HOME/.local/state, as the helper scripts and the TUI resolve it: HOME-fixed,
+// XDG_STATE_HOME is never read (any further argument is ignored); "" without
+// a usable $HOME.
+function stateHome(home) {
   return homePath(home, STATE_DEFAULT)
 }
 
-// The four directories the scan reads; "" for each without a usable home.
+// The four directories the scan reads, and the mount-root setting file; ""
+// for each without a usable home.
 function scanDirs(home, stateDir) {
   var s = cleanHome(stateDir)
   return {
     bisyncConf: homePath(home, BISYNC_CONF_DIR),
     backupConf: homePath(home, BACKUP_CONF_DIR),
     bisyncState: s !== "" ? s + "/" + BISYNC_STATE_DIR : "",
-    backupState: s !== "" ? s + "/" + BACKUP_STATE_DIR : ""
+    backupState: s !== "" ? s + "/" + BACKUP_STATE_DIR : "",
+    setting: rootSettingPath(home)
   }
 }
 
@@ -528,7 +629,7 @@ function scanArgv(home, stateDir, token) {
   var all = [d.bisyncConf, d.backupConf, d.bisyncState, d.backupState]
   for (var i = 0; i < all.length; i++) if (dirs.indexOf(all[i]) === -1) dirs.push(all[i])
   return timeoutArgv().concat(["sh", "-c", SCAN_SCRIPT, "cloud-mounts-scan", token,
-    String(SCAN_FILE_MAX_BYTES), String(SCAN_MAX_FILES), bin]).concat(dirs)
+    String(SCAN_FILE_MAX_BYTES), String(SCAN_MAX_FILES), bin, d.setting, String(ROOT_SETTING_MAX_BYTES)]).concat(dirs)
 }
 
 function timeoutArgv() {
@@ -538,8 +639,8 @@ function timeoutArgv() {
 // fuser takes no "--"; the path is absolute, so it can never read as an
 // option. -M: answer only if it is a mount point (a stopped remote's empty
 // directory would otherwise list every process on the root filesystem).
-function fuserArgv(remote) {
-  return fuserPathArgv(mountPath(remote))
+function fuserArgv(remote, root) {
+  return fuserPathArgv(mountPath(remote, root))
 }
 
 // The same for any absolute mount point (the live test uses /dev/shm).
@@ -580,6 +681,97 @@ function isLogUnit(unit) {
 function journalArgv(unit) {
   if (!isLogUnit(unit)) return []
   return ["journalctl", "--user", "-u", unit, "-n", String(LOG_LINES), "--no-pager", "-o", "short"]
+}
+
+// `argv` through BOUNDED_SCRIPT under `timeout -k`: at most `cap` bytes of its
+// stdout, then the end line for `token` (a scanToken). [] for an empty argv, a
+// bad token or a cap that is not a positive integer.
+function boundedArgv(argv, cap, token) {
+  if (!Array.isArray(argv) || argv.length === 0) return []
+  if (typeof token !== "string" || !SCAN_TOKEN_RE.test(token)) return []
+  if (typeof cap !== "number" || !isFinite(cap) || cap < 1 || Math.floor(cap) !== cap) return []
+  return timeoutArgv().concat(["sh", "-c", BOUNDED_SCRIPT, "cloud-mounts-bounded", token, String(cap)]).concat(argv)
+}
+
+// BOUNDED_SCRIPT's output for `token`: { ok, text }. ok only when the end line
+// closes it (the run was not cut by the timeout) and the whole answer is
+// within `cap` bytes of output plus the end line; text is the command's
+// output without it ("" when not ok).
+function parseBounded(text, token, cap) {
+  var bad = { ok: false, text: "" }
+  if (typeof token !== "string" || !SCAN_TOKEN_RE.test(token)) return bad
+  var s = String(text === undefined || text === null ? "" : text)
+  var tail = "\n" + token + " end\n"
+  if (s.length > cap + tail.length || s.length < tail.length || s.slice(-tail.length) !== tail) return bad
+  return { ok: true, text: s.slice(0, -tail.length) }
+}
+
+// The three bounded processes: the poll, the cache sizes, a unit's journal.
+function pollArgv(remotes, token) { return boundedArgv(showArgv(remotes), SHOW_MAX_CHARS, token) }
+function sizesArgv(home, remotes, token) { return boundedArgv(duArgv(home, remotes), DU_MAX_CHARS, token) }
+function logArgv(unit, token) { return boundedArgv(journalArgv(unit), LOG_READ_MAX_BYTES, token) }
+
+// What the log view shows for logProc's answer: the formatted journal, or
+// LOG_TIMED_OUT when the run was cut (no end line), never "Loading…" forever.
+var LOG_TIMED_OUT = "Log timed out"
+function logView(text, token) {
+  var b = parseBounded(text, token, LOG_READ_MAX_BYTES)
+  return b.ok ? formatLog(b.text) : LOG_TIMED_OUT
+}
+
+// The root check for a root that passed isValidRoot (the home rule skipped
+// only for a HOME that is "" or "/", as everywhere else): the
+// root as its own argument after the constant ROOT_CHECK_SCRIPT; [] otherwise.
+function rootCheckArgv(root, home) {
+  if (!isValidRoot(root, cleanHome(home))) return []
+  return timeoutArgv().concat(["sh", "-c", ROOT_CHECK_SCRIPT, "cloud-mounts-root", root])
+}
+
+// ROOT_CHECK_SCRIPT's answer: "ok", "missing", or "" (no answer: timed out,
+// or anything else), which claims nothing.
+function parseRootCheck(text) {
+  var s = String(text === undefined || text === null ? "" : text)
+  if (s === ROOT_CHECK_OK + "\n") return "ok"
+  if (s === ROOT_CHECK_MISSING + "\n") return "missing"
+  return ""
+}
+
+// While the root is not set up (rootStatus absent, invalid or missing), each
+// poll re-reads the setting (settingArgv) and checks the root again, so the
+// notice clears on the next poll after Set up or the one-time sudo command.
+// Nothing extra runs once it is ready ("ok") or before anything is known ("").
+function rootNeedsReread(status) {
+  return status === "absent" || status === "invalid" || status === "missing"
+}
+
+// SETTING_SCRIPT under `timeout -k`: the token and the path of the setting
+// file as their own arguments; [] without a usable home or a token.
+function settingArgv(home, token) {
+  if (typeof token !== "string" || !SCAN_TOKEN_RE.test(token)) return []
+  var file = rootSettingPath(home)
+  if (file === "") return []
+  return timeoutArgv().concat(["sh", "-c", SETTING_SCRIPT, "cloud-mounts-setting", token, file,
+    String(ROOT_SETTING_MAX_BYTES)])
+}
+
+// SETTING_SCRIPT's answer for `token`: { ok, setting } (setting as in
+// parseScan's); ok only for a run that finished (its end line) within
+// SETTING_MAX_CHARS, so a read cut by the timeout keeps the last setting.
+function parseSettingRead(text, token) {
+  var s = String(text === undefined || text === null ? "" : text)
+  if (s.length > SETTING_MAX_CHARS) return { ok: false, setting: { found: false, value: "" } }
+  var r = parseScan(s, token, {})
+  return { ok: r.ok, setting: r.setting }
+}
+
+// The scan with its setting replaced by a later read; the scan itself
+// (unchanged) before a good one, which claims nothing.
+function withSetting(scan, setting) {
+  if (!scan || scan.ok !== true || !setting || typeof setting !== "object") return scan
+  var out = {}
+  for (var k in scan) if (Object.prototype.hasOwnProperty.call(scan, k)) out[k] = scan[k]
+  out.setting = { found: setting.found === true, value: String(setting.value === undefined || setting.value === null ? "" : setting.value) }
+  return out
 }
 
 // What Omarchy's own "File manager (cwd)" binding runs (omarchy-launch-nautilus-cwd),
@@ -661,8 +853,8 @@ function parseDu(text, home, remotes) {
 // it is busy whatever cut the rest). Otherwise (not a mount point, fuser
 // missing, killed by timeout, output over the bound) known is false: the
 // caller must not read that as "not busy".
-function parseFuser(text, remote) {
-  return parseFuserAt(text, mountPath(remote))
+function parseFuser(text, remote, root) {
+  return parseFuserAt(text, mountPath(remote, root))
 }
 
 function parseFuserAt(text, path) {
@@ -705,7 +897,70 @@ function parsePendingCount(text) {
 
 function emptyScan() {
   return { ok: false, app: false, more: false, templates: { bisync: false, backup: false },
-    pairConfs: {}, jobConfs: {}, pairStates: {}, jobStates: {} }
+    pairConfs: {}, jobConfs: {}, pairStates: {}, jobStates: {}, setting: { found: false, value: "" } }
+}
+
+// The mount-root setting file's lines (ROOT_SETTING_FILE), as every reader
+// parses it and never sources it: one trailing "\r" stripped per line; empty
+// lines and lines starting with "#" skipped; a line starting with
+// "OMARCHY_CLOUD_ROOT=" gives the value, everything after that "=", verbatim
+// (no quote stripping, no expansion, no trimming); the last such line wins,
+// as systemd's EnvironmentFile reads it. Every line given counts (the read
+// itself is the ROOT_SETTING_MAX_BYTES bound, and a last line cut by it is
+// kept, as the bash and Rust readers keep it). { found, value }; found is
+// false when no line names the key. The value is validated later (rootSetting).
+function parseRootSetting(lines) {
+  var out = { found: false, value: "" }
+  var list = Array.isArray(lines) ? lines : []
+  var head = ROOT_SETTING_KEY + "="
+  for (var i = 0; i < list.length; i++) {
+    var line = String(list[i]).replace(/\r$/, "")
+    if (line === "" || line.charAt(0) === "#") continue
+    if (line.indexOf(head) !== 0) continue
+    out.found = true
+    out.value = line.slice(head.length)
+  }
+  return out
+}
+
+// The setting as read by the last good scan: { state, path, value }, state
+// absent (no file, or no key) | invalid (fails isValidRoot for `home`; a
+// HOME that is "" or "/" skips only the home rule, as the scripts and the TUI do) |
+// valid; path is the root in use (the value when valid, else
+// DEFAULT_MOUNT_ROOT); value is the raw value, for display only. null before
+// a good scan, so nothing is claimed.
+function rootSetting(scan, home) {
+  if (!scan || scan.ok !== true) return null
+  var st = scan.setting && typeof scan.setting === "object" ? scan.setting : { found: false, value: "" }
+  if (st.found !== true) return { state: "absent", path: DEFAULT_MOUNT_ROOT, value: "" }
+  var v = String(st.value === undefined || st.value === null ? "" : st.value)
+  if (!isValidRoot(v, cleanHome(home))) return { state: "invalid", path: DEFAULT_MOUNT_ROOT, value: v }
+  return { state: "valid", path: v, value: v }
+}
+
+// The mount root in use: the setting's path, DEFAULT_MOUNT_ROOT without one.
+function mountRoot(setting) {
+  return setting && typeof setting.path === "string" && isValidRoot(setting.path, "") ? setting.path : DEFAULT_MOUNT_ROOT
+}
+
+// The root's state for the notice: "" (nothing known yet) | absent | invalid
+// | missing (valid, but not a directory this user can write) | ok. check is
+// the last root check, { path, result } (parseRootCheck), and counts only for
+// the path it checked.
+function rootStatus(setting, check) {
+  if (!setting || typeof setting !== "object") return ""
+  if (setting.state === "absent" || setting.state === "invalid") return setting.state
+  if (setting.state !== "valid") return ""
+  if (!check || check.path !== setting.path) return ""
+  return check.result === "ok" || check.result === "missing" ? check.result : ""
+}
+
+// The one-time command that creates a root this user can write (the shared
+// wording of every part): "$USER" is literal text, for the user's shell to
+// expand; the path is single-quoted, a "'" in it written as '\''. Nothing
+// ever runs it: it is shown, and the user runs it.
+function setupCommand(path) {
+  return "sudo install -d -o \"$USER\" -m 755 '" + String(path).replace(/'/g, "'\\''") + "'"
 }
 
 // The instance name of `path` when it is exactly <dir>/<name><ext>, or "".
@@ -782,9 +1037,17 @@ function parseScan(text, token, dirs) {
   var head = token + " "
   var cur = null
   var files = 0
+  var settingSeen = false
   function finish() {
     var body = cur.lines
     if (body.length > 0 && body[body.length - 1] === "") body.pop()  // the script's own newline
+    if (cur.setting === true) {
+      // Every line, and a last line cut by the byte bound kept (C1).
+      if (!settingSeen) res.setting = parseRootSetting(body)
+      settingSeen = true
+      cur = null
+      return
+    }
     if (cur.truncated && body.length > 0) body.pop()                  // a line cut in half
     var name
     if ((name = nameInDir(cur.path, dirs.bisyncConf, ".conf")) !== "") {
@@ -807,6 +1070,11 @@ function parseScan(text, token, dirs) {
       if (rest === "more") { res.more = true; continue }
       if (rest === "eof") { if (cur !== null) finish(); continue }
       if (rest.indexOf("unitfile ") === 0) { templateLine(res.templates, rest.slice(9)); continue }
+      var sm = /^setting (\d{1,12})$/.exec(rest)
+      if (sm) {
+        cur = { setting: true, truncated: Number(sm[1]) > ROOT_SETTING_MAX_BYTES, lines: [] }
+        continue
+      }
       var m = /^file\s*(\d{1,12}) (\/.*)$/.exec(rest)
       if (m && files < SCAN_MAX_FILES) {
         files++
@@ -817,7 +1085,8 @@ function parseScan(text, token, dirs) {
       continue
     }
     if (cur === null) continue
-    if (cur.lines.length <= SCAN_FILE_MAX_LINES) cur.lines.push(line)
+    if (cur.setting === true) { if (cur.lines.length <= ROOT_SETTING_MAX_BYTES + 1) cur.lines.push(line) }
+    else if (cur.lines.length <= SCAN_FILE_MAX_LINES) cur.lines.push(line)
     else cur.truncated = true
   }
   return res
@@ -1519,15 +1788,58 @@ function installNotice(v) {
 
 var INSTALL_NOTICE_NONE = "Installed parts: not installed — run install.sh"
 
-// The tooltip's short form of an installNotice line: the panel has the
-// versions and the button.
+// The mount root not set up (rootStatus absent, invalid or missing): the
+// line names the root and says to run Set up… (install.sh, which asks for
+// the root and prints the one-time command); for a missing root the line also
+// carries that command (setupCommand). "" for any other state. Shown only as
+// plain text in the panel (the tooltip gets installTipLine's fixed line), and
+// a raw invalid value only through safeText.
+var ROOT_NOTICE_PREFIX = "Mount root not set up: "
+function rootNotice(status, setting) {
+  var path = setting && typeof setting.path === "string" ? setting.path : DEFAULT_MOUNT_ROOT
+  if (status === "absent")
+    return ROOT_NOTICE_PREFIX + "no root chosen yet (the default is " + DEFAULT_MOUNT_ROOT + ") — run Set up…"
+  if (status === "invalid") {
+    var v = setting && typeof setting.value === "string" ? setting.value : ""
+    return ROOT_NOTICE_PREFIX + "the setting " + (v === "" ? "(empty)" : safeText(v, NAME_MAX_CHARS))
+      + " in ~/" + ROOT_SETTING_FILE + " is not a valid root — run Set up…"
+  }
+  if (status === "missing")
+    return ROOT_NOTICE_PREFIX + path + " does not exist or is not writable — run Set up…, or create it once with: "
+      + setupCommand(path)
+  return ""
+}
+
+// The panel's notice above the install button: nothing installed first, then
+// the mount root not set up (no mount can start until it is), then the
+// installed parts out of date; "" when all is well or nothing is known.
+function setupNotice(v, status, setting) {
+  var state = installState(v)
+  if (state === "none") return INSTALL_NOTICE_NONE
+  var root = rootNotice(status, setting)
+  if (root !== "") return root
+  return installNotice(v)
+}
+
+// The tooltip's short form of a setupNotice line: the panel has the
+// versions, the root and the button.
 function installTipLine(notice) {
   if (typeof notice !== "string" || notice === "") return ""
   if (notice === INSTALL_NOTICE_NONE) return "Installed parts: not installed — open the panel"
+  if (notice.indexOf(ROOT_NOTICE_PREFIX) === 0) return "Mount root not set up — open the panel"
   return "Installed parts out of date — open the panel"
 }
 
 var INSTALL_BUTTON_TEXT = "Update installed parts"
+var SETUP_BUTTON_TEXT = "Set up…"
+
+// The install button's label: Set up… while nothing is installed or the
+// mount root is not set up (what setupNotice then says), else Update
+// installed parts. The button runs install.sh either way.
+function installButtonText(v, status) {
+  if (installState(v) === "none") return SETUP_BUTTON_TEXT
+  return rootNotice(status, null) !== "" ? SETUP_BUTTON_TEXT : INSTALL_BUTTON_TEXT
+}
 
 // ------------------------------------------------------------- formatting
 

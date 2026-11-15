@@ -3,7 +3,9 @@
 Everything for rclone cloud storage on an [Omarchy](https://omarchy.org)
 desktop, kept in one repository:
 
-- **The bar plugin** (Cloud Mounts, 0.3.4, id `io.github.rsd.cloud-mounts`): a
+![The Cloud Mounts bar panel: remotes with their mount state, offline folders with their last sync, and backups](preview.png)
+
+- **The bar plugin** (Cloud Mounts, 0.3.5, id `io.github.rsd.cloud-mounts`): a
   shell bar widget that shows rclone remotes mounted by systemd user units, the
   offline folders kept in sync with a remote, and the scheduled backups, and has
   a **Configure...** button (a right-click on the bar icon opens it too).
@@ -20,7 +22,8 @@ desktop, kept in one repository:
 
 Three ideas, in three kinds of instance, each named by one strict pattern
 (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`): a **remote** is mounted at
-`/mnt/cloud/<remote>` (linked at `~/Cloud/<remote>`); an **offline folder**
+`<root>/<remote>` (the root is `/mnt/cloud` by default; linked at
+`~/Cloud/<remote>`, see "Where mounts live"); an **offline folder**
 (a "pair") is a local directory kept in two-way sync with a path on a remote;
 a **backup** (a "job") keeps dated local copies of chosen files on a remote.
 Nothing is enabled by installing: the TUI does it, step by step.
@@ -44,9 +47,12 @@ scripts and TUI it needs are installed by `./install.sh`, which you run
 yourself. It refuses to run as root and is idempotent:
 
 ```
-./install.sh [--no-build | --from-source]
+./install.sh [--no-build | --from-source] [--no-prompt | --mount-root PATH]
 ./install.sh --uninstall [--force]
 ```
+
+Besides the parts below, it sets up the mount root (see "Where mounts live"):
+on a terminal it asks where mounts go, and never runs `sudo` itself.
 
 What it installs, and where (all of it copies, never links, so updating,
 moving or removing the plugin folder changes nothing that systemd runs):
@@ -58,12 +64,14 @@ moving or removing the plugin folder changes nothing that systemd runs):
 | the `omarchy-cloud` TUI | `~/.local/bin/omarchy-cloud` | 755 |
 | (a record of the above, with the version) | `~/.local/state/omarchy-cloud/installed-files` | 644 |
 
-It also creates `~/.config/rclone-bisync` and `~/.config/rclone-backup`
-(mode 700), runs `systemctl --user daemon-reload`, and enables and starts
+It also creates `~/.config/rclone-bisync`, `~/.config/rclone-backup` and
+`~/.config/omarchy-cloud` (mode 700; the last holds the mount-root setting),
+runs `systemctl --user daemon-reload`, and enables and starts
 nothing. Each file is copied atomically (a temporary file in the target
 directory, then `mv`). The record starts with two header lines,
 `#version=<the plugin's version>` and `#repo=<the checkout install.sh ran
-from>`, then lists one `<sha256>  <path>` line per installed file, sorted by
+from>`, then (once the mount-root setting exists) `#config=<its path>`, which
+marks it as user config, then lists one `<sha256>  <path>` line per installed file, sorted by
 path. It is rewritten on every run, so a rerun after an update records the new
 version even when no file changed. The widget and the TUI compare that version
 with the plugin's (see "After an update").
@@ -94,6 +102,14 @@ inside the plugin folder); `--from-source` always builds; `--no-build` installs
 everything but the TUI (an installed `omarchy-cloud` is kept). With neither a
 fitting prebuilt nor `cargo`, it stops with nothing changed and says what to
 install (Rust), or to rerun with `--no-build`.
+
+*What the prebuilt check proves.* The `.sha256` and `BUILD-INFO`'s `src_sha256`
+show that the binary is the file the release published and that it was built
+from the sources of this very commit: it is consistent with the commit. They do
+not show that the build itself was honest: that trust rests on the CI publish
+job (`release.yml`, see Releasing), which is the only thing that writes `dist/`.
+If you would rather not rely on it, run `./install.sh --from-source` and build
+the binary yourself.
 
 **What it never overwrites.** Before changing anything it decides for every
 target: it is replaced only when it is absent, identical to what it would
@@ -127,6 +143,16 @@ are not installed. It reads the record at shell start and on each panel open,
 never on a timer, so the badge updates when a panel is opened. The TUI shows a
 one-line notice on a mismatch.
 
+**Paths are fixed to `$HOME`.** Everything the plugin reads or writes lives
+under the home directory, and `XDG_*` variables are ignored: configuration in
+`~/.config/{rclone-bisync,rclone-backup,omarchy-cloud,rclone-mount}`, state in
+`~/.local/state`, cache in `~/.cache`, the units in `~/.config/systemd/user`.
+The services and timers run under the systemd user manager, whose environment
+usually lacks the `XDG_*` variables of your shell, so following them would let
+the panel, the TUI, the scripts and a timer run disagree about where a pair or a
+job lives. (The run locks stay in `$XDG_RUNTIME_DIR`, falling back to `/tmp`:
+they are not configuration.)
+
 A pair or a job works only after `rclone-bisync setup <pair>` /
 `rclone-backup setup <job>` has written its systemd drop-ins; the TUI does that.
 
@@ -143,8 +169,8 @@ record, then reloads systemd. It refuses while `rclone-bisync@` or
 `rclone-backup@` instances are enabled and prints the `systemctl --user
 disable --now` commands; it refuses while `rclone-mount@` instances are enabled
 unless `--force` (they then stop mounting at the next login). It keeps
-configuration (`~/.config/rclone-bisync`, `~/.config/rclone-backup`, rclone's
-own config), the instances' drop-ins and enablement links, state
+configuration (`~/.config/rclone-bisync`, `~/.config/rclone-backup`, the mount
+root setting `~/.config/omarchy-cloud/cloud.env`, rclone's own config), the instances' drop-ins and enablement links, state
 (`~/.local/state/rclone-*`), the build cache and every synced, mounted or
 backed-up file.
 
@@ -169,6 +195,72 @@ omarchy plugin enable io.github.rsd.cloud-mounts right
 Move it with `omarchy bar move io.github.rsd.cloud-mounts --section right`
 (see `omarchy bar --help`).
 
+## Where mounts live
+
+Mounts live **outside `$HOME`**, under the mount root (default `/mnt/cloud`):
+the remote `onedrive` is mounted at `/mnt/cloud/onedrive`, and
+`~/Cloud/<remote>` is a **symlink** to `<root>/<remote>`, so you still browse
+it from your home.
+
+*Why.* Tools that walk the home directory (indexers, backup tools, `du`,
+search, file pickers, IDE file watchers) usually do not follow symlinks by
+default. A FUSE mount inside `$HOME` would be crawled over the network: very
+slow, and it could cost egress or API quota. Behind a symlink they leave it
+alone.
+
+*The setting.* The root is one line in `~/.config/omarchy-cloud/cloud.env`
+(a systemd `EnvironmentFile`, mode 600, in a mode 700 directory):
+
+```
+OMARCHY_CLOUD_ROOT=/mnt/cloud
+```
+
+`install.sh` is the only thing that writes it; the unit, the scripts, the TUI
+and the panel read it (parsed, never sourced; absent means `/mnt/cloud`
+wherever a default is needed). The unit uses it as `${OMARCHY_CLOUD_ROOT}/%i`
+and its `ExecCondition=` lines skip the start when the root is not usable (not
+an absolute path outside your home, not an existing directory you can write to
+and search), so a machine without the root does not retry a failing mount every
+15 s: the unit is skipped, and the panel and the TUI say the root is not set up.
+The unit no longer creates anything under `/mnt`; it makes only the
+per-remote directory `<root>/<remote>` inside a root you already own.
+
+*Choosing the root.* After installing, with no setting yet, `install.sh`:
+
+- **adopts silently** an existing `/mnt/cloud` that is a directory you own and
+  can write to (an existing install keeps working), saves it, and says so in one
+  line;
+- otherwise, on a terminal, proposes `/mnt/cloud` (Enter accepts) or takes
+  another path. When the chosen path does not exist or is not writable, it
+  **prints** the one command that creates it, to run yourself in another
+  terminal, then press Enter to check again (or type another path):
+
+  ```
+  sudo install -d -o "$USER" -m 755 '<path>'
+  ```
+
+  `install.sh` never runs `sudo`: nothing outside your home is created without
+  you doing it;
+- with no terminal, or with `--no-prompt`, writes nothing and prints those
+  instructions.
+
+`./install.sh --mount-root PATH` saves a root without asking (it must exist and
+be writable). It refuses, naming the units, while any `rclone-mount@` instance
+is enabled or active, because a unit must unmount the path it mounted: stop and
+disable them first (`systemctl --user disable --now`), change the root, enable
+them again. It moves no mount and rewrites no link: `~/Cloud/<remote>` links
+that still point into the old root are listed for you to re-point. An existing
+`cloud.env` is never rewritten except by `--mount-root`, and `--uninstall`
+keeps it.
+
+A root **inside `$HOME` is refused** (everywhere: `install.sh`, the unit, the
+TUI, the panel), as is `/`, a relative path, one with a `.` or `..` component, or
+one containing a space, a control character, or any of the characters `$ % \ " '` or a backquote. The TUI
+shows the root and checks it before enabling a mount, but does not change it:
+that goes through `install.sh --mount-root`. The same root, with `/mnt/cloud`
+and `~/Cloud`, is what the offline-folder and backup guards refuse to overlap
+(see "Safety").
+
 ## Requirements
 
 Every external dependency, by what needs it (on Omarchy, the ones marked
@@ -190,7 +282,9 @@ Every external dependency, by what needs it (on Omarchy, the ones marked
 | `cargo` (only for a source build) | `rust` or rustup | `install.sh` on a machine other than x86_64, `--from-source`, or a checkout without a matching `dist/` |
 
 No network access at install time, except what `cargo` fetches for a source
-build (pinned by `app/Cargo.lock`, built with `--locked`). Nothing needs root.
+build (pinned by `app/Cargo.lock`, built with `--locked`). Root is needed only once, to create the mount root, and only if you
+choose a place you cannot write to (`/mnt/cloud` on a fresh machine): you run
+the command `install.sh` prints; nothing else uses it.
 
 ## Marketplace
 
@@ -203,13 +297,32 @@ scan to report review capabilities, not failures: `installer` (`install.sh`),
 `bundled-executable-binary` (`dist/`) and `remote-build` (the cargo fallback).
 There is no symlink in the repository (checked by `tests/install-test.sh` and
 `tests/manifest-test.js`), and nothing in `dist/` is named `install*` or
-`setup*`.
+`setup*`. The root `preview.png` is the listing's preview image.
+
+The manifest's `barWidget.category` is "Files": that is the shell's
+widget-picker group, which the marketplace ignores. The marketplace category
+(System, above) comes from the submission form. They are different fields on
+purpose, so there is no manifest change to make.
+
+The marketplace installs with `omarchy plugin add <url> --enable`, which only
+clones the plugin and never runs `install.sh`. For the submission's
+**Maintainer notes** field:
+
+> Please apply the `manual-setup` install override to this plugin. Besides the
+> bar widget it needs `install.sh` to be run once, to install its systemd user
+> units, two helper scripts and the `omarchy-cloud` TUI (a prebuilt x86_64
+> binary in `dist/`, else built from source). Installed without that step the
+> widget loads and stays functional: the panel shows "Installed parts: not
+> installed - run install.sh" and a **Set up...** button that opens `install.sh`
+> in a terminal and guides the user through it (including choosing the mount
+> root, which `install.sh` asks for and never creates with `sudo`). Nothing is
+> installed or enabled without that click.
 
 ## Releasing
 
 1. Bump the version in `app/Cargo.toml` (and `app/Cargo.lock`),
    `manifest.json`, `tests/manifest-test.js` and this README; commit to `main`.
-2. `git tag v0.3.4 && git push origin main v0.3.4`.
+2. `git tag v0.3.5 && git push origin main v0.3.5`.
 3. `.github/workflows/release.yml` runs two jobs. **build** (token
    `contents: read`, not kept in the checkout) checks that the tag equals both
    versions, digests the tagged `app/` sources (`src_sha256`, the same pipeline
@@ -224,6 +337,8 @@ There is no symlink in the repository (checked by `tests/install-test.sh` and
    version, commit and `src_sha256` recomputed from `main`), then commits
    `dist/` to `main` as `github-actions[bot]`. Any check failing stops it
    without pushing. Every action is pinned by commit SHA.
+   The `dist/` commit is the only thing that writes the binary, so trust in the
+   prebuilt rests on this publish job (see "The TUI binary").
 4. The marketplace listing is bound to a commit: submit the commit that carries
    `dist/` (the "Plugin verification" form, with its full 40-character SHA).
 
@@ -272,7 +387,17 @@ TUI is installed.
 - **Installed parts.** When they differ from the plugin, are unversioned or
   missing (see "Version check"), a line says so, with an **Update installed
   parts** button that runs `install.sh` in a floating terminal and closes the
-  panel.
+  panel. While nothing is installed, the button reads **Set up…** instead.
+- **Mount root.** While the mount root is not set up (see "Where mounts
+  live": no setting, an invalid one, or a root that does not exist or is not
+  writable), the same place shows "Mount root not set up: ..." (for example "Mount
+  root not set up: /mnt/cloud does not exist or is not writable — run Set up…,
+  or create it once with: sudo install -d -o "$USER" -m 755 '/mnt/cloud'"), the
+  button reads **Set up…**, and it runs `install.sh`, which asks for the root.
+  It is how a plugin added from the marketplace (which never runs `install.sh`)
+  is set up. The panel never runs `install.sh` by itself: it takes a click. The
+  notice clears on the next poll after `install.sh` finishes or you run the
+  command.
 - The panel is capped in height and scrolls past it.
 - **Keyboard.** Opened from a keybinding, the first arrow key shows a cursor;
   Up/Down step between rows (a remote, the confirm box, Sync now, a log), Left/
@@ -280,7 +405,7 @@ TUI is installed.
   Space activates the one under the cursor, Esc closes. The mouse moves the same
   cursor, so one control is highlighted at a time.
 - **Unmounting a busy remote.** Switching a remote off first checks, at that
-  moment only, which processes have files open on `/mnt/cloud/<remote>` and how
+  moment only, which processes have files open on `<root>/<remote>` and how
   many uploads are still pending in its VFS cache. With nothing open and
   nothing pending it stops at once. Otherwise the row lists the processes
   (name, PID, user; at most 8, then a count) and the pending uploads ("N pending
@@ -302,13 +427,15 @@ start on Cancel. Long commands run in a worker with a spinner.
 
 **Remotes**
 
+![The TUI's Remotes tab: the remotes, their mount state and settings, with the keys that add, mount, reconnect and remove them](docs/screenshots/tui-remotes.png)
+
 | Key | Does |
 |---|---|
-| `a` | add: hands the terminal to `rclone config`, then creates the `.env`, enables the mount and the `~/Cloud/<remote>` link |
+| `a` | add: hands the terminal to `rclone config`, then creates the `.env`, enables the mount and the `~/Cloud/<remote>` link (the mount waits for the mount root, see "Where mounts live") |
 | Enter / `s` | mount settings (see below); a restart is offered |
-| `m` | mount / unmount (an unmount asks first when files are open or uploads are pending, naming the count; a count that cannot be made counts as pending) |
+| `m` | mount / unmount (a mount is refused, with the setup command, while the mount root is not set up; an unmount asks first when files are open or uploads are pending, naming the count; a count that cannot be made counts as pending) |
 | `c` | reconnect |
-| `g` | Google client id and secret (Google Drive only; the secret is masked and never shown) |
+| `g` | Google client id and secret (Google Drive only; the secret is masked and never shown, and is written into `rclone.conf` by the TUI itself, never on a command line; an encrypted or symlinked config is refused, set the client in `rclone config` instead) |
 | `d` | remove: refuses while files are open, asks when uploads are pending (or cannot be counted); `rclone config delete` needs a separate typed-name confirmation and is refused while an offline folder or a backup uses the remote |
 
 **Offline folders**
@@ -327,8 +454,8 @@ Adding checks first. Identical: syncing starts (resync, then enable). Different:
 refused, with the differences listed. Identical but with no file on either side
 after the filter: refused ("put a file on one side first"), because bisync's
 next normal run fails on an empty baseline. An empty local folder: optionally,
-after a confirmation, "copy remote -> local first". A local directory inside
-`/mnt/cloud`, `~/Cloud` or any FUSE mount is refused, and so is one that
+after a confirmation, "copy remote -> local first". A local directory that is, is inside or contains
+the mount root, `/mnt/cloud`, `~/Cloud` or any FUSE mount is refused, and so is one that
 overlaps another pair's `LOCAL` or a backup job's `DEST` (see "Safety" and
 "Backups"). Resume (the paused pair's one normal run) is offered only when the
 pair has its own state file next to bisync's listings: listings left by a
@@ -347,7 +474,11 @@ files are open or uploads are pending.
 | `p` | schedule on / off |
 | `d` | remove (keeps `DEST` and the `.files` list) |
 
-**Maintenance.** The journal of a unit; clear a remote's VFS cache (the mount
+**Maintenance.**
+
+![The TUI's Maintenance tab: actions to show a unit's journal, clear a remote's VFS cache and dry-run an offline folder](docs/screenshots/tui-maintenance.png)
+
+The journal of a unit; clear a remote's VFS cache (the mount
 must be stopped, re-checked right before deleting; refused outright while any
 upload is pending, naming the count, and when they cannot be counted: a cache
 directory or metadata file that cannot be read, or more than 200,000 entries;
@@ -375,7 +506,7 @@ INTERVAL=2min
 
 | Key | |
 |---|---|
-| `LOCAL` | required; absolute or `~/`; an existing directory; must not overlap another pair's `LOCAL` or a backup job's `DEST`, nor be inside a cloud location |
+| `LOCAL` | required; absolute or `~/`; an existing directory; must not overlap another pair's `LOCAL` or a backup job's `DEST`, nor overlap a cloud location |
 | `REMOTE` | required; `<remote>:<path>`, the remote part matching the name pattern |
 | `FILTER` | optional; an rclone filter file. Absent: `<pair>.filter` next to the conf if it exists, else no filter. `FILTER=` (empty): no filter |
 | `INTERVAL` | optional; `<n>s`, `<n>min`, `<n>h` or `<n>d`, at least 30s; default `2min` |
@@ -441,11 +572,20 @@ both the timer and the path unit are enabled.
   code: a sync is never stopped for it.
 - The same refuse-at-setup, warn-at-run rule covers `LOCAL` overlapping
   another pair's `LOCAL` (two pairs would share or nest bisync's listings and
-  baseline) and `LOCAL` inside `/mnt/cloud`, `~/Cloud` or any FUSE mount point
-  (a pair would sync a remote with itself through the mount).
-- Every bisync call uses the work dir `~/.cache/rclone/bisync`, pinned: the
-  service and a terminal may have different `XDG_CACHE_HOME`, and the TUI looks
-  for the listings there.
+  baseline) and `LOCAL` overlapping the mount root, `/mnt/cloud`, `~/Cloud` or
+  any FUSE mount point, in either direction: inside one, equal to one, or
+  containing one (a pair would sync a remote with itself through the mount, or
+  walk it: `LOCAL=/mnt`, or a home folder that holds an sshfs mount, is
+  refused).
+- Every bisync call uses the work dir `~/.cache/rclone/bisync`, pinned (like
+  every path here, see "Paths are fixed to `$HOME`"): the service and a terminal
+  may have different `XDG_CACHE_HOME`, and the TUI looks for the listings there.
+- The desktop notification names the conflict copies with `<`, `>` and `&`
+  removed: the notification server renders a small set of markup (links
+  included) and decodes entities first, so a file named like a link in a synced
+  remote could otherwise show a clickable link in a critical notification (a
+  backup's failure notification is cleaned the same way). The log keeps the real
+  names.
 - The first sync of a pair (`resync`) builds the baseline and is allowed only
   when local and remote are **identical** under the filter (`rclone check
   --download`); otherwise it refuses (exit 3) and prints both listings. There is
@@ -473,7 +613,7 @@ STRIP_PREFIX=acme/
 |---|---|
 | `REMOTE` | required; `<remote>:` or `<remote>:<prefix>` (no trailing `/`) |
 | `FILES` | optional; default `~/.config/rclone-backup/<job>.files`; one path per line relative to `REMOTE`, `#` comments, no `..` segment, no leading `/` |
-| `DEST` | required; created with mode 700; must not overlap the `LOCAL` of any offline folder nor the `DEST` of another job, nor be inside a cloud location |
+| `DEST` | required; created with mode 700; must not overlap the `LOCAL` of any offline folder nor the `DEST` of another job, nor overlap a cloud location |
 | `KEEP` | optional; 1 to 365, default 14 |
 | `SCHEDULE` | optional; an `OnCalendar` value (`^[A-Za-z0-9*:,./ -]{1,64}$`), default `daily` |
 | `STRIP_PREFIX` | optional; removed from the front of each path when naming copies |
@@ -491,8 +631,9 @@ normal exit code, so a backup or a sync is never stopped for it.
 
 Two more guards work the same way: a `DEST` must not overlap another job's
 `DEST` (the jobs' copies and pruning would collide), and must not be inside
-`/mnt/cloud`, `~/Cloud` or any FUSE mount point (a backup would write, and
-prune, on a remote, or into a bare mount point the next mount hides).
+the mount root, `/mnt/cloud`, `~/Cloud` or any FUSE mount point, or contain
+one, as for offline folders (a backup would write, and prune, on a remote, or
+into a bare mount point the next mount hides).
 
 **Naming.** `<job>@`, then the path minus `STRIP_PREFIX` with `/` replaced by
 `__`, then the date before the extension: for the job `team-vaults`,
@@ -522,9 +663,10 @@ copies.
 ## Mount settings
 
 Remotes are mounted by `rclone-mount@<remote>.service`
-(`/mnt/cloud/<remote>`, `--cache-dir ~/.cache/rclone`, `--vfs-cache-mode full`,
-and `ExecStop=/usr/bin/fusermount3 -uz /mnt/cloud/%i`: a lazy unmount, which the
-force-unmount design depends on, see below). The tunables are environment
+(`<root>/<remote>`, `--cache-dir ~/.cache/rclone`, `--vfs-cache-mode full`,
+and `ExecStop=/usr/bin/fusermount3 -uz ${OMARCHY_CLOUD_ROOT}/%i`: a lazy
+unmount, which the force-unmount design depends on, see below; the root is the
+mount-root setting, see "Where mounts live"). The tunables are environment
 variables, set in the unit as `Environment=` defaults and overridden per remote
 in `~/.config/rclone-mount/<remote>.env` (a systemd `EnvironmentFile`, which
 wins over `Environment=`):
@@ -568,7 +710,7 @@ leaves it unchanged.
 | 3 | `resync` refused: local and remote differ |
 | 4 | `check` or `resync`: identical, but nothing to sync (no file on either side after the filter); `resync` refuses |
 | 75 | `resync` or `dry-run`: the pair's lock is busy, nothing was done |
-| 64 | usage error, invalid name or invalid conf (and, for `setup` and `validate` only, a guard hit: `LOCAL` overlapping another pair's `LOCAL` or a backup `DEST`, or inside a cloud location) |
+| 64 | usage error, invalid name or invalid conf (and, for `setup` and `validate` only, a guard hit: `LOCAL` overlapping another pair's `LOCAL` or a backup `DEST`, or a cloud location) |
 
 `run` otherwise exits with `rclone bisync`'s own code.
 
@@ -591,10 +733,21 @@ State files, written atomically after each run:
   keeps the previous lines);
 - `~/.local/state/rclone-backup/<job>.state`: `time=`, `exit=`, `ok=`, `failed=`.
 
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured by the scripts (and
-`XDG_CONFIG_HOME` by the TUI) for the `rclone-bisync` and `rclone-backup`
-configuration; the mount `.env` and the VFS cache stay under `~/.config` and
-`~/.cache` because the unit addresses them with `%h`.
+Configuration, state and cache are all under `$HOME` (see "Paths are fixed to
+`$HOME`"): the scripts, the TUI and the panel ignore `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME` and `XDG_CACHE_HOME`, like the units, which address the mount
+`.env` and the VFS cache with `%h`.
+
+**Upgrading to 0.3.5 with a non-default `XDG_CONFIG_HOME`.** Before 0.3.5 the
+scripts and the TUI (but not the panel) followed it, so pairs and jobs may sit
+under `$XDG_CONFIG_HOME/rclone-bisync` and `rclone-backup`, and their state
+under `$XDG_STATE_HOME`. Nothing reads them there any more: move them to
+`~/.config/rclone-bisync`, `~/.config/rclone-backup` and
+`~/.local/state/rclone-*` (and rerun `rclone-bisync setup <pair>` /
+`rclone-backup setup <job>`). 0.3.x has no known such installs, so there is no
+automatic migration. Likewise, bisync listings an older version left under
+`$XDG_CACHE_HOME/rclone/bisync` are no longer cleaned when a pair is removed
+(only `~/.cache/rclone/bisync` is); delete them by hand.
 
 ## How the panel relates to the units
 
@@ -625,7 +778,7 @@ directory) is not watched until the next restart.
 | `~/.config/rclone-mount/` | file names only (a watched directory listing, no process) | on change |
 | pair and job `.conf` / `.state` | the bounded scan described above | first poll, end of a run, panel open |
 | `~/.cache/rclone/vfs/<remote>` | one `du -s -B1 -- <dirs>` for all remotes: allocated bytes, since rclone's cache files are sparse and their apparent size (`du -b`) overstates the cache | only while the panel is open, at most once a minute |
-| who uses a mount | `timeout -k 2 10 sh -c 'fuser -v -M -m "$1" 2>&1; echo "cloud-mounts-fuser-exit $?"' cloud-mounts-busy /mnt/cloud/<remote>`: psmisc fuser puts the PIDs on stdout and the rest of its table on stderr, so the two are merged; output without the exit line (timed out) reads as "could not check" | only when switching a mounted remote off |
+| who uses a mount | `timeout -k 2 10 sh -c 'fuser -v -M -m "$1" 2>&1; echo "cloud-mounts-fuser-exit $?"' cloud-mounts-busy <root>/<remote>`: psmisc fuser puts the PIDs on stdout and the rest of its table on stderr, so the two are merged; output without the exit line (timed out) reads as "could not check" | only when switching a mounted remote off |
 | pending uploads | `timeout -k 2 10 bash -c '<constant script>' cloud-mounts-pending ~/.cache/rclone/vfsMeta/<remote>`: counts the metadata files whose `"Dirty"` is true (rclone's write-back flag); only the count is output | only when switching a mounted remote off |
 | a unit's log | `journalctl --user -u <unit> -n 20 --no-pager -o short`, shown as plain text, lines and total capped | on demand, for a failed unit |
 
@@ -688,9 +841,12 @@ bash tests/run.sh
 Needs `node`, `bash` and the `omarchy` CLI. Besides the plugin suites below it
 runs `tests/scripts-test.sh` (the helper scripts, with stand-ins for `rclone`,
 `systemctl` and `notify-send`), `tests/install-test.sh` (`install.sh` in a
-scratch `HOME`, with stand-ins for `systemctl`, `cargo` and `uname`: copies, the
-record, identical-or-stop, the migration from a linked install, the prebuilt
-binary's checks, `--uninstall`, and that the repository holds no symlink) and the app's `cargo test` and `cargo clippy` (warnings fatal),
+scratch `HOME`, with stand-ins for `systemctl`, `cargo`, `uname` and `sudo`:
+copies, the record, identical-or-stop, the migration from a linked install, the
+prebuilt binary's checks, the mount-root setup (adoption, the printed command,
+`--mount-root`, that `sudo` is never run), `--uninstall`, and that the
+repository holds no symlink; independent of whether `dist/` matches the
+sources) and the app's `cargo test` and `cargo clippy` (warnings fatal),
 built under `CARGO_TARGET_DIR=~/.cache/omarchy-cloud/target`, never inside the
 repo; they are skipped when `cargo` or `app/Cargo.lock` is missing. Plugin suites (a suite that cannot run here
 is reported as **skipped**, not passed):
@@ -719,6 +875,10 @@ is reported as **skipped**, not passed):
   fixture metadata tree; and the fuser script with a stand-in that splits its
   table across stdout and stderr as psmisc does, and one that hangs (cut by
   `timeout`).
+- `tests/fixtures/roots.tsv` pins the mount-root validator: the Rust, bash (the
+  copies in both scripts and `install.sh` must be identical) and JS
+  implementations all run its cases, as `tests/fixtures/names.tsv` does for
+  names.
 - `tests/fuser-live-test.js`: the busy check against the real `fuser`, read
   from stdout as the widget reads it, with a `sleep` the test starts holding
   its cwd on `/dev/shm` (busy) and on a non-mount temporary directory (could
@@ -731,9 +891,15 @@ is reported as **skipped**, not passed):
 
 ## Known residuals
 
-- The Google client secret (set with `g` in the Remotes section) is briefly
-  visible in `/proc/<pid>/cmdline` while `rclone config update` runs: rclone
-  offers no stdin or environment alternative. The TUI never shows it.
+- Setting a Google client (`g` in the Remotes section) edits the `[remote]`
+  section of `rclone.conf` in the TUI, so the secret is never on a command line
+  (rclone offers no way to set a value without one). It is written as plain
+  text, as rclone keeps it for Drive; the config must not be encrypted nor a
+  symlink, and rclone then reconnects the remote for a new token. The TUI never
+  shows the secret.
+- The mount root is not changed from the TUI (only through
+  `install.sh --mount-root`), and re-pointing the `~/Cloud/<remote>` links after
+  a change is left to you.
 
 ## License
 
