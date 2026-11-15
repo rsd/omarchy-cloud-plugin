@@ -60,6 +60,22 @@ alone, and you still find your cloud drives in `~/Cloud`.
 The same reasoning is why offline folders and backups are refused when they
 overlap this folder, `~/Cloud` or any mounted drive.
 
+### A link does not get around this
+
+It does not help to choose a mount folder that is itself a link (a "symbolic link")
+leading into your home folder, for example `/mnt/cloud` made as a link to
+`~/clouddrive`, or a folder that sits under such a link. The drive would then really
+be mounted inside your home, and programs that look through your home (file search,
+indexers, backup tools) would follow the link into the cloud drive and start
+downloading everything. So the plugin looks at where the folder **really** ends up
+and refuses it when that is your home folder or inside it. The installer, the app, the
+panel and the mount itself all do this check.
+
+For the same reason a mount point that is a link is refused: if `<mount folder>/gdrive`
+is a link, rclone would mount wherever it points. Remove the link (`rm
+/mnt/cloud/gdrive`; the plugin then creates it as a real folder), or choose another
+mount folder.
+
 ## Why a `sudo` command is needed at all
 
 `/mnt` belongs to the system, so your own user cannot create `/mnt/cloud` there.
@@ -73,7 +89,8 @@ Use a simple path outside your home folder, such as `/mnt/cloud` or `/mnt/clouds
 The rules, in plain words:
 
 - It must be a full path starting with `/`, and not `/` itself.
-- It must be outside your home folder (and not `~/Cloud`).
+- It must be outside your home folder (and not `~/Cloud`). A folder that is a link
+  into your home, or sits under one, counts as inside it and is refused.
 - Use only plain characters: letters, digits, `-`, `_`, `.` and `/`. No spaces, no
   quotes, no `$` or `%`, no trailing `/`, no `//`, no `.` or `..` parts. Keep it
   short (255 bytes at most). Ordinary text only: a path that is not valid UTF-8
@@ -168,9 +185,9 @@ folder gone, stop and remove your remotes' mounts first, then
     once with: sudo install -d -o "$USER" -m 755 '<folder>' (or choose another
     root: install.sh --mount-root PATH)`, and the panel and the app say the folder
     is not set up.
-  - The folder setting is **refused** (invalid path, or the unit and the other
-    readers disagree about it): the mount **fails right away and is not
-    restarted** until you fix the setting. See
+  - The folder setting is **refused** (invalid path, a path that leads into your
+    home through a link, or the unit and the other readers disagree about it): the
+    mount **fails right away and is not restarted** until you fix the setting. See
     [troubleshooting.md](troubleshooting.md#a-mount-fails-right-away-and-is-not-retried).
 - The unit never creates anything under `/mnt`. The script makes only the
   per-remote folder `<folder>/<remote>` inside a folder you already own.
@@ -182,8 +199,18 @@ folder gone, stop and remove your remotes' mounts first, then
   unit, the app, the panel). The same applies to `/`, a relative path, a path with a
   `.` or `..` part, one that is not valid UTF-8 text, one longer than 255 bytes, and
   one containing a space, a control character or any of the characters `$ % \ " '`
-  or a backquote. Trailing `/` characters on the home folder are ignored when
-  judging "inside your home". The exact check is pinned by
-  `tests/fixtures/roots.tsv`, which the Rust, bash and JavaScript copies all run.
+  or a backquote. The home folder is compared the same way everywhere: a doubled `/`
+  and `/./` in it are ignored, and so are trailing `/` characters. The exact checks
+  are pinned by `tests/fixtures/roots.tsv` (the folder rules) and
+  `tests/fixtures/homes.tsv` (the home comparison), which the Rust, bash and
+  JavaScript copies all run.
+- A folder that is a **symbolic link (or sits under one) leading into your home
+  folder** is refused everywhere too: the folder is resolved first (with
+  `realpath`) and the result is compared with your home. A mount point
+  `<folder>/<remote>` that is itself a symbolic link, to anywhere, is refused by the
+  mount unit. If the folder or your home cannot be resolved within 5 seconds, the
+  mount does not start and is retried (every 15 seconds); so it is when a leftover
+  dead mount at the mount point cannot be cleared (see
+  [troubleshooting.md](troubleshooting.md#a-mount-stopped-working-transport-endpoint-is-not-connected)).
 - The mount folder, `/mnt/cloud` and `~/Cloud` are what the offline-folder and
   backup guards refuse to overlap.

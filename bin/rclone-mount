@@ -4,17 +4,31 @@
 # scripts) would also accept, read from cloud.env the way they read it.
 #
 #   rclone-mount check <remote> <systemd root> <home>
-#                       (ExecCondition=) exit 0: go on (a refused root goes
-#                       on too, so that start fails loudly); exit 1: skip,
+#                       (ExecCondition=) exit 0: go on (a refused root, or
+#                       one that cannot be resolved now, goes on too, so
+#                       that start fails loudly or retries); exit 1: skip,
 #                       the root is valid but not yet an existing directory
 #                       this user can write to and search (one stderr line)
 #   rclone-mount start <remote> <systemd root> <home> -- <command...>
-#                       (ExecStart=) exit 78 when refused (one stderr line:
-#                       the remote, the path, the reason, the fix); else
-#                       creates <root>/<remote> (never the root; exit 78
-#                       when that fails: a file or a dangling link in the
-#                       way) and execs <command...> (same PID: Type=notify
-#                       still works)
+#                       (ExecStart=) clears a stale FUSE mount left at
+#                       <root>/<remote> (fusermount3 -uz), creates
+#                       <root>/<remote> (never the root) and execs
+#                       <command...> (same PID: Type=notify still works)
+#
+# Exit codes of start (each failure one stderr line: the remote, the path,
+# the reason, the fix):
+#   78 (EX_CONFIG) refused: the root or the remote name (below), or a
+#      non-directory or a symlink (to a directory, or dangling) where the
+#      mount point <root>/<remote> goes. The unit lists 78 in
+#      RestartPreventExitStatus=: it fails and is not restarted until fixed.
+#   75 (EX_TEMPFAIL) transient, restarted by Restart=on-failure: the root or
+#      the home could not be resolved (realpath missing, failing or hung
+#      past 5 s); the mount point did not answer stat within 5 s; a stale
+#      FUSE mount there (ENOTCONN: rclone died without unmounting, e.g.
+#      killed) that fusermount3 -uz could not clear (missing or failing; the
+#      line gives the command to run); mkdir of the mount point failing with
+#      nothing in the way.
+#   1  (check and start) the root is valid but not usable yet (above).
 #
 # <systemd root> is ${OMARCHY_CLOUD_ROOT} as systemd set it (the unit's
 # Environment= default, then EnvironmentFile= cloud.env), <home> is %h
@@ -27,17 +41,20 @@
 #     backslashes, accepts indented lines, skips a line that is not valid
 #     UTF-8 so that the default wins), and a root the readers do not see is
 #     never mounted;
+#   - it resolves (symlinks followed, realpath -m) to the home or inside it,
+#     the home as written and resolved (root_outside_home, below;
+#     tests/fixtures/resolved-roots.tsv): programs that crawl the home would
+#     follow the link into the cloud drive;
 #   - the remote name is invalid (the scripts' name rule).
 # cloud.env is parsed, never sourced, as install.sh and the scripts parse it:
 # at most 4096 bytes, empty and # lines skipped, one trailing \r dropped, the
 # value of the last OMARCHY_CLOUD_ROOT= line verbatim; no file, or no such
 # line: the default /mnt/cloud.
-# A refused start exits 78 (EX_CONFIG), which the unit lists in
-# RestartPreventExitStatus=: the unit fails and is not restarted until the
-# setting is fixed. A usage error: check exits 0 (start then refuses it),
-# start 78, an unknown mode 64.
+# A usage error: check exits 0 (start then refuses it), start 78, an unknown
+# mode 64.
 # <home> stands in for $HOME while the root is judged (valid_root reads
-# $HOME and drops every trailing /; a home of only / skips the home rule, as
+# $HOME, normalised by norm_home: runs of / collapsed, "." components and
+# trailing / dropped; a home that normalises to "/" skips the home rule, as
 # in every reader); one that is not absolute is refused (no cloud.env to
 # read).
 # The command runs with the environment's own HOME.
@@ -58,14 +75,15 @@ valid_name() {
 # --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---
 # valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
 # empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
-# backquote, not $HOME nor inside it (every trailing / of $HOME ignored; a
-# $HOME of only / is no home: the rule is skipped), at most 255 bytes; valid
-# UTF-8 (valid_utf8) without U+FFFD (EF BF BD, what a lossy decoder puts in
-# place of a bad byte), so a reader that decodes the path as text and one
-# that reads bytes reach the same verdict.
+# backquote, not $HOME nor inside it ($HOME as norm_home gives it; a $HOME
+# that normalises to "/" is no home: the rule is skipped;
+# tests/fixtures/homes.tsv), at most 255 bytes; valid UTF-8 (valid_utf8)
+# without U+FFFD (EF BF BD, what a lossy decoder puts in place of a bad
+# byte), so a reader that decodes the path as text and one that reads bytes
+# reach the same verdict.
 valid_root() {
-  local LC_ALL=C p=$1 home=$HOME
-  home=${home%"${home##*[!/]}"}
+  local LC_ALL=C p=$1 home
+  norm_home home "$HOME"
   [[ $p == /?* && ${#p} -le 255 ]] || return 1
   [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
   [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
@@ -103,7 +121,66 @@ valid_utf8() {
   done
   return 0
 }
+# norm_home VAR HOME: sets VAR to HOME normalised as every reader does
+# (tests/fixtures/homes.tsv): runs of / collapsed, every "." component and
+# every trailing / dropped, ".." kept as written; empty when that leaves "/"
+# or nothing (no home).
+norm_home() {
+  local _h=$2/ _c _out='' _lead=''
+  [[ $2 == /* ]] && _lead=/
+  while [[ -n $_h ]]; do
+    _c=${_h%%/*} _h=${_h#*/}
+    [[ -z $_c || $_c == . ]] && continue
+    _out+=${_out:+/}$_c
+  done
+  printf -v "$1" '%s' "${_out:+$_lead$_out}"
+}
 # --- end valid_root ---
+
+# --- root_outside_home (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/resolved-roots.tsv) ---
+# root_outside_home ROOT: ROOT (one that passes valid_root) judged with its
+# symlinks resolved (realpath -m: missing components are fine, a dangling
+# link is followed as far as it goes; cut off after 5 s), against the home
+# as written (norm_home) and resolved. Programs that crawl the home (file
+# search, indexers, backups) would follow a link into the cloud drive, so:
+#   0  ROOT resolves outside the home (or there is no home);
+#   1  ROOT resolves to the home or inside it: refused;
+#   2  ROOT (or the home) could not be resolved: realpath missing, failing
+#      or hung (a reader refuses it; rclone-mount start retries it).
+# On 1 and 2, ROOT_WHY is the reason, one clause (paths through printf %q).
+root_outside_home() {
+  local LC_ALL=C home real hr h where
+  ROOT_WHY=''
+  norm_home home "$HOME"
+  if ! real=$(timeout -k 1 5 realpath -m -- "$1" 2>/dev/null) || [[ $real != /* ]]; then
+    printf -v ROOT_WHY 'the mount root %q could not be resolved (realpath is missing, failed or did not answer within 5 s)' "$1"
+    return 2
+  fi
+  [[ -n $home ]] || return 0
+  hr=$home
+  if [[ $home == /* ]] && { ! hr=$(timeout -k 1 5 realpath -m -- "$home" 2>/dev/null) || [[ $hr != /* ]]; }; then
+    printf -v ROOT_WHY 'your home %q could not be resolved (realpath is missing, failed or did not answer within 5 s)' "$home"
+    return 2
+  fi
+  for h in "$home" "$hr"; do
+    [[ $h == / ]] && continue
+    [[ $real == "$h" || $real == "$h"/* ]] || continue
+    if [[ $real == "$1" ]]; then
+      printf -v where 'the mount root %q is' "$1"
+    else
+      printf -v where 'the mount root %q resolves to %q,' "$1" "$real"
+    fi
+    if [[ $h == "$home" ]]; then
+      printf -v ROOT_WHY '%s at or inside your home %q' "$where" "$home"
+    else
+      printf -v ROOT_WHY '%s at or inside your home %q (which resolves to %q)' "$where" "$home" "$hr"
+    fi
+    ROOT_WHY+=': programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive'
+    return 1
+  done
+  return 0
+}
+# --- end root_outside_home ---
 
 # shown <string>: printf %q in the C locale, so a control or non-ASCII byte is
 # shown as an escape, never raw; '' for an empty string.
@@ -139,8 +216,8 @@ read_setting() {
 # refusal: WHY, why the root is refused (one sentence), or empty; ROOT, the
 # root to mount at when WHY is empty.
 refusal() {
-  local home=$HOME
-  home=${home%"${home##*[!/]}"}
+  local home
+  norm_home home "$HOME"
   local env="$home/.config/omarchy-cloud/cloud.env"
   WHY='' ROOT=''
   if ! valid_name "$REMOTE"; then
@@ -170,7 +247,7 @@ refusal() {
   # and where systemd's may have: cloud.env parsed its own way, or another
   # file the unit reads (<remote>.env, read before cloud.env).
   if [[ $SYSTEMD_ROOT != "$ROOT" ]]; then
-    local other="another file the unit reads (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/$REMOTE.env: remove it)"
+    local other="another file the unit reads or a drop-in (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/$REMOTE.env, or an Environment=OMARCHY_CLOUD_ROOT= line in rclone-mount@.service.d/*.conf or rclone-mount@$REMOTE.service.d/*.conf under ~/.config/systemd/user/, /etc/systemd/user/ or ~/.config/systemd/user.control/ (systemctl set-property): remove it)"
     WHY="the unit was given the mount root $(shown "$SYSTEMD_ROOT"), but "
     if [[ $SETTING_STATE == absent && ! -e $env && ! -L $env ]]; then
       WHY+="the other readers use the built-in default $DEFAULT_ROOT (there is no $(shown "$env")); systemd got it from $other"
@@ -223,6 +300,25 @@ if [[ -n $WHY ]]; then
   echo "$PROG: $(shown "$REMOTE"): refusing to mount: $WHY. Fix: $FIX." >&2
   exit 78
 fi
+# retry <why> [fix]: a transient failure, exit 75 (restarted by the unit).
+retry() {
+  echo "$PROG: $REMOTE: cannot mount yet, will retry: $1.${2:+ Fix: $2.}" >&2
+  exit 75
+}
+# The root with its symlinks resolved: not the home nor inside it. One that
+# cannot be resolved now is not refused (check goes on; start retries).
+root_outside_home "$ROOT"
+case $? in
+  1)
+    [[ $MODE == check ]] && exit 0
+    echo "$PROG: $REMOTE: refusing to mount: $ROOT_WHY. Fix: point the root at a real folder outside your home: $FIX." >&2
+    exit 78
+    ;;
+  2)
+    [[ $MODE == check ]] && exit 0
+    retry "$ROOT_WHY"
+    ;;
+esac
 if ! usable "$ROOT"; then
   not_set_up
   exit 1
@@ -230,11 +326,45 @@ fi
 [[ $MODE == check ]] && exit 0
 shift
 if [[ -n $ENV_HOME_SET ]]; then HOME=$ENV_HOME; else unset HOME; fi
-# The remote's own directory only: never the root (mkdir without -p). A
-# failure is not transient (the root is usable: a file or a dangling link is
-# in the way), so it exits 78, not restarted, with one line.
-if [[ ! -d $ROOT/$REMOTE ]] && ! err=$(LC_ALL=C mkdir -- "$ROOT/$REMOTE" 2>&1); then
-  echo "$PROG: $REMOTE: refusing to mount: cannot create the mount point $ROOT/$REMOTE (${err##*: }). Fix: remove or rename what is at $ROOT/$REMOTE, or choose another root: install.sh --mount-root PATH." >&2
+MP=$ROOT/$REMOTE
+STALE='Transport endpoint is not connected'
+# mp_stat: MP_ERR, stat's error for the mount point (empty when it answers);
+# status 124 or 137 when it did not answer within 5 s.
+mp_stat() {
+  local rc=0
+  MP_ERR=$(LC_ALL=C timeout -k 1 5 stat -- "$MP" 2>&1 >/dev/null) || rc=$?
+  ((rc == 0)) && MP_ERR=''
+  return "$rc"
+}
+mp_stat
+case $? in 124 | 137) retry "the mount point $MP did not answer within 5 s (a hung mount)" "run fusermount3 -uz $MP" ;; esac
+# A stale FUSE mount (rclone gone, its mount left): systemd runs ExecStop=
+# after an unexpected death too, but not after a start that failed or timed
+# out before READY=1, and its fusermount3 can fail. Every access fails with
+# ENOTCONN, so it is unmounted (lazily), then looked at again.
+# fusermount3 comes from PATH (not /usr/bin): the tests' stand-in replaces it.
+if [[ $MP_ERR == *"$STALE"* ]]; then
+  if ! err=$(LC_ALL=C fusermount3 -uz -- "$MP" 2>&1); then
+    command -v fusermount3 >/dev/null || err="fusermount3 is not installed"
+    [[ -n $err ]] || err="fusermount3 failed"
+    retry "the mount point $MP is a stale FUSE mount ($STALE: an earlier rclone died without unmounting), and fusermount3 -uz could not clear it (${err##*: })" "run fusermount3 -uz $MP"
+  fi
+  mp_stat
+  [[ $MP_ERR == *"$STALE"* ]] && retry "the mount point $MP is a stale FUSE mount ($STALE), still there after fusermount3 -uz" "run fusermount3 -uz $MP"
+fi
+# A symlink where the mount point goes: rclone would mount where it points
+# (perhaps into the home), or fail on a dangling one. Not transient.
+if [[ -L $MP ]]; then
+  echo "$PROG: $REMOTE: refusing to mount: the mount point $MP is a symbolic link (to $(shown "$(readlink -- "$MP")")); rclone would mount wherever it points. Fix: remove the link (rm $MP; the mount point is then created as a folder), or choose another root: install.sh --mount-root PATH." >&2
   exit 78
+fi
+# The remote's own directory only: never the root (mkdir without -p). A
+# non-directory in the way is not transient (78); any other failure is (75).
+if [[ ! -d $MP ]] && ! err=$(LC_ALL=C mkdir -- "$MP" 2>&1); then
+  if [[ -e $MP && ! -d $MP ]]; then
+    echo "$PROG: $REMOTE: refusing to mount: cannot create the mount point $MP (${err##*: }). Fix: remove or rename what is at $MP, or choose another root: install.sh --mount-root PATH." >&2
+    exit 78
+  fi
+  [[ -d $MP ]] || retry "cannot create the mount point $MP (${err##*: })"
 fi
 exec "$@"

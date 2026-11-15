@@ -1,0 +1,34 @@
+# Mount roots judged with symlinks resolved: the ONE list of cases every reader
+# (the shared bash rule in bin/* and install.sh, rclone-mount, the TUI, the
+# panel) is tested against. A root that passes valid_root (roots.tsv) is still
+# refused when the path it resolves to (realpath -m: missing components are
+# fine, a dangling link is followed as far as it goes) is the home or inside
+# it, the home taken both as written (normalised as in homes.tsv) and
+# resolved. Why: programs that crawl the home (file search, indexers, backup
+# tools) would follow the link into the cloud drive and download it.
+# Each case builds a fresh tree under a temp dir T, with HOME=T/home:
+#   - T/home is created as a directory unless a step makes it a link;
+#   - <setup> is ";"-separated steps, applied in order, or "-" for none:
+#       dir:<p>        mkdir -p T/<p>
+#       link:<p>=<t>   ln -s <t> T/<p> (the parent of T/<p> created first);
+#                      <t> starting with "@/" stands for T/<rest>, any other
+#                      <t> is written verbatim (a relative link)
+#   - <root> is relative to T (the root judged is T/<root>).
+# T itself must be a plain path that passes valid_root (no spaces).
+# Format: <valid|invalid><TAB><setup><TAB><root>; "#" lines are comments.
+valid	dir:mnt/cloud	mnt/cloud
+valid	-	mnt/cloud
+valid	dir:srv/c;link:mnt/cloud=@/srv/c	mnt/cloud
+valid	dir:home2;link:mnt/cloud=@/home2	mnt/cloud
+valid	dir:srv/c;link:mnt=@/srv	mnt/c
+invalid	dir:home/Cloud;link:mnt/cloud=@/home/Cloud	mnt/cloud
+invalid	link:mnt/cloud=@/home	mnt/cloud
+invalid	link:mnt/cloud=../home/Cloud	mnt/cloud
+invalid	link:mnt/cloud=@/home/gone/deeper	mnt/cloud
+invalid	dir:home/x;link:mnt=@/home/x	mnt/cloud
+invalid	dir:home/x;link:mnt=@/home/x	mnt
+invalid	dir:home/a;link:srv/b=@/home/a;link:mnt/cloud=@/srv/b	mnt/cloud
+invalid	dir:data/home;link:home=@/data/home	data/home
+invalid	dir:data/home/Cloud;link:home=@/data/home	data/home/Cloud
+valid	dir:data/home;dir:data/other;link:home=@/data/home	data/other
+invalid	dir:data/home/Cloud;link:home=@/data/home;link:mnt/cloud=@/data/home/Cloud	mnt/cloud

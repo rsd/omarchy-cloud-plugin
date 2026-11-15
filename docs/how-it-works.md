@@ -58,14 +58,18 @@ lines skipped, the value of the last `OMARCHY_CLOUD_ROOT=` line taken verbatim; 
 or no such line means `/mnt/cloud`), and holds the root to their one rule
 (`tests/fixtures/roots.tsv`): absolute; not `/`; no empty, `.` or `..` component; no
 whitespace, control character (NUL included), `$ % \ " '` or backquote; not the home
-folder (trailing `/` of home ignored; a home of only `/` means no home rule) nor inside
-it; at most 255 bytes; valid UTF-8 without U+FFFD. The root systemd passed must also be
+folder nor inside it (the home is compared the same way by every reader,
+`tests/fixtures/homes.tsv`: a doubled `/`, `/./` and a trailing `/` are ignored; a home
+of only `/` means no home rule), and not resolving into it either: the unit runs
+`realpath -m` on the root and on `%h` (each bounded to 5 s) and refuses a root that
+resolves to the home or inside it, so that a symbolic link into the home cannot put the
+mount where file search and backup tools walk; at most 255 bytes; valid UTF-8 without U+FFFD. The root systemd passed must also be
 the same one: systemd parses an environment file its own way (strips quotes and
 surrounding whitespace, processes backslashes, accepts indented lines, skips a line that
 is not valid UTF-8 so that the default wins), and a root the other readers do not see is
 never mounted.
 
-- **A refused root (or remote name):** `ExecStart=` exits **78** with one line in the
+- **A refused root (or remote name, or mount point):** `ExecStart=` exits **78** with one line in the
   journal, `rclone-mount: <remote>: refusing to mount: <reason>. Fix: edit
   ~/.config/omarchy-cloud/cloud.env (one OMARCHY_CLOUD_ROOT=<path> line) or run
   install.sh --mount-root PATH.`, and `RestartPreventExitStatus=78` keeps the unit from
@@ -73,10 +77,30 @@ never mounted.
   given a root that differs from what the other readers see (three variants: no
   `cloud.env`, a `cloud.env` without the line, or a line that says something else; the
   message names the likely causes: quotes or whitespace in the line, a line that is not
-  valid UTF-8, or an `OMARCHY_CLOUD_ROOT=` line in `~/.config/rclone-mount/<remote>.env`);
+  valid UTF-8, an `OMARCHY_CLOUD_ROOT=` line in `~/.config/rclone-mount/<remote>.env`, or
+  an `Environment=OMARCHY_CLOUD_ROOT=` line in a drop-in,
+  `~/.config/systemd/user/rclone-mount@.service.d/*.conf` or
+  `rclone-mount@<remote>.service.d/*.conf`; the message names both places);
+  the root resolves to the home or inside it (the message says what it resolves to,
+  and why: programs that crawl the home would follow the link into the cloud drive);
   `cloud.env` is not a readable regular file; `%h` is not absolute; an invalid remote
-  name; or `cannot create the mount point <root>/<remote> (<reason>)`, usually a file or
-  a dangling link in the way.
+  name; or the mount point `<root>/<remote>` is a file, or a symbolic link (to a
+  folder anywhere, or dangling): rclone would mount wherever the link points.
+- **A temporary problem:** `ExecStart=` exits **75** with `rclone-mount: <remote>:
+  cannot mount yet, will retry: <why>.`, and `Restart=on-failure` retries it as
+  for any failing start (`RestartPreventExitStatus=78` is the only exit status that
+  stops the retries). Reasons: the root or `%h` could not be resolved (`realpath`
+  missing, failing or silent for 5 s); the mount point did not answer `stat` within
+  5 s; `mkdir` failed with nothing in the way; or the mount point is a **stale FUSE
+  mount** (see next).
+- **A stale mount:** when rclone dies hard (`kill -9`, out of memory) the mount is
+  left behind and `stat` on the mount point says "Transport endpoint is not
+  connected". `ExecStart=` detects it from that (never from a live mount: it does not
+  unmount anything that answers), clears it silently with `fusermount3 -uz -- <mount
+  point>` and checks again, then mounts as normal, so the unit recovers by itself on
+  the restart after the crash. If `fusermount3` is missing, fails or the mount point is
+  still stale, it exits 75 and the journal line ends with `Fix: run fusermount3 -uz
+  <mount point>.`; the unit keeps retrying.
 - **A valid root that is not set up** (not an existing directory you can write to and
   search): `ExecCondition=` exits 1, which **skips** the start: the unit is neither
   failed nor restarted, so a machine without the folder does not retry every 15 seconds.
@@ -92,8 +116,9 @@ changed while no mount runs.
 The user manager has no `network-online.target`, so the units do not order on it.
 A mount whose start fails (or takes longer than `TimeoutStartSec=2min`) is
 restarted every 15 seconds (`Restart=on-failure`), with no start limit, so it
-comes up once the network does. (The one exception is a refused mount folder, exit 78
-above, which is not restarted.)
+comes up once the network does. (The one exception is a refused mount folder or mount
+point, exit 78 above, which is not restarted; a failure that only needs time exits 75
+and is retried.)
 
 ### Why settings are environment variables, not flags
 
@@ -390,6 +415,13 @@ is retried by the timer. `w` in the app runs `systemctl --user reset-failed`, th
   <local>`; nothing that writes to a remote is ever run. This copies one file per list
   line; a list line that is a folder is not expanded into its files, which is why
   backups are for single files only.
+- The app's files-list screen and `rclone-backup list`/`validate` judge a list by one
+  rule, pinned by `tests/fixtures/files-lines.tsv` (run under the C and C.UTF-8
+  locales): a relative path (no leading or trailing `/`, no `//`, `.` or `..` part), no
+  control character, and no two entries that would make the same
+  copy name. The screen is stricter than bash only in a few exotic cases (such as a line over 1024
+  bytes; never the other way round), and it writes the list atomically; a list that is a symlink, is not
+  UTF-8 or is over 1 MiB is not opened on the screen but in `$VISUAL` / `$EDITOR`.
 - Copies are downloaded to a `.part` file and then renamed, with umask 077 (files 600,
   `DEST` 700). One failed file does not stop the others: the run exits 1 and sends a
   desktop notification; a failed rename counts as failed and its older copies are not

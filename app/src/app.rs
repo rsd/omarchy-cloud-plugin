@@ -320,6 +320,41 @@ impl Form {
     }
 }
 
+/// The in-app files-list screen of a backup (`f`, and after the new-backup
+/// form): the list's entries, edited in memory, written on save.
+pub struct FilesEdit {
+    pub job: String,
+    /// The job's remote, as its conf names it (shown; "?" when unknown).
+    pub remote: String,
+    /// The job's STRIP_PREFIX (empty: none): copy names depend on it.
+    pub strip: String,
+    pub file: PathBuf,
+    /// Set up (and maybe enable) the job once the list is closed, as after
+    /// the editor.
+    pub setup: bool,
+    pub enable: bool,
+    pub list: conf::FilesList,
+    /// The selected entry.
+    pub sel: usize,
+    /// A path being typed: (the entry it replaces, None: a new one; text).
+    pub input: Option<(Option<usize>, String)>,
+    /// Changed since it was read.
+    pub dirty: bool,
+    /// Esc pressed with unsaved changes: the next Esc discards them.
+    pub discard: bool,
+    pub error: Option<String>,
+}
+
+impl FilesEdit {
+    /// What the typed path is refused for (None: accepted), live.
+    pub fn input_problem(&self) -> Option<String> {
+        let (at, text) = self.input.as_ref()?;
+        self.list
+            .try_entry(*at, text, &self.strip)
+            .map(|p| self.list.problem_text(&p))
+    }
+}
+
 pub enum Mode {
     Normal,
     Help,
@@ -328,6 +363,7 @@ pub enum Mode {
     Form(Form),
     View(View),
     Pick(Pick),
+    Files(FilesEdit),
 }
 
 /// Work that needs the real terminal; run by the main loop.
@@ -894,6 +930,7 @@ impl App {
                 _ => self.mode = Mode::TypeConfirm(t),
             },
             Mode::Form(f) => self.key_form(f, k),
+            Mode::Files(fe) => self.key_files(fe, k),
         }
     }
 
@@ -925,6 +962,17 @@ impl App {
                         break;
                     }
                     t.input.push(c);
+                }
+            }
+            Mode::Files(fe) => {
+                if let Some((_, s)) = &mut fe.input {
+                    for c in clean {
+                        if s.len() + c.len_utf8() > validate::MAX_TEXT {
+                            break;
+                        }
+                        s.push(c);
+                    }
+                    fe.error = None;
                 }
             }
             _ => {}
@@ -1406,12 +1454,12 @@ impl App {
                 // A job whose setup was refused (an empty files list, say)
                 // is set up and scheduled once the list is fixed.
                 let setup = j.conf.is_ok() && !self.paths.job_timer_dropin(&name).is_file();
-                self.interactive = Some(Interactive::EditFiles {
-                    job: name,
-                    file,
-                    setup,
-                    enable: setup,
-                });
+                let (remote, strip) = j
+                    .conf
+                    .as_ref()
+                    .map(|c| (c.remote.clone(), c.strip_prefix.clone().unwrap_or_default()))
+                    .unwrap_or_else(|_| ("?".into(), String::new()));
+                self.open_files(name, remote, strip, file, setup, setup);
             }
             Some('p') => {
                 let label = if enabled { "Disabling" } else { "Enabling" };
@@ -1449,6 +1497,238 @@ impl App {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// Opens the files-list screen on `file` (a missing file starts as the
+    /// template: its header, no entry). A list the screen cannot save (a
+    /// symlink, dangling or not: write_atomic refuses it) or cannot read (not
+    /// UTF-8, over 1 MiB) opens straight in $VISUAL / $EDITOR instead.
+    fn open_files(
+        &mut self,
+        job: String,
+        remote: String,
+        strip: String,
+        file: PathBuf,
+        setup: bool,
+        enable: bool,
+    ) {
+        let editor = |a: &mut Self, why: &str| {
+            a.msg(
+                Level::Info,
+                format!(
+                    "{} {why}: opened in $VISUAL / $EDITOR",
+                    a.paths.tilde(&file)
+                ),
+            );
+            a.interactive = Some(Interactive::EditFiles {
+                job: job.clone(),
+                file: file.clone(),
+                setup,
+                enable,
+            });
+        };
+        if std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink()) {
+            editor(self, "is a symlink");
+            return;
+        }
+        let text = if file.exists() {
+            match sys::read_small(&file) {
+                Some(t) => t,
+                None => {
+                    editor(self, "is not UTF-8 text of at most 1 MiB");
+                    return;
+                }
+            }
+        } else {
+            conf::files_template(&job, &remote)
+        };
+        self.mode = Mode::Files(FilesEdit {
+            job,
+            remote,
+            strip,
+            file,
+            setup,
+            enable,
+            list: conf::FilesList::parse(&text),
+            sel: 0,
+            input: None,
+            dirty: false,
+            discard: false,
+            error: None,
+        });
+    }
+
+    fn key_files(&mut self, mut fe: FilesEdit, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some((at, mut s)) = fe.input.take() {
+            fe.error = None;
+            match k.code {
+                KeyCode::Esc => {} // back to the list, nothing changed
+                KeyCode::Enter => match fe.list.try_entry(at, &s, &fe.strip) {
+                    Some(p) => {
+                        fe.error = Some(format!("Not added: {}", fe.list.problem_text(&p)));
+                        fe.input = Some((at, s));
+                    }
+                    None => match at {
+                        Some(i) => {
+                            if fe.list.entries().get(i) != Some(&s.as_str()) {
+                                fe.list.set(i, s);
+                                fe.dirty = true;
+                            }
+                        }
+                        None => {
+                            fe.sel = fe.list.add(s);
+                            fe.dirty = true;
+                        }
+                    },
+                },
+                KeyCode::Backspace => {
+                    s.pop();
+                    fe.input = Some((at, s));
+                }
+                KeyCode::Char('u') if ctrl => {
+                    s.clear();
+                    fe.input = Some((at, s));
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !k
+                            .modifiers
+                            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+                        && s.len() + c.len_utf8() <= validate::MAX_TEXT =>
+                {
+                    s.push(c);
+                    fe.input = Some((at, s));
+                }
+                _ => fe.input = Some((at, s)),
+            }
+            self.mode = Mode::Files(fe);
+            return;
+        }
+        if ctrl {
+            self.mode = Mode::Files(fe); // Ctrl+letter never triggers an action
+            return;
+        }
+        // `q` is Esc here, as in the other screens (typed, it is text above).
+        let code = match k.code {
+            KeyCode::Char('q') => KeyCode::Esc,
+            c => c,
+        };
+        if fe.discard {
+            fe.discard = false;
+            match code {
+                KeyCode::Esc => {
+                    self.close_files(fe, true);
+                    return;
+                }
+                KeyCode::Char('s') => {}
+                _ => {
+                    fe.error = None;
+                    self.mode = Mode::Files(fe);
+                    return;
+                }
+            }
+        }
+        fe.error = None;
+        let entries: Vec<String> = fe.list.entries().iter().map(|e| e.to_string()).collect();
+        let n = entries.len();
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => fe.sel = (fe.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Up | KeyCode::Char('k') => fe.sel = fe.sel.saturating_sub(1),
+            KeyCode::Home => fe.sel = 0,
+            KeyCode::End => fe.sel = n.saturating_sub(1),
+            KeyCode::Char('a') => fe.input = Some((None, String::new())),
+            KeyCode::Enter => {
+                if let Some(e) = entries.get(fe.sel) {
+                    // A hand-edited line may end in \r (CRLF): it is shown
+                    // spelled out in the list and dropped here. Any other
+                    // control character stays (spelled out, refused): dropping
+                    // it would silently name another path.
+                    let clean = e.strip_suffix('\r').unwrap_or(e).to_string();
+                    fe.input = Some((Some(fe.sel), clean));
+                }
+            }
+            KeyCode::Char('d') => {
+                if fe.sel < n {
+                    fe.list.remove(fe.sel);
+                    fe.sel = fe.sel.min(n.saturating_sub(2));
+                    fe.dirty = true;
+                }
+            }
+            KeyCode::Char('s') => {
+                self.save_files(fe);
+                return;
+            }
+            KeyCode::Char('E') => {
+                if fe.dirty {
+                    fe.error = Some(
+                        "Unsaved changes: save them (s) or discard them (Esc) before opening the editor"
+                            .into(),
+                    );
+                } else {
+                    self.interactive = Some(Interactive::EditFiles {
+                        job: fe.job,
+                        file: fe.file,
+                        setup: fe.setup,
+                        enable: fe.enable,
+                    });
+                    return;
+                }
+            }
+            KeyCode::Esc => {
+                if fe.dirty {
+                    fe.discard = true;
+                } else {
+                    self.close_files(fe, false);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Files(fe);
+    }
+
+    /// Writes the list (refused while it is empty or an entry is refused),
+    /// then checks and sets the job up as after the editor.
+    fn save_files(&mut self, mut fe: FilesEdit) {
+        if let Err(e) = fe.list.save_check(&fe.strip) {
+            fe.error = Some(e);
+            self.mode = Mode::Files(fe);
+            return;
+        }
+        if let Err(e) = sys::write_atomic(&fe.file, &fe.list.render()) {
+            fe.error = Some(format!("Not saved: {e}"));
+            self.mode = Mode::Files(fe);
+            return;
+        }
+        let FilesEdit {
+            job,
+            file,
+            setup,
+            enable,
+            ..
+        } = fe;
+        self.spawn(&format!("Checking backup {job}"), move |paths| {
+            finish_job(paths, &job, &file, setup, enable)
+        });
+    }
+
+    /// Leaves the screen without writing. A job to set up (the form just
+    /// saved its conf) goes on as after quitting the editor: checked, and
+    /// set up only if the list on disk names a file.
+    fn close_files(&mut self, fe: FilesEdit, discarded: bool) {
+        if fe.setup {
+            let FilesEdit {
+                job, file, enable, ..
+            } = fe;
+            self.spawn(&format!("Checking backup {job}"), move |paths| {
+                finish_job(paths, &job, &file, true, enable)
+            });
+        } else if discarded {
+            self.msg(Level::Info, "Changes discarded — files list unchanged");
+        } else {
+            self.msg(Level::Info, "Files list unchanged");
         }
     }
 
@@ -1899,12 +2179,8 @@ impl App {
             sys::write_atomic(&files, &conf::files_template(&job, &conf.remote))?;
         }
         let enable = is_new || self.jobs.iter().any(|j| j.name == job && j.enabled());
-        self.interactive = Some(Interactive::EditFiles {
-            job,
-            file: files,
-            setup: true,
-            enable,
-        });
+        let strip = conf.strip_prefix.clone().unwrap_or_default();
+        self.open_files(job, conf.remote, strip, files, true, enable);
         Ok(())
     }
 
@@ -2761,9 +3037,11 @@ pub fn root_setup_command(root: &Path) -> String {
 }
 
 /// Whether a mount may be enabled now: the mount root is set in cloud.env,
-/// valid, and an existing directory this user can write to (the unit only
+/// valid, resolves outside the home (`sys::resolve_root`: a root that is a
+/// symlink into the home is refused), and an existing directory this user can write to (the unit only
 /// creates `<root>/<remote>` inside it, never the root). Err: what to do, on
-/// several lines.
+/// several lines. Runs `realpath` on the calling (UI) thread: a hung path
+/// blocks the screen until its `timeout -k 1 5`, about 6 s at most.
 pub fn root_ready(paths: &Paths) -> Result<(), String> {
     let file = paths.tilde(&paths.cloud_env());
     let setup = "Run install.sh from the plugin folder (the bar panel's Set up… button runs it) to choose it, or install.sh --mount-root PATH.";
@@ -2778,16 +3056,36 @@ pub fn root_ready(paths: &Paths) -> Result<(), String> {
                  (it must be an absolute UTF-8 path outside your home, without spaces, quotes, $, % or \\).\n{setup}"
             ))
         }
-        RootSetting::Valid(r) => match sys::dir_problem(r) {
-            None => Ok(()),
-            Some(why) => Err(format!(
-                "The mount root is not set up: {} {why}.\n\
+        RootSetting::Valid(r) => match sys::resolve_root(r, &paths.home) {
+            sys::RootResolution::InHome(to) => Err(format!(
+                "The mount root is not set up: OMARCHY_CLOUD_ROOT={} resolves to {}, inside your home:\n\
+                 programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive.\n\
+                 Choose a real folder outside your home: install.sh --mount-root PATH",
+                r.display(),
+                to.display()
+            )),
+            sys::RootResolution::Unresolved => Err(format!(
+                "The mount root is not set up: OMARCHY_CLOUD_ROOT={} could not be resolved (realpath failed or timed out),\n\
+                 so it cannot be checked against your home. Check the path, or choose another: install.sh --mount-root PATH",
+                r.display()
+            )),
+            sys::RootResolution::Outside => root_dir_ready(r),
+        },
+    }
+}
+
+/// The directory half of `root_ready` for a valid root that resolves
+/// outside the home.
+fn root_dir_ready(r: &Path) -> Result<(), String> {
+    match sys::dir_problem(r) {
+        None => Ok(()),
+        Some(why) => Err(format!(
+            "The mount root is not set up: {} {why}.\n\
                  Create it once, in a terminal (nothing here runs sudo for you):\n  {}\n\
                  then try again.",
-                r.display(),
-                root_setup_command(r)
-            )),
-        },
+            r.display(),
+            root_setup_command(r)
+        )),
     }
 }
 
@@ -2806,8 +3104,9 @@ pub fn pair_units(pair: &str, watch_set_up: bool) -> Vec<String> {
 
 /// A backup's files list must name at least one file: an empty list is an
 /// invalid conf for the helper (every run would exit 64). Returns the count.
-pub fn files_list_verdict(text: &str) -> Result<usize, String> {
-    match conf::check_files_list(text)? {
+/// `strip`: the job's STRIP_PREFIX (copy names, so duplicates, depend on it).
+pub fn files_list_verdict(text: &str, strip: &str) -> Result<usize, String> {
+    match conf::check_files_list(text, strip)? {
         0 => Err("the files list names no file; add at least one path".into()),
         n => Ok(n),
     }
@@ -3256,7 +3555,11 @@ fn remove_job(paths: &Paths, job: &str) -> Outcome {
 
 fn finish_job(paths: &Paths, job: &str, file: &Path, setup: bool, enable: bool) -> Outcome {
     let text = sys::read_small(file).unwrap_or_default();
-    if let Err(e) = files_list_verdict(&text) {
+    let strip = sys::read_small(&paths.job_conf(job))
+        .and_then(|t| JobConf::parse(&t, &paths.home).ok())
+        .and_then(|c| c.strip_prefix)
+        .unwrap_or_default();
+    if let Err(e) = files_list_verdict(&text, &strip) {
         let what = if setup { " — not set up" } else { "" };
         return Outcome::Msg(
             Level::Error,
@@ -4135,10 +4438,13 @@ mod tests {
 
     #[test]
     fn backup_needs_a_file() {
-        assert!(files_list_verdict(&conf::files_template("j", "r:")).is_err());
-        assert!(files_list_verdict("# only a comment\n\n").is_err());
-        assert_eq!(files_list_verdict("a.kdbx\n").unwrap(), 1);
-        assert!(files_list_verdict("/abs\n").is_err());
+        assert!(files_list_verdict(&conf::files_template("j", "r:"), "").is_err());
+        assert!(files_list_verdict("# only a comment\n\n", "").is_err());
+        assert_eq!(files_list_verdict("a.kdbx\n", "").unwrap(), 1);
+        assert!(files_list_verdict("/abs\n", "").is_err());
+        // Duplicate copy names depend on the job's STRIP_PREFIX.
+        assert_eq!(files_list_verdict("acme/a.kdbx\na.kdbx\n", "").unwrap(), 2);
+        assert!(files_list_verdict("acme/a.kdbx\na.kdbx\n", "acme/").is_err());
     }
 
     #[test]
@@ -4290,6 +4596,33 @@ mod tests {
         assert_eq!(a.paths.mount_point("od"), root.join("od"));
         std::fs::write(&env, format!("OMARCHY_CLOUD_ROOT={}/x\n", home.display())).unwrap();
         assert!(!a.root_ok_or_explain(), "inside home");
+        // A valid root that is a symlink into the home: refused, and why.
+        std::fs::create_dir_all(home.join("CloudRoot")).unwrap();
+        let link = d.join("linked");
+        std::os::unix::fs::symlink(home.join("CloudRoot"), &link).unwrap();
+        std::fs::write(&env, format!("OMARCHY_CLOUD_ROOT={}\n", link.display())).unwrap();
+        a.mode = Mode::Normal;
+        assert!(!a.root_ok_or_explain(), "symlinked into home");
+        let want = format!(
+            "The mount root is not set up: OMARCHY_CLOUD_ROOT={} resolves to {}, inside your home:",
+            link.display(),
+            home.join("CloudRoot").display()
+        );
+        match &a.mode {
+            Mode::View(v) => {
+                assert!(v.lines.contains(&want), "{:?}", v.lines);
+                assert!(
+                    v.lines
+                        .iter()
+                        .any(|l| l.contains("install.sh --mount-root PATH")),
+                    "{:?}",
+                    v.lines
+                );
+            }
+            _ => panic!("no view"),
+        }
+        // The setting itself is valid: mount points and links still use it.
+        assert_eq!(a.paths.mount_point("od"), link.join("od"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -4559,5 +4892,458 @@ type = s3\n";
         assert!(build_job(h, &[], "j", "r", "", "~", "", "", "", "").is_err());
         assert!(build_job(h, &[], "j", "r", "", "/b", "", "x;y", "", "").is_err());
         assert!(build_job(h, &[], "..", "r", "", "/b", "", "", "", "").is_err());
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_text(a: &mut App, t: &str) {
+        for c in t.chars() {
+            a.on_key(key(c, KeyModifiers::NONE));
+        }
+    }
+
+    /// Waits for the running task's outcome and applies it.
+    fn settle(a: &mut App) {
+        let o =
+            a.rx.recv_timeout(Duration::from_secs(10))
+                .expect("an outcome");
+        a.on_outcome(o);
+        assert!(a.running.is_none());
+    }
+
+    fn files(a: &App) -> &FilesEdit {
+        match &a.mode {
+            Mode::Files(fe) => fe,
+            _ => panic!("not on the files-list screen"),
+        }
+    }
+
+    #[test]
+    fn new_backup_opens_the_files_list() {
+        let d = scratch("files-new");
+        let mut a = App::new(Paths::new(d.clone()));
+        assert_eq!(a.submit_job(None, &job_form(None, "~/Backups/x")), Ok(()));
+        assert!(a.interactive.is_none(), "no editor for a new backup");
+        let file = a.paths.job_files("new-job");
+        let template = conf::files_template("new-job", "work_drive:");
+        {
+            let fe = files(&a);
+            assert!(fe.list.entries().is_empty() && fe.setup && fe.enable);
+            assert_eq!(fe.list.render(), template);
+        }
+        // An empty list is not saved.
+        type_text(&mut a, "s");
+        assert!(
+            files(&a)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("names no file")
+        );
+        // Typed as the helper would read it: a comment is refused.
+        type_text(&mut a, "a# x");
+        assert_eq!(files(&a).input, Some((None, "# x".into())));
+        assert!(files(&a).input_problem().unwrap().contains("comment"));
+        press(&mut a, KeyCode::Enter);
+        assert!(files(&a).error.as_deref().unwrap().starts_with("Not added"));
+        assert!(files(&a).list.entries().is_empty());
+        a.on_key(key('u', KeyModifiers::CONTROL));
+        type_text(&mut a, "acme/a.kdbx");
+        assert_eq!(files(&a).input_problem(), None);
+        press(&mut a, KeyCode::Enter);
+        // Paste goes into the path, without its line end.
+        type_text(&mut a, "a");
+        a.on_paste("a.kdbx\r\n");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(files(&a).list.entries(), ["acme/a.kdbx", "a.kdbx"]);
+        assert_eq!(files(&a).sel, 1);
+        // A duplicate copy name is refused as typed.
+        type_text(&mut a, "aacme/a.kdbx");
+        assert!(
+            files(&a)
+                .input_problem()
+                .unwrap()
+                .contains("same copy name as acme/a.kdbx")
+        );
+        press(&mut a, KeyCode::Esc);
+        assert!(files(&a).input.is_none());
+        // Edit in place, remove, move.
+        type_text(&mut a, "k");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(files(&a).input, Some((Some(0), "acme/a.kdbx".into())));
+        a.on_key(key('u', KeyModifiers::CONTROL));
+        type_text(&mut a, "b.kdbx");
+        press(&mut a, KeyCode::Enter);
+        type_text(&mut a, "j");
+        a.on_key(key('d', KeyModifiers::CONTROL));
+        assert_eq!(files(&a).list.entries().len(), 2, "Ctrl-D removes nothing");
+        type_text(&mut a, "d");
+        assert_eq!(files(&a).list.entries(), ["b.kdbx"]);
+        assert_eq!(files(&a).sel, 0);
+        // The file on disk is the template until saved.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), template);
+        type_text(&mut a, "s");
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{template}b.kdbx\n")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            a.running.as_ref().map(|(l, _)| l.as_str()),
+            Some("Checking backup new-job")
+        );
+        settle(&mut a);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_keeps_comments_and_flags_hand_edits() {
+        let d = scratch("files-hand");
+        let mut a = App::new(Paths::new(d.clone()));
+        let file = d.join("list.files");
+        std::fs::write(&file, "# h\r\nbad/\n# keep\n\nok.kdbx\r\n").unwrap();
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            false,
+            false,
+        );
+        let v = files(&a).list.verdicts("");
+        assert!(v.iter().all(Option::is_some), "{v:?}");
+        type_text(&mut a, "s");
+        let e = files(&a).error.clone().unwrap();
+        assert!(e.contains("entry 1 (bad/)"), "{e}");
+        // Fix both: a hand-edited \r is dropped when the entry is edited.
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(files(&a).input, Some((Some(0), "bad/".into())));
+        press(&mut a, KeyCode::Backspace);
+        press(&mut a, KeyCode::Enter);
+        type_text(&mut a, "j");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(files(&a).input, Some((Some(1), "ok.kdbx".into())));
+        press(&mut a, KeyCode::Enter);
+        type_text(&mut a, "s");
+        assert!(matches!(a.mode, Mode::Normal), "saved");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "# h\nbad\n# keep\n\nok.kdbx\n"
+        );
+        settle(&mut a);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_esc_asks_before_discarding() {
+        let d = scratch("files-esc");
+        let file = d.join("j.files");
+        let mut a = App::new(Paths::new(d.clone()));
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            false,
+            false,
+        );
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.status.as_ref().unwrap().1, "Files list unchanged");
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            false,
+            false,
+        );
+        type_text(&mut a, "ax.kdbx");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        assert!(files(&a).discard, "unsaved changes: asks first");
+        // Any other key goes back, the change kept.
+        type_text(&mut a, "j");
+        assert!(!files(&a).discard);
+        assert_eq!(files(&a).list.entries(), ["x.kdbx"]);
+        // E refuses while there are unsaved changes.
+        type_text(&mut a, "E");
+        assert!(a.interactive.is_none());
+        assert!(files(&a).error.as_deref().unwrap().contains("Unsaved"));
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(!file.exists(), "nothing written");
+        assert!(
+            a.status
+                .as_ref()
+                .unwrap()
+                .1
+                .starts_with("Changes discarded")
+        );
+        // `s` from the question saves.
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            false,
+            false,
+        );
+        type_text(&mut a, "ax.kdbx");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        type_text(&mut a, "s");
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .ends_with("x.kdbx\n")
+        );
+        settle(&mut a);
+        // A job to set up goes on as after the editor: checked on close.
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            true,
+            true,
+        );
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(
+            a.running.as_ref().map(|(l, _)| l.as_str()),
+            Some("Checking backup j")
+        );
+        settle(&mut a);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_e_opens_the_editor() {
+        let mut a = App::new(paths());
+        let file = PathBuf::from("/home/u/.config/rclone-backup/j.files");
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            true,
+            false,
+        );
+        type_text(&mut a, "E");
+        assert!(matches!(a.mode, Mode::Normal));
+        match &a.interactive {
+            Some(Interactive::EditFiles {
+                job,
+                file: f,
+                setup,
+                enable,
+            }) => assert!(job == "j" && *f == file && *setup && !*enable),
+            _ => panic!("E must run the editor"),
+        }
+    }
+
+    /// Opens `file` for job "j" and returns the editor the screen gave way
+    /// to (None: the list screen opened).
+    fn open_files_editor(a: &mut App, file: &Path) -> Option<PathBuf> {
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.to_path_buf(),
+            true,
+            false,
+        );
+        match a.interactive.take() {
+            Some(Interactive::EditFiles {
+                job,
+                file,
+                setup,
+                enable,
+            }) => {
+                assert!(job == "j" && setup && !enable);
+                assert!(matches!(a.mode, Mode::Normal));
+                Some(file)
+            }
+            None => None,
+            _ => panic!("only the editor"),
+        }
+    }
+
+    #[test]
+    fn files_list_a_symlink_opens_the_editor() {
+        // write_atomic refuses a symlink: the screen could never save it, so
+        // `f` says so and opens the editor (which writes through the link).
+        let d = scratch("files-link");
+        let target = d.join("real.files");
+        std::fs::write(&target, "a.kdbx\n").unwrap();
+        let link = d.join("j.files");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let dangling = d.join("dangling.files");
+        std::os::unix::fs::symlink(d.join("nowhere"), &dangling).unwrap();
+        let mut a = App::new(Paths::new(d.clone()));
+        for f in [&link, &dangling] {
+            assert_eq!(open_files_editor(&mut a, f).as_ref(), Some(f));
+            let m = &a.status.as_ref().unwrap().1;
+            assert!(
+                m.ends_with("is a symlink: opened in $VISUAL / $EDITOR"),
+                "{m}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a.kdbx\n");
+        assert!(!d.join("nowhere").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_unreadable_opens_the_editor() {
+        let d = scratch("files-unreadable");
+        let mut a = App::new(Paths::new(d.clone()));
+        let latin1 = d.join("latin1.files");
+        std::fs::write(&latin1, b"caf\xe9.kdbx\n").unwrap();
+        let big = d.join("big.files");
+        std::fs::write(&big, "a".repeat(1024 * 1024 + 1)).unwrap();
+        for f in [&latin1, &big] {
+            assert_eq!(open_files_editor(&mut a, f).as_ref(), Some(f));
+            let m = &a.status.as_ref().unwrap().1;
+            assert!(
+                m.contains("is not UTF-8 text of at most 1 MiB: opened in $VISUAL"),
+                "{m}"
+            );
+        }
+        // A readable list opens the screen.
+        let ok = d.join("ok.files");
+        std::fs::write(&ok, "a.kdbx\n").unwrap();
+        assert_eq!(open_files_editor(&mut a, &ok), None);
+        assert_eq!(files(&a).list.entries(), ["a.kdbx"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_unchanged_edit_is_not_a_change() {
+        let d = scratch("files-same");
+        let file = d.join("j.files");
+        std::fs::write(&file, "a.kdbx\n").unwrap();
+        let mut a = App::new(Paths::new(d.clone()));
+        assert_eq!(open_files_editor(&mut a, &file), None);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(!files(&a).dirty, "Enter on an unchanged entry");
+        // Retyped to the same text: still no change.
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Backspace);
+        type_text(&mut a, "x");
+        press(&mut a, KeyCode::Enter);
+        assert!(!files(&a).dirty);
+        // A real edit is one, so E refuses.
+        press(&mut a, KeyCode::Enter);
+        type_text(&mut a, "x");
+        press(&mut a, KeyCode::Enter);
+        assert!(files(&a).dirty);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_edit_keeps_inner_control_characters() {
+        // Only a trailing \r (CRLF) is dropped: a \t inside stays, shown and
+        // refused, never silently turned into another path.
+        let d = scratch("files-ctl");
+        let file = d.join("j.files");
+        std::fs::write(&file, "a\tb.kdbx\r\n").unwrap();
+        let mut a = App::new(Paths::new(d.clone()));
+        assert_eq!(open_files_editor(&mut a, &file), None);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(files(&a).input, Some((Some(0), "a\tb.kdbx".into())));
+        press(&mut a, KeyCode::Enter);
+        let e = files(&a).error.clone().unwrap();
+        assert!(e.starts_with("Not added: control character"), "{e}");
+        assert!(files(&a).input.is_some() && !files(&a).dirty);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn files_list_q_is_esc_unless_typed() {
+        let d = scratch("files-q");
+        let file = d.join("j.files");
+        let mut a = App::new(Paths::new(d.clone()));
+        a.open_files(
+            "j".into(),
+            "r:".into(),
+            String::new(),
+            file.clone(),
+            false,
+            false,
+        );
+        // Typed, q is text.
+        type_text(&mut a, "aq.kdbx");
+        assert_eq!(files(&a).input, Some((None, "q.kdbx".into())));
+        press(&mut a, KeyCode::Enter);
+        // On the list it asks, then discards, as Esc does.
+        type_text(&mut a, "q");
+        assert!(files(&a).discard);
+        type_text(&mut a, "q");
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(!file.exists());
+        assert!(
+            a.status
+                .as_ref()
+                .unwrap()
+                .1
+                .starts_with("Changes discarded")
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn f_key_uses_the_jobs_strip_prefix() {
+        let d = scratch("files-f");
+        let mut a = App::new(Paths::new(d.clone()));
+        let mut j = job_entry("j", "~/Backups/j");
+        if let Ok(c) = &mut j.conf {
+            c.strip_prefix = Some("acme/".into());
+        }
+        a.jobs.push(j);
+        a.tab = Tab::Backups;
+        type_text(&mut a, "f");
+        {
+            let fe = files(&a);
+            assert_eq!(fe.strip, "acme/");
+            assert_eq!(fe.file, a.paths.job_files("j"));
+            assert!(fe.setup && fe.enable, "not set up yet");
+            assert_eq!(fe.list.render(), conf::files_template("j", "work_drive:"));
+        }
+        type_text(&mut a, "aacme/A/B.kdbx");
+        press(&mut a, KeyCode::Enter);
+        type_text(&mut a, "aA/B.kdbx");
+        assert!(
+            files(&a)
+                .input_problem()
+                .unwrap()
+                .contains("same copy name")
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn finish_job_reads_the_strip_prefix() {
+        let d = scratch("finish-strip");
+        let p = Paths::new(d.clone());
+        std::fs::create_dir_all(p.backup_dir()).unwrap();
+        std::fs::write(p.job_conf("j"), "REMOTE=r:\nDEST=~/b\nSTRIP_PREFIX=acme/\n").unwrap();
+        let file = p.job_files("j");
+        std::fs::write(&file, "acme/a.kdbx\na.kdbx\n").unwrap();
+        match finish_job(&p, "j", &file, true, true) {
+            Outcome::Msg(Level::Error, m) => {
+                assert!(m.contains("line 2: same copy name as line 1"), "{m}")
+            }
+            _ => panic!("a duplicate under STRIP_PREFIX must be refused first"),
+        }
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

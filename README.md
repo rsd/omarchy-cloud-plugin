@@ -4,7 +4,7 @@ Omarchy Cloud shows your cloud storage (Google Drive, OneDrive, Dropbox and many
 more) as ordinary folders on your [Omarchy](https://omarchy.org) desktop, in
 `~/Cloud`. A small cloud icon on the bar shows what is connected. You can also
 keep a cloud folder **synced offline** on your computer, and keep dated
-**backup** copies of important files.
+**backup** copies of important files (single files, not folders).
 
 ![The Omarchy Cloud panel, listing remotes, offline folders and backups](preview.png)
 
@@ -19,7 +19,7 @@ yourself, step by step, in a small terminal app.
 | **mount** | Making a remote show up as a folder you can open. Files are fetched when you open them. |
 | **mount folder** | The one folder on your computer where all mounts appear, `/mnt/cloud` by default. Each remote shows up inside it, and `~/Cloud/<remote>` is a shortcut (link) to it. The installer and the panel call it the "mount root". |
 | **offline folder** | A folder on your computer kept in two-way sync with a folder on a remote, so the files are there without a connection. |
-| **backup** | A schedule that downloads chosen files from a remote and keeps several dated copies on your computer. |
+| **backup** | Dated copies of important files (single files, not folders): a schedule downloads the files you chose from a remote and keeps several dated copies of each on your computer. |
 | **Omarchy Cloud app** | The terminal program where you set all of the above up. |
 | **panel** | The Omarchy Cloud panel: the popup that opens when you click the cloud icon on the bar. |
 | **installed parts** | The small helper programs and settings files the plugin needs. The installer copies them into your home folder; the panel calls them "installed parts". |
@@ -96,8 +96,8 @@ else. **Step-by-step instructions, including how to open a second terminal and
 what the password prompt looks like, are in
 [docs/mount-folder.md](docs/mount-folder.md#create-the-mount-folder-step-by-step).**
 
-Why the folder is outside your home folder: so search and backup tools do not
-try to read your whole cloud drive. The full reason is in
+Why the folder is outside your home folder (and cannot be a link into it): so search
+and backup tools do not try to read your whole cloud drive. The full reason is in
 [docs/mount-folder.md](docs/mount-folder.md#why-it-is-outside-your-home-folder).
 
 ## First steps
@@ -126,7 +126,7 @@ The switch next to a remote in the panel mounts and unmounts it. Remotes set to
 Next, when you want them:
 
 - Keep a folder available offline: [docs/offline-folders.md](docs/offline-folders.md)
-- Keep dated backups of chosen files: [docs/backups.md](docs/backups.md)
+- Keep dated copies of important files (single files, not folders): [docs/backups.md](docs/backups.md)
 - Read the log of something that failed, or free the disk space a remote uses for
   its cache: the **Maintenance** section (key `4`), described in
   [docs/tui.md](docs/tui.md#maintenance).
@@ -148,7 +148,7 @@ Next, when you want them:
 |---|---|
 | [docs/remotes.md](docs/remotes.md) | Adding Google Drive, mounting, unmounting, removing |
 | [docs/offline-folders.md](docs/offline-folders.md) | Two-way synced folders and conflict copies |
-| [docs/backups.md](docs/backups.md) | Dated backup copies |
+| [docs/backups.md](docs/backups.md) | Backups: dated copies of important files (single files) |
 | [docs/panel.md](docs/panel.md) | The bar icon and its panel |
 | [docs/tui.md](docs/tui.md) | The Omarchy Cloud app: every section and key |
 

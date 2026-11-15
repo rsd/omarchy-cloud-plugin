@@ -9,13 +9,15 @@ use ratatui::widgets::{
     Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap,
 };
 
-use crate::app::{App, Input, Level, MAINT_ITEMS, Mode, Tab};
-use crate::sys;
+use crate::app::{App, FilesEdit, Input, Level, MAINT_ITEMS, Mode, Tab};
+use crate::{conf, sys};
 
 const ACCENT: Color = Color::Blue;
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// A secret shows as this many dots once non-empty, whatever its length.
 const SECRET_MASK: usize = 8;
+/// What a backup is, in the words the panel uses (Model.js BACKUPS_BLURB).
+pub const BACKUPS_BLURB: &str = "Dated copies of important files (single files, not folders)";
 
 /// `s` in a column of `w` cells: cut with "…" so at least one cell of gap
 /// is left, then padded to `w`. Pure.
@@ -307,6 +309,149 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .highlight_symbol("› ");
             f.render_stateful_widget(list, area, &mut st);
         }
+        Mode::Files(fe) => draw_files(f, fe),
+    }
+}
+
+/// The files-list screen's key line: typing a path, asking before a
+/// discard, or browsing the list.
+pub fn files_footer(typing: bool, discard: bool) -> &'static str {
+    if typing {
+        " type the path · Enter keep · Esc back · Ctrl-U clear · paste works"
+    } else if discard {
+        " Unsaved changes: Esc/q again discards them · s saves · any other key goes back"
+    } else {
+        " a add · Enter edit · d remove · ↑/↓ move · s save · E $EDITOR · Esc/q close"
+    }
+}
+
+/// The entries shown when `rows` fit: [start, end) around `sel`. Pure.
+pub fn window(len: usize, sel: usize, rows: usize) -> (usize, usize) {
+    let rows = rows.max(1);
+    if len <= rows {
+        return (0, len);
+    }
+    let start = sel.saturating_sub(rows - 1).min(len - rows);
+    (start, start + rows)
+}
+
+/// The copy a typed path makes, as rclone-backup names it
+/// (`<job>@<stem>.<date><ext>`); None when there is none. Pure.
+pub fn copy_preview(job: &str, path: &str, strip: &str) -> Option<String> {
+    let (stem, ext) = conf::copy_name(path, strip).ok()?;
+    Some(format!("{job}@{stem}.<date>{ext}"))
+}
+
+fn draw_files(f: &mut Frame, fe: &FilesEdit) {
+    let red = Style::default().fg(Color::Red);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                " {BACKUPS_BLURB}: one path per entry, relative to {}",
+                fe.remote
+            ),
+            dim(),
+        )),
+        Line::from(""),
+    ];
+    let entries = fe.list.entries();
+    let verdicts = fe.list.verdicts(&fe.strip);
+    let input_row = |lines: &mut Vec<Line>, text: &str| {
+        lines.push(Line::from(vec![
+            Span::styled("  Path: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{}▏", conf::shown(text)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        match fe.input_problem() {
+            Some(p) => lines.push(Line::from(Span::styled(format!("        ✗ {p}"), red))),
+            None => lines.push(Line::from(Span::styled(
+                format!(
+                    "        ✓ copied as {}",
+                    copy_preview(&fe.job, text, &fe.strip).unwrap_or_default()
+                ),
+                Style::default().fg(Color::Green),
+            ))),
+        }
+    };
+    let rows = (f.area().height as usize).saturating_sub(14).max(3);
+    let (start, end) = window(entries.len(), fe.sel, rows);
+    if entries.is_empty() && fe.input.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  (no file yet — press a to add one)",
+            dim(),
+        )));
+    }
+    if start > 0 {
+        lines.push(Line::from(Span::styled(format!("  ↑ {start} more"), dim())));
+    }
+    for (i, e) in entries.iter().enumerate().take(end).skip(start) {
+        if let Some((Some(j), text)) = &fe.input
+            && *j == i
+        {
+            input_row(&mut lines, text);
+            continue;
+        }
+        let selected = i == fe.sel && fe.input.is_none();
+        let mut row = vec![
+            Span::raw(if selected { "› " } else { "  " }),
+            Span::styled(
+                conf::shown(e),
+                if selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                },
+            ),
+        ];
+        if let Some(Some(p)) = verdicts.get(i) {
+            row.push(Span::styled(
+                format!("  ✗ {}", fe.list.problem_text(p)),
+                red,
+            ));
+        }
+        lines.push(Line::from(row));
+    }
+    if end < entries.len() {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more", entries.len() - end),
+            dim(),
+        )));
+    }
+    if let Some((None, text)) = &fe.input {
+        input_row(&mut lines, text);
+    }
+    lines.push(Line::from(""));
+    if let Some(e) = &fe.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {e}"),
+            level_style(Level::Error),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        files_footer(fe.input.is_some(), fe.discard),
+        dim(),
+    )));
+    popup(f, &format!("Files list — backup {}", fe.job), lines, 84);
+}
+
+/// The list's title: the section, and for Backups what a backup is.
+pub fn list_title(tab: Tab) -> String {
+    match tab {
+        Tab::Backups => format!("Backups — {}", BACKUPS_BLURB.to_lowercase()),
+        t => t.title().to_string(),
+    }
+}
+
+/// What an empty list says.
+pub fn empty_text(tab: Tab) -> String {
+    match tab {
+        Tab::Backups => format!(
+            "No backups yet — {}; press a to add one",
+            BACKUPS_BLURB.to_lowercase()
+        ),
+        _ => "Nothing here yet — press a to add".into(),
     }
 }
 
@@ -340,7 +485,7 @@ pub fn hint_for(mode_normal: bool, help: bool, tab: Tab, watch_stopped: bool) ->
             "a add · Enter sync/resume · p pause · n dry-run · c conflicts · d remove · ? help · q quit"
         }
         Tab::Backups => {
-            "a add · Enter run · e edit · f files · p schedule on/off · d remove · ? help · q quit"
+            "a add · Enter run · e edit · f files list · p schedule on/off · d remove · ? help · q quit"
         }
         Tab::Maint => "Enter choose · ↑/↓ move · Tab next section · ? help · q quit",
     }
@@ -476,8 +621,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Some(app.sel[app.tab.index()])
     });
+    let title = list_title(app.tab);
     let list = List::new(items)
-        .block(block(app.tab.title()))
+        .block(block(&title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("› ");
     f.render_stateful_widget(list, area, &mut st);
@@ -489,7 +635,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             height: 1,
         };
         f.render_widget(
-            Paragraph::new(Span::styled("Nothing here yet — press a to add", dim())),
+            Paragraph::new(Span::styled(empty_text(app.tab), dim())),
             inner,
         );
     }
@@ -698,7 +844,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             v
         }),
         Tab::Backups => app.jobs.get(i).map_or_else(Vec::new, |j| {
-            let mut v = Vec::new();
+            let mut v = vec![Line::from(Span::styled(BACKUPS_BLURB, dim()))];
             match &j.conf {
                 Ok(c) => {
                     v.push(kv("Remote", c.remote.clone()));
@@ -798,12 +944,29 @@ fn draw_help(f: &mut Frame) {
             "restart a stopped folder watch / timer (reset-failed + start)",
         ),
         h("d", "remove (local and remote files are never deleted)"),
-        s("Backups"),
-        h("a / e / f", "add · edit · edit the files list"),
+        s(&format!("Backups — {}", BACKUPS_BLURB.to_lowercase())),
+        h("a / e", "add · edit the settings"),
+        h("f", "the files list: the single files to copy"),
         h(
             "Enter / p / d",
             "run now · schedule on/off · remove (copies kept)",
         ),
+        s("Files list (f)"),
+        h("↑↓ / j k", "move · Home / End: first / last"),
+        h(
+            "a / Enter / d",
+            "add a path · edit the selected one · remove it",
+        ),
+        h(
+            "while typing",
+            "Enter keep · Esc back · Backspace · Ctrl-U clear · paste works",
+        ),
+        h(
+            "s",
+            "save, then check (and set up); refused while one is ✗ or none",
+        ),
+        h("E", "edit the file in $VISUAL / $EDITOR instead"),
+        h("Esc / q", "close (asks again before discarding changes)"),
         s("Maintenance"),
         h(
             "Enter",
@@ -1002,5 +1165,49 @@ mod tests {
         // wide characters count as two cells
         assert_eq!(cells(&fit("日本語日本語日本語", 10)), 10);
         assert_eq!(fit("", 3), "   ");
+    }
+
+    #[test]
+    fn files_screen_text() {
+        for (typing, discard) in [(false, false), (true, false), (false, true)] {
+            let h = files_footer(typing, discard);
+            assert!(cells(h) <= 82, "{} cells: {h}", cells(h));
+        }
+        assert!(files_footer(false, false).contains("s save"));
+        assert!(files_footer(false, false).contains("E $EDITOR"));
+        assert!(files_footer(false, false).ends_with("Esc/q close"));
+        assert!(files_footer(false, true).contains("Esc/q again discards"));
+        assert!(files_footer(false, true).starts_with(" Unsaved changes"));
+        assert!(files_footer(true, true).contains("Enter keep"));
+        // The window keeps the selection in view.
+        assert_eq!(window(3, 2, 10), (0, 3));
+        assert_eq!(window(20, 0, 5), (0, 5));
+        assert_eq!(window(20, 7, 5), (3, 8));
+        assert_eq!(window(20, 19, 5), (15, 20));
+        assert_eq!(window(0, 0, 5), (0, 0));
+        assert_eq!(
+            copy_preview("admin", "acme/A/B/C.kdbx", "acme/").as_deref(),
+            Some("admin@A__B__C.<date>.kdbx")
+        );
+        assert_eq!(copy_preview("j", "acme/x", "acme"), None);
+    }
+
+    #[test]
+    fn backups_say_what_they_copy() {
+        assert_eq!(
+            BACKUPS_BLURB,
+            "Dated copies of important files (single files, not folders)"
+        );
+        assert_eq!(
+            list_title(Tab::Backups),
+            "Backups — dated copies of important files (single files, not folders)"
+        );
+        assert_eq!(list_title(Tab::Remotes), "Remotes");
+        assert!(empty_text(Tab::Backups).contains("single files, not folders"));
+        assert_eq!(
+            empty_text(Tab::Offline),
+            "Nothing here yet — press a to add"
+        );
+        assert_eq!(Tab::Backups.title(), "Backups");
     }
 }

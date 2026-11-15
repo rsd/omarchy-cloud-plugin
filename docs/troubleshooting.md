@@ -130,15 +130,28 @@ What to do:
    - **The root is not valid:** the folder path breaks the rules (inside your home, a
      space or special character, not plain text, trailing `/`, over 255 bytes). See
      [mount-folder.md](mount-folder.md#choosing-another-folder).
+   - **"the mount root … resolves to …, at or inside your home":** the mount folder is
+     a symbolic link (or sits under one) that leads into your home folder. Programs
+     that look through your home (file search, indexers, backup tools) would follow
+     the link into the cloud drive and download everything, so it is refused. Point
+     the folder at a real folder outside your home (step 2 below).
+   - **"the mount point … is a symbolic link":** `<mount folder>/<remote>` is a link, so
+     rclone would mount wherever it points. Remove the link (`rm
+     /mnt/cloud/gdrive`; the plugin then creates a real folder there), or choose
+     another mount folder.
    - **"the unit was given the mount root …, but …":** the file
      `~/.config/omarchy-cloud/cloud.env` is written in a way the system reads
      differently from the rest of the plugin (quotes, spaces around the line, an
      indented line), or another file sets the same setting. Make the file hold
      exactly one plain line, `OMARCHY_CLOUD_ROOT=/mnt/cloud`, at the start of the
-     line, and remove any `OMARCHY_CLOUD_ROOT=` line from
-     `~/.config/rclone-mount/<remote>.env`.
+     line, and remove any other `OMARCHY_CLOUD_ROOT=` line: in
+     `~/.config/rclone-mount/<remote>.env`, or an
+     `Environment=OMARCHY_CLOUD_ROOT=` line in a systemd drop-in (a `.conf` file in
+     `~/.config/systemd/user/rclone-mount@.service.d/` or
+     `rclone-mount@<remote>.service.d/`; the message names both).
    - **"cannot create the mount point …":** something is already at
-     `<mount folder>/<remote>` (a file or a broken link). Remove or rename it.
+     `<mount folder>/<remote>` (a file). Remove or rename it. (If the mount is only
+     retried with the words "cannot mount yet, will retry", see the next section.)
    - **`cloud.env` is not a readable regular file:** it is a folder, link or has wrong
      permissions. Replace it by running the installer's `--mount-root` (below).
 2. Easiest fix: run, from the plugin folder, with the folder you want:
@@ -157,6 +170,29 @@ A different, milder message, `rclone-mount: gdrive: not started: the mount root 
 is not an existing directory you can write to and search; …`, just means the folder
 does not exist yet. The start was skipped (not failed) and nothing retries. Create it:
 [the step-by-step](mount-folder.md#create-the-mount-folder-step-by-step).
+
+## A mount stopped working ("Transport endpoint is not connected")
+
+If rclone is killed hard (it ran out of memory, or was stopped with `kill -9`), it
+cannot unmount the drive. The folder at `<mount folder>/<remote>` is then a dead
+mount: opening it says "Transport endpoint is not connected". You do not need to do
+anything. When the mount service starts again (about 15 seconds later), it clears
+the leftover with `fusermount3 -uz` and mounts the drive afresh; your files in the
+cloud are not affected.
+
+If it does not come back, read the log (top of this page). A line like this means
+the leftover could not be cleared yet, and the service keeps retrying:
+
+```
+rclone-mount: gdrive: cannot mount yet, will retry: the mount point /mnt/cloud/gdrive is a stale FUSE mount (Transport endpoint is not connected …), and fusermount3 -uz could not clear it (…). Fix: run fusermount3 -uz /mnt/cloud/gdrive.
+```
+
+Run that command yourself in a terminal, with your own mount folder and remote
+name. If it says `fusermount3` is not found, install `fuse3`
+([README](../README.md#what-you-need)). The next retry then succeeds. Only a
+refused setting (the section above) stops the service for good; temporary problems
+like this one are always retried. A line saying the mount point "did not answer within
+5 s (a hung mount)" is handled the same way: `fusermount3 -uz <mount point>`.
 
 ## The drive is mounted but empty, or slow
 
@@ -206,6 +242,10 @@ a terminal and fix what it says; the app cannot add remotes until that works.
 - If the message says the setting "is not a valid root", the saved path breaks the
   rules (no spaces or special characters, outside your home, no trailing `/`, plain
   UTF-8 text).
+- If it says the folder "resolves inside your home (through a symbolic link)", the
+  folder is a link into your home: choose a real folder outside your home, see
+  [mount-folder.md](mount-folder.md#a-link-does-not-get-around-this). If it says it
+  "could not be resolved", check that the path exists and is spelled right.
   Save a valid one: `./install.sh --mount-root /mnt/cloud` (run from the plugin
   folder).
 - The installer will not rewrite an existing setting by itself; only `--mount-root`
@@ -246,10 +286,13 @@ original name after merging.
 - A failed file does not stop the others; the run counts as failed and you get a
   notification.
 - Press Enter on it in the app to run it now. The schedule needs `p` (on).
-- Backups are for single files, listed one per line; a folder in the list is not
-  supported ([backups.md](backups.md)).
-- "Files list" errors: press `f` to edit the list (one path per line, no leading `/`,
-  no `..`).
+- A backup keeps dated copies of **single files, not folders**; a folder in the list
+  is not supported ([backups.md](backups.md)).
+- "Files list" errors: press `f` on the backup to open the files list screen. A
+  `✗` and a reason mark each entry that cannot be used (a path starts or ends with
+  `/`, has `//`, `.` or `..` parts, or two entries make the same copy name); fix it
+  with Enter or remove it with `d`, then `s` saves. Saving is refused while the list
+  is empty. See [backups.md](backups.md#add-one).
 
 ## Unmounting says files are open
 

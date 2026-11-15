@@ -57,12 +57,15 @@ it; the app's Maintenance section shows it too.
 ## Lazy unmount
 
 A lazy unmount (`fusermount3 -uz`) detaches a mount now even if programs still have
-files open on it. It is how the mount service stops, so a stop never hangs.
+files open on it. It is how the mount service stops, so a stop never hangs. The
+mount service also uses it to clear a [stale mount](#stale-mount).
 
 ## Link (symlink)
 
 A shortcut that points to another folder or file. `~/Cloud/<remote>`
-is a link to the mount.
+is a link to the mount. The mount folder itself must not be a link into your home
+folder, nor may a mount point be a link: see
+[the mount folder](mount-folder.md#a-link-does-not-get-around-this).
 
 ## Mount root
 
@@ -95,6 +98,14 @@ again. The app opens it for you.
 
 A Google Drive that belongs to an organisation rather
 than to one person.
+
+## Stale mount
+
+A mount left behind when rclone was killed hard (out of memory, `kill -9`): opening
+the folder says "Transport endpoint is not connected". The mount service clears it
+by itself the next time it starts; if it cannot, the log says which command to run,
+`fusermount3 -uz <mount point>`. See
+[troubleshooting.md](troubleshooting.md#a-mount-stopped-working-transport-endpoint-is-not-connected).
 
 ## Sync
 

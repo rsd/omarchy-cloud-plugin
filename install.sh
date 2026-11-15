@@ -29,9 +29,10 @@
 # Without a terminal, or with --no-prompt, nothing is written and the
 # instructions are printed.
 # --mount-root PATH saves PATH (an existing directory you can write to and
-# search, outside $HOME) without asking; it refuses while a rclone-mount@
-# instance is enabled or active, and it moves no mount and no ~/Cloud link
-# (links into the old root are listed). An existing cloud.env is never
+# search, outside $HOME, also with its symlinks resolved: a link into the
+# home is refused, as by every reader) without asking; it refuses while a
+# rclone-mount@ instance is enabled or active, and it moves no mount and no
+# ~/Cloud link (links into the old root are listed). An existing cloud.env is never
 # rewritten except by --mount-root, and --uninstall keeps it.
 #
 # All paths are HOME-fixed: ~/.config, ~/.local/state, ~/.cache; the XDG_*
@@ -197,14 +198,15 @@ sq() {
 # --- valid_root (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/roots.tsv) ---
 # valid_root PATH: 0 when PATH may be the mount root. Absolute, not "/", no
 # empty / "." / ".." component, no whitespace, control character, $ % \ " ' or
-# backquote, not $HOME nor inside it (every trailing / of $HOME ignored; a
-# $HOME of only / is no home: the rule is skipped), at most 255 bytes; valid
-# UTF-8 (valid_utf8) without U+FFFD (EF BF BD, what a lossy decoder puts in
-# place of a bad byte), so a reader that decodes the path as text and one
-# that reads bytes reach the same verdict.
+# backquote, not $HOME nor inside it ($HOME as norm_home gives it; a $HOME
+# that normalises to "/" is no home: the rule is skipped;
+# tests/fixtures/homes.tsv), at most 255 bytes; valid UTF-8 (valid_utf8)
+# without U+FFFD (EF BF BD, what a lossy decoder puts in place of a bad
+# byte), so a reader that decodes the path as text and one that reads bytes
+# reach the same verdict.
 valid_root() {
-  local LC_ALL=C p=$1 home=$HOME
-  home=${home%"${home##*[!/]}"}
+  local LC_ALL=C p=$1 home
+  norm_home home "$HOME"
   [[ $p == /?* && ${#p} -le 255 ]] || return 1
   [[ $p == *[[:space:][:cntrl:]\$%\\\"\'\`]* ]] && return 1
   [[ $p/ == *//* || $p/ == */./* || $p/ == */../* ]] && return 1
@@ -242,7 +244,66 @@ valid_utf8() {
   done
   return 0
 }
+# norm_home VAR HOME: sets VAR to HOME normalised as every reader does
+# (tests/fixtures/homes.tsv): runs of / collapsed, every "." component and
+# every trailing / dropped, ".." kept as written; empty when that leaves "/"
+# or nothing (no home).
+norm_home() {
+  local _h=$2/ _c _out='' _lead=''
+  [[ $2 == /* ]] && _lead=/
+  while [[ -n $_h ]]; do
+    _c=${_h%%/*} _h=${_h#*/}
+    [[ -z $_c || $_c == . ]] && continue
+    _out+=${_out:+/}$_c
+  done
+  printf -v "$1" '%s' "${_out:+$_lead$_out}"
+}
 # --- end valid_root ---
+
+# --- root_outside_home (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/resolved-roots.tsv) ---
+# root_outside_home ROOT: ROOT (one that passes valid_root) judged with its
+# symlinks resolved (realpath -m: missing components are fine, a dangling
+# link is followed as far as it goes; cut off after 5 s), against the home
+# as written (norm_home) and resolved. Programs that crawl the home (file
+# search, indexers, backups) would follow a link into the cloud drive, so:
+#   0  ROOT resolves outside the home (or there is no home);
+#   1  ROOT resolves to the home or inside it: refused;
+#   2  ROOT (or the home) could not be resolved: realpath missing, failing
+#      or hung (a reader refuses it; rclone-mount start retries it).
+# On 1 and 2, ROOT_WHY is the reason, one clause (paths through printf %q).
+root_outside_home() {
+  local LC_ALL=C home real hr h where
+  ROOT_WHY=''
+  norm_home home "$HOME"
+  if ! real=$(timeout -k 1 5 realpath -m -- "$1" 2>/dev/null) || [[ $real != /* ]]; then
+    printf -v ROOT_WHY 'the mount root %q could not be resolved (realpath is missing, failed or did not answer within 5 s)' "$1"
+    return 2
+  fi
+  [[ -n $home ]] || return 0
+  hr=$home
+  if [[ $home == /* ]] && { ! hr=$(timeout -k 1 5 realpath -m -- "$home" 2>/dev/null) || [[ $hr != /* ]]; }; then
+    printf -v ROOT_WHY 'your home %q could not be resolved (realpath is missing, failed or did not answer within 5 s)' "$home"
+    return 2
+  fi
+  for h in "$home" "$hr"; do
+    [[ $h == / ]] && continue
+    [[ $real == "$h" || $real == "$h"/* ]] || continue
+    if [[ $real == "$1" ]]; then
+      printf -v where 'the mount root %q is' "$1"
+    else
+      printf -v where 'the mount root %q resolves to %q,' "$1" "$real"
+    fi
+    if [[ $h == "$home" ]]; then
+      printf -v ROOT_WHY '%s at or inside your home %q' "$where" "$home"
+    else
+      printf -v ROOT_WHY '%s at or inside your home %q (which resolves to %q)' "$where" "$home" "$hr"
+    fi
+    ROOT_WHY+=': programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive'
+    return 1
+  done
+  return 0
+}
+# --- end root_outside_home ---
 
 # The mount-root setting (cloud.env), parsed, never sourced: at most 4096
 # bytes; empty and # lines skipped; one trailing \r dropped; the value of the
@@ -517,6 +578,11 @@ if ((SET_ROOT)); then
     echo "  (no U+FFFD), at most 255 bytes." >&2
     exit 1
   fi
+  if ! root_outside_home "$MOUNT_ROOT"; then
+    echo "$PROG: stopping, nothing was changed: $ROOT_WHY." >&2
+    echo "  Choose a real folder outside your home: $PROG --mount-root PATH" >&2
+    exit 1
+  fi
   if ! usable_root "$MOUNT_ROOT"; then
     echo "$PROG: stopping, nothing was changed: $(sq "$MOUNT_ROOT") is not a directory you can write to and search;" >&2
     mkroot_hint "$MOUNT_ROOT" >&2
@@ -747,6 +813,12 @@ fi
 # --- the mount root ---------------------------------------------------------------
 # root_not_set_up <path>: the instructions when no usable root is set.
 root_not_set_up() {
+  if ! root_outside_home "$1"; then
+    echo "$PROG: the mount root is not set up, so no mount can start yet: $ROOT_WHY."
+    echo "  Nothing was written. Choose a real folder outside your home you can write to and search:"
+    echo "    $PROG --mount-root PATH"
+    return 0
+  fi
   echo "$PROG: the mount root is not set up, so no mount can start yet. Mounts go to <root>/<remote>"
   echo "(outside your home; ~/Cloud/<remote> links to them), and $(sq "$1") is not a directory you"
   echo "own and can write to and search. Nothing was written."
@@ -769,6 +841,12 @@ ask_root() {
     if ! valid_root "$proposed"; then
       echo "  $(sq "$proposed") cannot be the mount root: it must be an absolute path outside your home,"
       echo "  not /, with no space, \$ % \\ \" ' or backquote, no . or .. component, valid UTF-8."
+      proposed=$DEFAULT_ROOT
+      continue
+    fi
+    if ! root_outside_home "$proposed"; then
+      echo "  $ROOT_WHY."
+      echo "  Type a real folder outside your home."
       proposed=$DEFAULT_ROOT
       continue
     fi
@@ -799,7 +877,10 @@ if ((SET_ROOT)); then
     for l in "${stale[@]}"; do echo "  $l"; done
   fi
 elif [[ $ROOT_STATE == valid ]]; then
-  if ! usable_root "$ROOT_VALUE"; then
+  if ! root_outside_home "$ROOT_VALUE"; then
+    echo "$PROG: the mount root setting in $CLOUD_ENV cannot be used, so no mount starts: $ROOT_WHY."
+    echo "  It was left as it is. Choose a real folder outside your home: $PROG --mount-root PATH"
+  elif ! usable_root "$ROOT_VALUE"; then
     echo "$PROG: the mount root $(sq "$ROOT_VALUE") (from $CLOUD_ENV) is not a directory you can write to and search;"
     mkroot_hint "$ROOT_VALUE"
   fi
@@ -808,7 +889,7 @@ elif [[ $ROOT_STATE == valid ]]; then
 elif [[ $ROOT_STATE == invalid || -e $CLOUD_ENV || -L $CLOUD_ENV ]]; then
   echo "$PROG: $CLOUD_ENV holds no usable OMARCHY_CLOUD_ROOT=<path> line; it was left as it is."
   echo "  Edit it, or set the root with: $PROG --mount-root PATH"
-elif valid_root "$DEFAULT_ROOT" && [[ -d $DEFAULT_ROOT && -O $DEFAULT_ROOT && -w $DEFAULT_ROOT && -x $DEFAULT_ROOT ]]; then
+elif valid_root "$DEFAULT_ROOT" && root_outside_home "$DEFAULT_ROOT" && [[ -d $DEFAULT_ROOT && -O $DEFAULT_ROOT && -w $DEFAULT_ROOT && -x $DEFAULT_ROOT ]]; then
   save_root "$DEFAULT_ROOT" || exit 1
   ROOT_WRITTEN=1
   echo "$PROG: mount root: adopted your existing $DEFAULT_ROOT (saved in $CLOUD_ENV)"

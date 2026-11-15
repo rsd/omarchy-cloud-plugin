@@ -180,7 +180,7 @@ pub const MAX_ROOT: usize = 255;
 /// The mount root (`OMARCHY_CLOUD_ROOT` in cloud.env): absolute, not `/`,
 /// every component non-empty and not `.` or `..` (so no `//` and no trailing
 /// `/`), no ASCII whitespace or control byte (0x00-0x20, 0x7F), none of
-/// `$`, `%`, `\`, `"`, `'` or a backtick, not `home` and not inside it (component-wise), at most
+/// `$`, `%`, `\`, `"`, `'` or a backtick, not `home` (normalised: `normalise_home`) and not inside it, at most
 /// 255 bytes, and no U+FFFD: a `&str` is valid UTF-8 already, and banning the
 /// replacement character makes a lossy decoder (the bar reads cloud.env as
 /// text, a bad byte arriving as U+FFFD) reach the same verdict as a strict
@@ -202,13 +202,51 @@ pub fn is_valid_root(path: &str, home: &Path) -> bool {
         && !inside_home(path, home)
 }
 
-/// True when `path` is inside `home`. A home of "/" or "" (after trimming
-/// trailing `/`) is no home: the rule is skipped, like the helpers'
-/// `valid_root` (every trailing `/` of HOME stripped; `[[ -n $home && ... ]]`).
+/// The home as every root validator compares it (tests/fixtures/homes.tsv):
+/// runs of `/` collapsed to one, every `.` component dropped, every trailing
+/// `/` dropped; `..` is kept as written. A home that normalises to `/` (or
+/// "") is no home: None, and the home rule is skipped. Pure.
+pub fn normalise_home(home: &str) -> Option<String> {
+    let mut out = String::with_capacity(home.len());
+    if home.starts_with('/') {
+        out.push('/');
+    }
+    for seg in home.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        if !out.is_empty() && !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    (!out.is_empty() && out != "/").then_some(out)
+}
+
+/// True when `path` is `home` (normalised, `normalise_home`) or inside it,
+/// as strings on a `/` boundary, like the helpers' `valid_root` and the
+/// bar's `isValidRoot`. No home: false.
 fn inside_home(path: &str, home: &Path) -> bool {
-    let h = home.to_string_lossy();
-    let h = h.trim_end_matches('/');
-    !h.is_empty() && Path::new(path).starts_with(h)
+    match normalise_home(&home.to_string_lossy()) {
+        Some(h) => under(path, &h),
+        None => false,
+    }
+}
+
+/// `path` is `dir` or below it, as strings on a `/` boundary.
+fn under(path: &str, dir: &str) -> bool {
+    path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The filesystem half of the root rule (tests/fixtures/resolved-roots.tsv):
+/// true when the root as resolved (`realpath -m`) is the home or inside it,
+/// the home taken both as written (normalised) and resolved. A resolved home
+/// of `/` is no home either. Pure: the resolving is the caller's.
+pub fn resolves_into_home(resolved_root: &str, home: &str, resolved_home: &str) -> bool {
+    [home, resolved_home]
+        .iter()
+        .filter_map(|h| normalise_home(h))
+        .any(|h| under(resolved_root, &h))
 }
 
 /// True when `p` is `root` or inside it. Both should be canonical. Pure.
@@ -389,6 +427,48 @@ mod tests {
             n >= 49 && valid >= 13 && invalid >= 36 && non_utf8 >= 5,
             "only {n} cases read ({valid} valid, {invalid} invalid, {non_utf8} non-UTF-8)"
         );
+    }
+
+    /// The one list of home cases (how a root is compared with $HOME),
+    /// shared with the helpers, rclone-mount and the bar.
+    #[test]
+    fn homes_fixture() {
+        let text = include_str!("../../tests/fixtures/homes.tsv");
+        let mut n = 0;
+        for line in text.split('\n') {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            let [want, home, path] = f[..] else {
+                panic!("<valid|invalid><TAB><home><TAB><path>: {line:?}");
+            };
+            let expect = match want {
+                "valid" => true,
+                "invalid" => false,
+                other => panic!("bad fixture verdict {other:?}"),
+            };
+            assert_eq!(is_valid_root(path, Path::new(home)), expect, "{line:?}");
+            n += 1;
+        }
+        assert!(n >= 17, "only {n} cases read");
+    }
+
+    #[test]
+    fn home_normalisation() {
+        let norm = |h: &str| normalise_home(h);
+        assert_eq!(norm("/home/u"), Some("/home/u".into()));
+        assert_eq!(norm("//home//u//"), Some("/home/u".into()));
+        assert_eq!(norm("/./home/./u/."), Some("/home/u".into()));
+        assert_eq!(norm("/home/../u"), Some("/home/../u".into()), ".. kept");
+        for none in ["", "/", "//", "/.", "/./", "./"] {
+            assert_eq!(norm(none), None, "{none:?}");
+        }
+        // Resolved and written homes: either one containing the root refuses it.
+        assert!(resolves_into_home("/data/home/C", "/home/u", "/data/home"));
+        assert!(resolves_into_home("/home/u", "/home//u/", "/elsewhere"));
+        assert!(!resolves_into_home("/home/u2", "/home/u", "/home/u"));
+        assert!(!resolves_into_home("/srv/c", "/", "/"));
     }
 
     #[test]

@@ -17,6 +17,11 @@
 #      install.sh byte-identical, every line of tests/fixtures/roots.tsv
 #      (read as raw bytes) through each, and the UTF-8 forms a TSV line does
 #      not spell out (overlong, surrogate, past U+10FFFF, truncated);
+#      every line of tests/fixtures/homes.tsv through each valid_root (HOME
+#      set per line); the shared root_outside_home: its marker blocks
+#      byte-identical, every line of tests/fixtures/resolved-roots.tsv
+#      through each (the tree built per the fixture's header), status 2 when
+#      realpath fails or hangs;
 #      HOME-fixed paths (XDG_CONFIG_HOME / XDG_STATE_HOME ignored);
 #      backup FILES with .., an absolute path, duplicate copy names, empty.
 #   3. rclone-bisync: run passes exactly the safety flags and bisync's exit
@@ -31,7 +36,8 @@
 #      excludes conflict copies), teardown removes them; validate; the guards
 #      (backup DEST, other pairs' LOCAL, cloud locations and FUSE mounts, in
 #      both directions: LOCAL inside one or containing one; the configured
-#      mount root of cloud.env, parsed and validated, never run); a
+#      mount root of cloud.env, parsed and validated, never run; one that
+#      links into the home still a cloud location: fail closed); a
 #      hung FUSE mount: the guards never resolve a path in it and a run
 #      completes, setup and validate still refuse; a hung realpath elsewhere is
 #      cut off after 5 s.
@@ -42,7 +48,9 @@
 #      not prune; a busy job lock exits 0; only `rclone copyto <remote> <local>`;
 #      validate; the guards (pairs' LOCAL, other jobs' DEST, cloud locations,
 #      both directions), the same hung-mount cases; a hostile path in the
-#      failure notification is stripped of < > &.
+#      failure notification is stripped of < > &; every case of
+#      tests/fixtures/files-lines.tsv (a conf with its STRIP_PREFIX, a files
+#      list of its lines) through `list`, under LC_ALL=C and C.UTF-8.
 #   5. The generated drop-ins against the repo's templates, through the real
 #      systemd (`systemd --test`, `systemd-analyze verify`), read-only.
 #   6. rclone-mount (the mount unit's guard): every line of roots.tsv end to
@@ -53,7 +61,13 @@
 #      check's skip (exit 1 and one line) for a valid root that is missing,
 #      not writable or not searchable; start never creates the root, execs
 #      the command (same PID, argv intact, the environment's HOME); every
-#      line of names.tsv as the remote; usage errors.
+#      line of names.tsv as the remote; usage errors; <root>/<remote> a
+#      file or a symlink (to a folder outside or inside the home, dangling):
+#      78; the transient failures, 75, never 78: a stale FUSE mount (stand-in
+#      stat and fusermount3 on PATH: cleared then mounted, or fusermount3
+#      failing, missing, not clearing it: the fusermount3 -uz hint), a hung
+#      mount point, mkdir failing with nothing in the way, realpath failing
+#      or hung; every line of resolved-roots.tsv end to end.
 
 # The checks are eval'd single-quoted strings, expanded when they run: the
 # variables they read look unused to shellcheck, and the quotes are on purpose.
@@ -68,6 +82,9 @@ BACKUP=$PLUGIN_DIR/bin/rclone-backup
 MOUNT=$PLUGIN_DIR/bin/rclone-mount
 NAMES_TSV=$PLUGIN_DIR/tests/fixtures/names.tsv
 ROOTS_TSV=$PLUGIN_DIR/tests/fixtures/roots.tsv
+HOMES_TSV=$PLUGIN_DIR/tests/fixtures/homes.tsv
+RESOLVED_TSV=$PLUGIN_DIR/tests/fixtures/resolved-roots.tsv
+FILES_TSV=$PLUGIN_DIR/tests/fixtures/files-lines.tsv
 FAILURES=0
 SCRATCH=$(mktemp -d) || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -160,6 +177,11 @@ done
 exec /usr/bin/realpath "$@"
 EOF
 chmod +x "$RPSTUB/realpath"
+# A realpath that always fails (as if missing); only on PATH where asked.
+RPFAIL=$SCRATCH/rpfail
+mkdir -p "$RPFAIL"
+printf '#!/bin/bash\necho "realpath: stand-in failure" >&2\nexit 1\n' >"$RPFAIL/realpath"
+chmod +x "$RPFAIL/realpath"
 export PATH="$STUBS:$PATH"
 TODAY=2026-11-14
 
@@ -385,6 +407,31 @@ while IFS=$'\t' read -r kind name; do
 done < <(grep -v '^#' "$NAMES_TSV")
 check "names.tsv: read (at least 20 cases)" eval '((names_n >= 20))'
 
+# rr_cases: the cases of tests/fixtures/resolved-roots.tsv, as
+# "<kind>\t<setup>\t<root>" lines.
+rr_cases() { grep -v '^#' "$RESOLVED_TSV" | grep $'\t'; }
+# rr_build <T> <setup>: the tree of one resolved-roots.tsv case under T (the
+# fixture's header): T/home a directory unless a step links it; the steps
+# in order: dir:<p> is mkdir -p T/<p>; link:<p>=<t> is ln -s <t> T/<p> (its
+# parent made first; a <t> of @/<rest> is T/<rest>, any other verbatim).
+rr_build() {
+  local t=$1 step p tg steps=()
+  [[ $2 == - ]] || IFS=';' read -ra steps <<<"$2"
+  mkdir -p "$t" || return 1
+  [[ ";$2;" == *";link:home="* ]] || mkdir -p "$t/home" || return 1
+  for step in "${steps[@]}"; do
+    case $step in
+      dir:*) mkdir -p "$t/${step#dir:}" || return 1 ;;
+      link:*=*)
+        p=${step#link:} tg=${step#*=}
+        p=${p%%=*}
+        [[ $tg == @/* ]] && tg=$t/${tg#@/}
+        mkdir -p "$(dirname -- "$t/$p")" && ln -s -- "$tg" "$t/$p" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
 # roots_cases: the cases of tests/fixtures/roots.tsv as "<kind>\t<path>"
 # lines, the path as raw bytes (the file holds non-UTF-8 bytes, so no grep,
 # which calls it binary in a UTF-8 locale, and no IFS splitting, which would
@@ -446,6 +493,64 @@ for f in "${VR_FILES[@]}"; do
   done
   check "valid_root (${f##*/}): strict UTF-8 by bytes (overlong, surrogate, past U+10FFFF, stray, truncated, U+FFFD refused)${u8_bad:+; wrong: ${u8_bad[*]}}" \
     eval '((${#u8_bad[@]} == 0))'
+done
+
+# The home, normalised the same way in every copy (tests/fixtures/homes.tsv:
+# runs of / collapsed, "." components and trailing / dropped, ".." kept; a
+# home that normalises to "/" skips the home rule), HOME set per line.
+for f in "${VR_FILES[@]}"; do
+  blk=$(vr_block "$f")
+  homes_n=0 homes_bad=()
+  while IFS=$'\t' read -r kind home path; do
+    [[ $kind == valid || $kind == invalid ]] || continue
+    homes_n=$((homes_n + 1))
+    if HOME=$home bash -c 'eval "$1"; valid_root "$2"' vr "$blk" "$path"; then got=valid; else got=invalid; fi
+    [[ $got == "$kind" ]] || homes_bad+=("$kind home=$home $path")
+  done < <(grep -v '^#' "$HOMES_TSV")
+  check "homes.tsv: ${f#"$PLUGIN_DIR"/} valid_root normalises the home ($homes_n cases${homes_bad:+; wrong: ${homes_bad[*]}})" \
+    eval '((homes_n >= 15 && ${#homes_bad[@]} == 0))'
+done
+
+# The resolved-root rule: one bash function, root_outside_home, copied byte
+# for byte between its marker lines into the three scripts and install.sh;
+# every case of tests/fixtures/resolved-roots.tsv through each copy, the
+# tree of the case built under a fresh scratch dir (rr_build), HOME=<it>/home.
+RH_BEGIN='# --- root_outside_home (shared: bin/rclone-bisync, bin/rclone-backup, bin/rclone-mount, install.sh; tests/fixtures/resolved-roots.tsv) ---'
+RH_END='# --- end root_outside_home ---'
+rh_block() { awk -v b="$RH_BEGIN" -v e="$RH_END" '$0 == b { p = 1 } p { print } p && $0 == e { exit }' "$1"; }
+RH_REF=$(rh_block "$BISYNC")
+RRN=0
+for f in "${VR_FILES[@]}"; do
+  rblk=$(rh_block "$f")
+  check "root_outside_home: ${f#"$PLUGIN_DIR"/} has the marker block" \
+    eval '[[ $rblk == "$RH_BEGIN"$'"'"'\n'"'"'*root_outside_home\(\)*"$RH_END" ]]'
+  check "root_outside_home: ${f#"$PLUGIN_DIR"/}'s block is byte-identical to bin/rclone-bisync's" eval '[[ -n $rblk && $rblk == "$RH_REF" ]]'
+  blk=$(vr_block "$f")$'\n'$rblk
+  rr_n=0 rr_bad=()
+  while IFS=$'\t' read -r kind setup root; do
+    rr_n=$((rr_n + 1)) RRN=$((RRN + 1))
+    t=$SCRATCH/rr/$RRN
+    rr_build "$t" "$setup" || { rr_bad+=("unbuildable $setup"); continue; }
+    HOME=$t/home bash -c 'eval "$1"; valid_root "$2"' vr "$blk" "$t/$root" || { rr_bad+=("valid_root refuses $root"); continue; }
+    HOME=$t/home bash -c 'eval "$1"; root_outside_home "$2"' vr "$blk" "$t/$root"
+    case $?:$kind in
+      0:valid | 1:invalid) ;;
+      *) rr_bad+=("$kind $setup $root") ;;
+    esac
+  done < <(rr_cases)
+  check "resolved-roots.tsv: ${f#"$PLUGIN_DIR"/} root_outside_home gives every verdict ($rr_n cases${rr_bad:+; wrong: ${rr_bad[*]}})" \
+    eval '((rr_n >= 15 && ${#rr_bad[@]} == 0))'
+  # Could not resolve (realpath failing, missing, hung past 5 s): status 2.
+  t=$SCRATCH/rr/x
+  mkdir -p "$t/home" "$t/mnt/cloud"
+  rh() { HOME=$t/home PATH=$1 bash -c 'eval "$1"; root_outside_home "$2"; echo "$?|$ROOT_WHY"' vr "$blk" "$t/mnt/cloud"; }
+  out_fail=$(rh "$RPFAIL:$PATH")
+  out_hung=$(FAKE_HUNG=$t/mnt/cloud rh "$RPSTUB:$PATH")
+  check "root_outside_home (${f##*/}): realpath failing or hung (cut off after 5 s): status 2, the reason said" \
+    eval '[[ $out_fail == "2|the mount root $t/mnt/cloud could not be resolved"* && $out_hung == "2|the mount root $t/mnt/cloud could not be resolved"* ]]'
+  out=$(HOME=$t/home bash -c 'eval "$1"; root_outside_home "$2"; echo "$?|$ROOT_WHY"' vr "$blk" "$t/home/x")
+  check "root_outside_home (${f##*/}): the reason names the root, the home and why (home crawlers)" \
+    eval '[[ $out == "1|the mount root $t/home/x is at or inside your home $t/home: programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive" ]]'
 done
 
 # HOME-fixed paths: XDG_CONFIG_HOME and XDG_STATE_HOME (pointed away from
@@ -1010,6 +1115,20 @@ cloud_env "OMARCHY_CLOUD_ROOT=$HOME/mnt"
 local_at "$HOME/mnt"
 runc "$BISYNC" validate vault-A
 check "bisync: a configured root inside HOME is invalid, ignored" eval 'rc_is 0 && [[ -z $OUT ]]'
+# A root that resolves into HOME (the mount refuses it: root_outside_home)
+# is still a cloud location for the guard: fail closed, as written and
+# resolved.
+for rel in home/CloudReal/x srv/link/x; do
+  fresh
+  at=$T/$rel
+  mkdir -p "$HOME/CloudReal" "$T/srv"
+  ln -s "$HOME/CloudReal" "$T/srv/link"
+  cloud_env "OMARCHY_CLOUD_ROOT=$T/srv/link"
+  local_at "$at"
+  runc "$BISYNC" validate vault-A
+  check "bisync validate: a configured root that links into HOME is still a cloud location: LOCAL \$T${at#"$T"} refused" \
+    eval 'rc_is 64 && [[ $OUT == *"is inside the cloud location $T/srv/link;"* ]]'
+done
 # Only the first 4096 bytes are read: a key line past them is not seen.
 fresh
 mkdir -p "$T/srv/clouds"
@@ -1249,6 +1368,49 @@ check "backup conf without DEST: exit 64" rc_is 64
 runc "$BACKUP" run ../j
 check "bad job name: exit 64" rc_is 64
 
+# Every case of the shared files-list cases (tests/fixtures/files-lines.tsv;
+# the app's verdict, conf::check_files_list, is tested against the same
+# file): a conf with the case's STRIP_PREFIX, a files list of its lines
+# (decoded with printf %b: \t \r \\ \xHH). `list` exits 0 for a valid case,
+# 64 for an invalid one, under LC_ALL=C and C.UTF-8 (when installed); a
+# stricter case (the app refuses it) exits 0 under C.
+FL_LOCALES=(C)
+locale -a 2>/dev/null | grep -qix 'c\.utf-\?8' && FL_LOCALES+=(C.UTF-8)
+fl_n=0 fl_bad=()
+while IFS= read -r fl_line; do
+  [[ -z $fl_line || $fl_line == '#'* ]] && continue
+  fl_kind=${fl_line%%$'\t'*} fl_rest=${fl_line#*$'\t'}
+  fl_strip=${fl_rest%%$'\t'*} fl_rest=${fl_rest#*$'\t'}
+  fresh
+  mkdir -p "$HOME/.config/rclone-backup"
+  {
+    echo "REMOTE=work_drive:"
+    echo "DEST=~/Backups/fl"
+    [[ $fl_strip == - ]] || LC_ALL=C printf 'STRIP_PREFIX=%b\n' "$fl_strip"
+  } >"$HOME/.config/rclone-backup/fl.conf"
+  : >"$HOME/.config/rclone-backup/fl.files"
+  while :; do
+    LC_ALL=C printf '%b\n' "${fl_rest%%$'\t'*}" >>"$HOME/.config/rclone-backup/fl.files"
+    [[ $fl_rest == *$'\t'* ]] || break
+    fl_rest=${fl_rest#*$'\t'}
+  done
+  fl_n=$((fl_n + 1))
+  for fl_loc in "${FL_LOCALES[@]}"; do
+    case $fl_kind in
+      valid) fl_want=0 ;;
+      invalid) fl_want=64 ;;
+      stricter) [[ $fl_loc == C ]] || continue; fl_want=0 ;;
+      *) fl_want='unknown kind' ;;
+    esac
+    runc env LC_ALL="$fl_loc" "$BACKUP" list fl
+    if [[ $RC != "$fl_want" ]] || ! no_rclone; then
+      fl_bad+=("$fl_loc:$fl_kind:$(printf %q "${fl_line#*$'\t'}")=$RC")
+    fi
+  done
+done <"$FILES_TSV"
+check "files-lines.tsv: rclone-backup list agrees with every case ($fl_n, locales ${FL_LOCALES[*]}${fl_bad:+; wrong: ${fl_bad[*]}})" \
+  eval '((fl_n >= 40 && ${#fl_bad[@]} == 0))'
+
 # DEST (~/Backups/vaults) against the LOCAL of offline folders.
 for local in "~/Backups/vaults/sub" "~/Backups/vaults" "~/Backups" "~/"; do
   fresh
@@ -1396,6 +1558,17 @@ dest_at "$T/srv"
 runc "$BACKUP" run archive-vaults
 check "backup run: DEST containing the configured root warns and backs up" \
   eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && [[ $OUT == *"contains the cloud location $T/srv/clouds; "*"continuing"* ]]'
+for rel in home/CloudReal/x srv/link/x; do
+  fresh
+  at=$T/$rel
+  mkdir -p "$HOME/CloudReal" "$T/srv"
+  ln -s "$HOME/CloudReal" "$T/srv/link"
+  cloud_env "OMARCHY_CLOUD_ROOT=$T/srv/link"
+  dest_at "$at"
+  runc "$BACKUP" validate archive-vaults
+  check "backup validate: a configured root that links into HOME is still a cloud location: DEST \$T${at#"$T"} refused" \
+    eval 'rc_is 64 && [[ $OUT == *"is inside the cloud location $T/srv/link;"* ]]'
+done
 for at in /mnt /; do
   fresh
   dest_at "$at"
@@ -1653,7 +1826,7 @@ check "rclone-mount check: a valid, agreeing, usable root: exit 0, silent" eval 
 rm -f "$MENV"
 mstart od "$MR"
 check "rclone-mount: no cloud.env means /mnt/cloud; another systemd value is refused, blamed on another file (od.env), not on a cloud.env parse" \
-  eval 'refused "$DIFFERS" && [[ $OUT == *"the other readers use the built-in default /mnt/cloud (there is no "*"); systemd got it from another file the unit reads (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/od.env: remove it)"* && $OUT != *"its own way"* ]]'
+  eval 'refused "$DIFFERS" && [[ $OUT == *"the other readers use the built-in default /mnt/cloud (there is no "*"); systemd got it from another file the unit reads or a drop-in (an OMARCHY_CLOUD_ROOT= line in ~/.config/rclone-mount/od.env, or an Environment=OMARCHY_CLOUD_ROOT= line in rclone-mount@.service.d/*.conf or rclone-mount@od.service.d/*.conf under ~/.config/systemd/user/, /etc/systemd/user/ or ~/.config/systemd/user.control/ (systemctl set-property): remove it)"* && $OUT != *"its own way"* ]]'
 menv "# only a comment" "OMARCHY_CLOUD_ROOT_X=$MR"
 mstart od "$MR"
 check "rclone-mount: a cloud.env without the line means /mnt/cloud too; either cause named" \
@@ -1768,11 +1941,133 @@ mstart od "$MR"
 check "rclone-mount start: <root>/od is a regular file: exit 78, one line naming it and why, not mounted" \
   eval 'refused "cannot create the mount point $MR/od (File exists)" && [[ $OUT == *"Fix: remove or rename what is at $MR/od"* && -f $MR/od ]]'
 rm -f "$MR/od"
-ln -s "$T/nowhere" "$MR/od"
-mstart od "$MR"
-check "rclone-mount start: <root>/od is a dangling symlink: exit 78, one line, not mounted, the link kept" \
-  eval 'refused "cannot create the mount point $MR/od" && [[ -L $MR/od && ! -e $T/nowhere ]]'
-rm -f "$MR/od"
+# A symlink where the mount point goes (rclone would mount where it points):
+# refused, exit 78, whether it points to a folder outside the home, one
+# inside it, or nowhere; the link and its target left as they are.
+mkdir -p "$T/m/srv/elsewhere" "$MH/Inside"
+for tg in "$T/m/srv/elsewhere" "$MH/Inside" "$T/nowhere"; do
+  ln -s "$tg" "$MR/od"
+  mstart od "$MR"
+  check "rclone-mount start: <root>/od is a symlink to \$T/${tg#"$T"/}: exit 78, one line, not mounted, the link and its target untouched" \
+    eval 'refused "the mount point $MR/od is a symbolic link (to $tg)" && [[ $OUT == *"Fix: remove the link (rm $MR/od"* && -L $MR/od && ! -e $tg/od && $(find "$T/m/srv/elsewhere" "$MH/Inside" -mindepth 1 | wc -l) == 0 ]]'
+  rm -f "$MR/od"
+done
+check "rclone-mount start: a dangling link's target is not created" eval '[[ ! -e $T/nowhere ]]'
+
+# Transient failures exit 75 (EX_TEMPFAIL: Restart=on-failure retries),
+# never 78, with one line; nothing is run. Stand-ins first on PATH:
+# FUSESTUB's stat reports ENOTCONN ("Transport endpoint is not connected")
+# for the path in $FAKE_LOG/stale (a stale FUSE mount: rclone died without
+# unmounting; a regular file stands in for the dead mount, in the way of
+# mkdir as the real one is) and hangs on $FAKE_STAT_HANG; its fusermount3
+# records its argv and, unless FAKE_FUSER_FAIL or FAKE_FUSER_NOOP, unmounts
+# (the stand-in file goes, the folder beneath it shows). MKSTUB's mkdir
+# fails with ENOSPC. NOFUSER: the tools rclone-mount runs, no fusermount3.
+FUSESTUB=$SCRATCH/fusestub MKSTUB=$SCRATCH/mkstub NOFUSER=$SCRATCH/nofuser
+mkdir -p "$FUSESTUB" "$MKSTUB" "$NOFUSER"
+cat >"$FUSESTUB/stat" <<'STUB'
+#!/bin/bash
+p=${*: -1}
+[[ -n ${FAKE_STAT_HANG:-} && $p == "$FAKE_STAT_HANG" ]] && exec sleep 30
+if [[ -f $FAKE_LOG/stale && $p == "$(<"$FAKE_LOG/stale")" ]]; then
+  echo "stat: cannot statx '$p': Transport endpoint is not connected" >&2
+  exit 1
+fi
+exec /usr/bin/stat "$@"
+STUB
+cat >"$FUSESTUB/fusermount3" <<'STUB'
+#!/bin/bash
+{ printf 'fusermount3'; printf ' %q' "$@"; printf '\n'; } >>"$FAKE_LOG/fusermount3"
+if [[ -n ${FAKE_FUSER_FAIL:-} ]]; then
+  echo "fusermount3: failed to unmount ${*: -1}: Device or resource busy" >&2
+  exit 1
+fi
+if [[ -z ${FAKE_FUSER_NOOP:-} && -f $FAKE_LOG/stale ]]; then
+  p=$(<"$FAKE_LOG/stale")
+  rm -f "$FAKE_LOG/stale" "$p" && mkdir "$p"
+fi
+exit 0
+STUB
+cat >"$MKSTUB/mkdir" <<'STUB'
+#!/bin/bash
+echo "mkdir: cannot create directory '${*: -1}': No space left on device" >&2
+exit 1
+STUB
+for tool in bash timeout realpath mkdir head tr readlink sleep rm; do ln -sf "$(command -v "$tool")" "$NOFUSER/$tool"; done
+cp "$FUSESTUB/stat" "$NOFUSER/stat"
+chmod +x "$FUSESTUB/stat" "$FUSESTUB/fusermount3" "$MKSTUB/mkdir" "$NOFUSER/stat"
+# stale: <root>/od a stale mount (as the stand-ins see it).
+stale() { : >"$MR/od" && printf '%s' "$MR/od" >"$FAKE_LOG/stale"; }
+fuser_log() { cat "$FAKE_LOG/fusermount3" 2>/dev/null; }
+# retried [text]: exit 75, one line (with text), the command never run.
+retried() {
+  rc_is 75 && one_line && [[ $OUT == "rclone-mount: od: cannot mount yet, will retry: "*"${1:-}"* ]] && ! mounted
+}
+mfresh
+menv "OMARCHY_CLOUD_ROOT=$MR"
+stale
+PATH="$FUSESTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: a stale FUSE mount at <root>/od is cleared (fusermount3 -uz -- <root>/od), then mounted (exit 0, the command run)" \
+  eval 'rc_is 0 && [[ -z $OUT && -d $MR/od ]] && mounted && [[ $(fuser_log) == "fusermount3 -uz -- $MR/od" ]]'
+mfresh
+menv "OMARCHY_CLOUD_ROOT=$MR"
+stale
+FAKE_FUSER_FAIL=1 PATH="$FUSESTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: a stale mount fusermount3 cannot clear: exit 75 (retried), one line with the hint fusermount3 -uz <path>" \
+  eval 'retried "the mount point $MR/od is a stale FUSE mount (Transport endpoint is not connected" && [[ $OUT == *"(Device or resource busy). Fix: run fusermount3 -uz $MR/od." ]]'
+FAKE_FUSER_NOOP=1 PATH="$FUSESTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: a stale mount still there after fusermount3 -uz: exit 75, the hint" \
+  eval 'retried "still there after fusermount3 -uz" && [[ $OUT == *"Fix: run fusermount3 -uz $MR/od." ]]'
+PATH=$NOFUSER mstart od "$MR"
+check "rclone-mount start: a stale mount and no fusermount3: exit 75, says so, the hint" \
+  eval 'retried "could not clear it (fusermount3 is not installed). Fix: run fusermount3 -uz $MR/od."'
+rm -f "$FAKE_LOG/stale" "$MR/od"
+FAKE_STAT_HANG=$MR/od PATH="$FUSESTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: a mount point that does not answer (stat hung, cut off after 5 s): exit 75, the hint" \
+  eval 'retried "the mount point $MR/od did not answer within 5 s (a hung mount). Fix: run fusermount3 -uz $MR/od."'
+PATH="$MKSTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: mkdir of <root>/od failing with nothing in the way (ENOSPC): exit 75, not 78" \
+  eval 'retried "cannot create the mount point $MR/od (No space left on device)"'
+PATH="$RPFAIL:$PATH" mstart od "$MR"
+check "rclone-mount start: the root cannot be resolved (realpath failing): exit 75, nothing made" \
+  eval 'retried "the mount root $MR could not be resolved" && [[ ! -e $MR/od ]]'
+FAKE_HUNG=$MR PATH="$RPSTUB:$PATH" mstart od "$MR"
+check "rclone-mount start: realpath of the root hung (cut off after 5 s): exit 75" \
+  eval 'retried "the mount root $MR could not be resolved" && [[ ! -e $MR/od ]]'
+PATH="$RPFAIL:$PATH" mcheck od "$MR"
+check "rclone-mount check: the root cannot be resolved: exit 0, silent (start retries)" eval 'rc_is 0 && [[ -z $OUT ]]'
+
+# The root with its symlinks resolved: every case of resolved-roots.tsv end
+# to end, systemd agreeing with the file, the tree built under a fresh
+# scratch dir (rr_build) with %h = <it>/home and cloud.env under it. A valid
+# root is created when missing, so it is mounted; an invalid one: check goes
+# on (exit 0, silent), start refuses it (exit 78, one line naming the home
+# and why) with nothing created.
+mfresh
+rm_n=0 rm_bad=()
+while IFS=$'\t' read -r kind setup root; do
+  rm_n=$((rm_n + 1))
+  t=$T/rrm$rm_n
+  rr_build "$t" "$setup" || { rm_bad+=("unbuildable $setup"); continue; }
+  MH=$t/home r=$t/$root
+  mkdir -p "$MH/.config/omarchy-cloud"
+  printf 'OMARCHY_CLOUD_ROOT=%s\n' "$r" >"$MH/.config/omarchy-cloud/cloud.env"
+  [[ $kind == valid && ! -e $r ]] && mkdir -p "$r"
+  before=$(find "$t" | LC_ALL=C sort)
+  mcheck od "$r"
+  crc=$RC cout=$OUT
+  mstart od "$r"
+  if [[ $kind == valid ]]; then
+    { ((crc == 0)) && [[ -z $cout ]] && rc_is 0 && [[ -z $OUT && -d $r/od ]] && mounted; } || rm_bad+=("valid $setup $root rc=$RC")
+  else
+    { ((crc == 0)) && [[ -z $cout ]] && refused "at or inside your home " &&
+      [[ $OUT == *": programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive. Fix: point the root at a real folder outside your home: "* &&
+        $(find "$t" | LC_ALL=C sort) == "$before" ]]; } || rm_bad+=("invalid $setup $root rc=$RC")
+  fi
+done < <(rr_cases)
+check "resolved-roots.tsv: rclone-mount check and start, end to end: valid mounted, invalid exit 78 with nothing created ($rm_n cases${rm_bad:+; wrong: ${rm_bad[*]}})" \
+  eval '((rm_n >= 15 && ${#rm_bad[@]} == 0))'
+mfresh
 
 # The remote: every case of names.tsv (valid: mounted; invalid: exit 78, its
 # name shown escaped, nothing created).

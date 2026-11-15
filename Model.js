@@ -258,14 +258,32 @@ var INSTALL_SCRIPT = [
   "read -r _"
 ].join("\n")
 
-// Whether the mount root "$1" is a directory this user can create the
-// per-remote folders in (what the unit's ExecCondition asks). Run only for a
-// root that passed isValidRoot, and the root is "$1", never part of the
-// script. The answer is one constant word: ROOT_CHECK_OK or ROOT_CHECK_MISSING.
+// Whether the mount root "$1" resolves outside the home "$2" and is a
+// directory this user can create the per-remote folders in (what the unit's
+// ExecCondition asks). Run only for a root that passed isValidRoot, with the
+// home as normaliseHome gives it ("" for no home: the home half skipped);
+// both are arguments, never part of the script. First the filesystem half of
+// the root rule (tests/fixtures/resolved-roots.tsv): the root resolved by the
+// helpers' own `timeout -k 1 5 realpath -m` is refused when it is the home
+// as written or resolved, or inside it (a resolved home of "/" is no home).
+// "x" after each answer keeps a trailing newline in a path, then is cut.
+// The answer is one constant word: ROOT_CHECK_OK, ROOT_CHECK_MISSING,
+// ROOT_CHECK_INHOME, or ROOT_CHECK_UNRESOLVED (realpath failed or timed out).
 var ROOT_CHECK_OK = "root-ok"
 var ROOT_CHECK_MISSING = "root-missing"
-var ROOT_CHECK_SCRIPT = "if [ -d \"$1\" ] && [ -w \"$1\" ] && [ -x \"$1\" ]; then echo " + ROOT_CHECK_OK
-  + "; else echo " + ROOT_CHECK_MISSING + "; fi"
+var ROOT_CHECK_INHOME = "root-inhome"
+var ROOT_CHECK_UNRESOLVED = "root-unresolved"
+var ROOT_CHECK_SCRIPT = [
+  "r=$1 h=$2",
+  "if [ -n \"$h\" ]; then",
+  "  rr=$(timeout -k 1 5 realpath -m -- \"$r\" 2>/dev/null && echo x) || { echo " + ROOT_CHECK_UNRESOLVED + "; exit 0; }",
+  "  hr=$(timeout -k 1 5 realpath -m -- \"$h\" 2>/dev/null && echo x) || { echo " + ROOT_CHECK_UNRESOLVED + "; exit 0; }",
+  "  rr=${rr%??} hr=${hr%??}",
+  "  case $rr in \"$h\"|\"$h\"/*) echo " + ROOT_CHECK_INHOME + "; exit 0;; esac",
+  "  if [ \"$hr\" != / ]; then case $rr in \"$hr\"|\"$hr\"/*) echo " + ROOT_CHECK_INHOME + "; exit 0;; esac; fi",
+  "fi",
+  "if [ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ]; then echo " + ROOT_CHECK_OK + "; else echo " + ROOT_CHECK_MISSING + "; fi"
+].join("\n")
 
 // A plain command (systemctl show, du, journalctl) bounded at the source: its
 // argv is "$@" after the token "$1" and the byte cap "$2", its stdout cut by
@@ -302,6 +320,19 @@ var ICON = {
 
 function isValidRemote(name) {
   return typeof name === "string" && REMOTE_RE.test(name)
+}
+
+// The home as every root validator compares it (tests/fixtures/homes.tsv,
+// shared with the TUI's validate::normalise_home and the scripts): runs of
+// "/" collapsed to one, every "." component dropped, every trailing "/"
+// dropped (".." kept as written). A home that normalises to "/" (or "") is
+// no home: "", and the home rule is skipped. Unlike cleanHome, a home with
+// "//" or "/./" in it is still a home here.
+function normaliseHome(home) {
+  if (typeof home !== "string") return ""
+  var parts = home.split("/").filter(function (p) { return p !== "" && p !== "." })
+  var h = (home.charAt(0) === "/" ? "/" : "") + parts.join("/")
+  return h === "/" ? "" : h
 }
 
 // A usable $HOME: absolute, no "." or ".." segment, no control character.
@@ -355,7 +386,7 @@ function isWellFormedText(s) {
 // the TUI's validate::is_valid_root and the scripts' valid_root): absolute;
 // not "/"; no empty, "." or ".." component (so no "//" and no trailing "/");
 // none of the bytes 0x00-0x20 and 0x7f, nor $ % \ " ' or a backquote (ASCII
-// only: "é" is allowed); not `home` nor inside it, component-wise (a root
+// only: "é" is allowed); not `home` (normaliseHome) nor inside it (a root
 // inside $HOME would be crawled by everything that walks the home
 // directory); at most ROOT_MAX_BYTES UTF-8 bytes; well-formed (no lone
 // surrogate) and without U+FFFD. The panel reads cloud.env as decoded text,
@@ -371,9 +402,8 @@ function isValidRoot(path, home) {
   var parts = path.split("/")
   for (var i = 1; i < parts.length; i++)
     if (parts[i] === "" || parts[i] === "." || parts[i] === "..") return false
-  var h = typeof home === "string" ? home : ""
-  while (h.length > 1 && h.charAt(h.length - 1) === "/") h = h.slice(0, -1)
-  if (h !== "" && h !== "/" && (path === h || path.indexOf(h + "/") === 0)) return false
+  var h = normaliseHome(home)
+  if (h !== "" && (path === h || path.indexOf(h + "/") === 0)) return false
   return true
 }
 
@@ -742,28 +772,34 @@ function logView(text, token) {
 }
 
 // The root check for a root that passed isValidRoot (the home rule skipped
-// only for a HOME that is "" or "/", as everywhere else): the
-// root as its own argument after the constant ROOT_CHECK_SCRIPT; [] otherwise.
+// only for a HOME that normalises to "" or "/", as everywhere else): the
+// root and the normalised home ("" for none) as their own arguments after
+// the constant ROOT_CHECK_SCRIPT; [] otherwise. `home` is $HOME as given
+// (not cleanHome's, which drops a home with "//" in it).
 function rootCheckArgv(root, home) {
-  if (!isValidRoot(root, cleanHome(home))) return []
-  return timeoutArgv().concat(["sh", "-c", ROOT_CHECK_SCRIPT, "cloud-mounts-root", root])
+  if (!isValidRoot(root, home)) return []
+  return timeoutArgv().concat(["sh", "-c", ROOT_CHECK_SCRIPT, "cloud-mounts-root", root, normaliseHome(home)])
 }
 
-// ROOT_CHECK_SCRIPT's answer: "ok", "missing", or "" (no answer: timed out,
-// or anything else), which claims nothing.
+// ROOT_CHECK_SCRIPT's answer: "ok", "missing", "inhome", "unresolved", or
+// "" (no answer: timed out, or anything else), which claims nothing.
 function parseRootCheck(text) {
   var s = String(text === undefined || text === null ? "" : text)
   if (s === ROOT_CHECK_OK + "\n") return "ok"
   if (s === ROOT_CHECK_MISSING + "\n") return "missing"
+  if (s === ROOT_CHECK_INHOME + "\n") return "inhome"
+  if (s === ROOT_CHECK_UNRESOLVED + "\n") return "unresolved"
   return ""
 }
 
-// While the root is not set up (rootStatus absent, invalid or missing), each
+// While the root is not set up (rootStatus absent, invalid, missing, inhome
+// or unresolved), each
 // poll re-reads the setting (settingArgv) and checks the root again, so the
 // notice clears on the next poll after Set up or the one-time sudo command.
 // Nothing extra runs once it is ready ("ok") or before anything is known ("").
 function rootNeedsReread(status) {
   return status === "absent" || status === "invalid" || status === "missing"
+    || status === "inhome" || status === "unresolved"
 }
 
 // SETTING_SCRIPT under `timeout -k`: the token and the path of the setting
@@ -977,7 +1013,8 @@ function parseRootSetting(lines) {
 
 // The setting as read by the last good scan: { state, path, value }, state
 // absent (no file, or no key) | invalid (fails isValidRoot for `home`; a
-// HOME that is "" or "/" skips only the home rule, as the scripts and the TUI do) |
+// HOME that normalises to "" or "/" skips only the home rule, as the scripts and the
+// TUI do; `home` is $HOME as given, normaliseHome applied by isValidRoot) |
 // valid; path is the root in use (the value when valid, else
 // DEFAULT_MOUNT_ROOT); value is the raw value, for display only. null before
 // a good scan, so nothing is claimed.
@@ -986,7 +1023,7 @@ function rootSetting(scan, home) {
   var st = scan.setting && typeof scan.setting === "object" ? scan.setting : { found: false, value: "" }
   if (st.found !== true) return { state: "absent", path: DEFAULT_MOUNT_ROOT, value: "" }
   var v = String(st.value === undefined || st.value === null ? "" : st.value)
-  if (!isValidRoot(v, cleanHome(home))) return { state: "invalid", path: DEFAULT_MOUNT_ROOT, value: v }
+  if (!isValidRoot(v, home)) return { state: "invalid", path: DEFAULT_MOUNT_ROOT, value: v }
   return { state: "valid", path: v, value: v }
 }
 
@@ -996,7 +1033,9 @@ function mountRoot(setting) {
 }
 
 // The root's state for the notice: "" (nothing known yet) | absent | invalid
-// | missing (valid, but not a directory this user can write) | ok. check is
+// | missing (valid, but not a directory this user can write) | inhome (valid,
+// but it resolves to the home or inside it) | unresolved (realpath failed)
+// | ok. check is
 // the last root check, { path, result } (parseRootCheck), and counts only for
 // the path it checked.
 function rootStatus(setting, check) {
@@ -1004,7 +1043,8 @@ function rootStatus(setting, check) {
   if (setting.state === "absent" || setting.state === "invalid") return setting.state
   if (setting.state !== "valid") return ""
   if (!check || check.path !== setting.path) return ""
-  return check.result === "ok" || check.result === "missing" ? check.result : ""
+  var known = ["ok", "missing", "inhome", "unresolved"]
+  return known.indexOf(check.result) >= 0 ? check.result : ""
 }
 
 // The one-time command that creates a root this user can write (the shared
@@ -1840,7 +1880,8 @@ function installNotice(v) {
 
 var INSTALL_NOTICE_NONE = "Installed parts: not installed — run install.sh"
 
-// The mount root not set up (rootStatus absent, invalid or missing): the
+// The mount root not set up (rootStatus absent, invalid, missing, inhome or
+// unresolved): the
 // line names the root and says to run Set up… (install.sh, which asks for
 // the root and prints the one-time command); for a missing root the line also
 // carries that command (setupCommand). "" for any other state. Shown only as
@@ -1859,6 +1900,12 @@ function rootNotice(status, setting) {
   if (status === "missing")
     return ROOT_NOTICE_PREFIX + path + " does not exist or is not writable — run Set up…, or create it once with: "
       + setupCommand(path)
+  if (status === "inhome")
+    return ROOT_NOTICE_PREFIX + path + " resolves inside your home (through a symbolic link): programs that crawl"
+      + " the home (file search, indexers, backups) would follow it into the cloud drive — run Set up… and choose"
+      + " a real folder outside your home"
+  if (status === "unresolved")
+    return ROOT_NOTICE_PREFIX + path + " could not be resolved, so it cannot be checked against your home — run Set up…"
   return ""
 }
 
@@ -1881,6 +1928,14 @@ function installTipLine(notice) {
   if (notice.indexOf(ROOT_NOTICE_PREFIX) === 0) return "Mount root not set up — open the panel"
   return "Installed parts out of date — open the panel"
 }
+
+// How the panel describes backups: plainly dated copies of single important
+// files, so nobody expects a folder to be backed up. The section keeps the
+// name "Backups".
+var BACKUPS_BLURB = "Dated copies of important files (single files, not folders)"
+var NOTHING_SET_UP_TEXT = "Nothing set up yet: no mounts, offline folders or backups (dated copies of important files)."
+  + " Configure… below sets them up."
+var CONFIGURE_TOOLTIP = "Mounts, offline folders and backups, dated copies of important files (omarchy-cloud)"
 
 var INSTALL_BUTTON_TEXT = "Update installed parts"
 var SETUP_BUTTON_TEXT = "Set up…"

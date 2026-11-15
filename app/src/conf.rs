@@ -299,32 +299,302 @@ pub fn files_template(job: &str, remote: &str) -> String {
     )
 }
 
-/// Checks a files list; returns the number of entries or the first bad line.
-/// Lines split on `\n` only, as the helper's `read`: a CRLF list keeps its
-/// `\r` and is rejected, as the helper rejects it (blank and comment lines
-/// are skipped first, as there).
-pub fn check_files_list(text: &str) -> Result<usize, String> {
-    let mut n = 0;
-    for (i, l) in text.split('\n').enumerate() {
-        let t = l.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        if has_control(l) {
-            return Err(format!(
-                "line {}: control character (a CRLF line ending? save the list with LF endings)",
-                i + 1
-            ));
-        }
-        if !is_valid_files_line(l) {
-            return Err(format!(
-                "line {}: paths must be relative (no leading or trailing /, no //, . or ..)",
-                i + 1
-            ));
-        }
-        n += 1;
+// ------------------------------------------------------------- files list
+//
+// ONE verdict for a files list, the one bin/rclone-backup's `load()` reaches
+// (`list` / `validate` exit 0 or 64); both sides are tested against the same
+// cases, tests/fixtures/files-lines.tsv. Where the helper's reading depends
+// on the locale (non-ASCII spaces, U+2028/U+2029), the app refuses the line:
+// stricter, never looser.
+
+/// The bytes `[[:space:]]` matches in the C locale.
+const C_SPACE: [char; 6] = [' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+
+/// A line rclone-backup skips: `^[[:space:]]*(#.*)?$`, as read in the C
+/// locale (a UTF-8 locale skips more: see `line_problem`).
+pub fn is_skipped_line(l: &str) -> bool {
+    let t = l.trim_start_matches(C_SPACE);
+    t.is_empty() || t.starts_with('#')
+}
+
+/// What is wrong with one line taken as an entry (a path), on its own: the
+/// helper's skip regex (a typed entry that it would read as a comment or a
+/// blank line is refused), `valid_rel`, and the length bound. None: a path.
+pub fn line_problem(l: &str) -> Option<&'static str> {
+    if is_skipped_line(l) {
+        let t = l.trim_start_matches(C_SPACE);
+        return Some(if t.starts_with('#') {
+            "starts with # (after any spaces): rclone-backup reads it as a comment"
+        } else {
+            "blank: rclone-backup skips blank lines"
+        });
     }
-    Ok(n)
+    let t = l.trim_start_matches(char::is_whitespace);
+    if t.is_empty() || t.starts_with('#') {
+        return Some(
+            "only spaces, or spaces then #: rclone-backup may read it as a blank or comment line (it depends on the locale)",
+        );
+    }
+    if has_control(l) {
+        return Some("control character (a CRLF line ending? save the list with LF endings)");
+    }
+    if l.contains(['\u{2028}', '\u{2029}']) {
+        return Some("a Unicode line or paragraph separator (U+2028, U+2029)");
+    }
+    if l.len() > crate::validate::MAX_TEXT {
+        return Some("longer than 1024 bytes");
+    }
+    if !is_valid_files_line(l) {
+        return Some("paths must be relative (no leading or trailing /, no //, . or ..)");
+    }
+    None
+}
+
+/// The copy name of an entry, as rclone-backup derives it: the path minus
+/// STRIP_PREFIX (a plain string prefix), `/` → `__`, split into stem and
+/// extension (the last `.x` of the file name, `^.+\.([^.]+)$`); the copy is
+/// `<job>@<stem>.<date><ext>`. Err: nothing (or only a `/…` rest) is left
+/// after STRIP_PREFIX.
+pub fn copy_name(line: &str, strip: &str) -> Result<(String, String), &'static str> {
+    let mut base = line;
+    if !strip.is_empty()
+        && let Some(rest) = base.strip_prefix(strip)
+    {
+        base = rest;
+    }
+    if base.is_empty() || base.starts_with('/') {
+        return Err("nothing left after STRIP_PREFIX");
+    }
+    let base = base.replace('/', "__");
+    let last = line.rsplit('/').next().unwrap_or(line);
+    let ext = match last.rfind('.') {
+        Some(i) if i > 0 && i + 1 < last.len() => &last[i..],
+        _ => "",
+    };
+    let stem = base.strip_suffix(ext).unwrap_or(&base).to_string();
+    Ok((stem, ext.to_string()))
+}
+
+/// Why an entry of a files list is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryProblem {
+    /// The line itself breaks a rule (`line_problem`, `copy_name`).
+    Line(&'static str),
+    /// Same copy name as the entry at this index (the earlier one).
+    SameCopyName(usize),
+}
+
+/// The verdict of every entry, in order (None: fine), as the helper reads
+/// them: each line on its own, then its copy name against those of the
+/// earlier valid entries.
+pub fn entry_verdicts(entries: &[&str], strip: &str) -> Vec<Option<EntryProblem>> {
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            if let Some(r) = line_problem(e) {
+                return Some(EntryProblem::Line(r));
+            }
+            let key = match copy_name(e, strip) {
+                Ok((stem, ext)) => stem + &ext,
+                Err(r) => return Some(EntryProblem::Line(r)),
+            };
+            if let Some((_, j)) = seen.iter().find(|(k, _)| *k == key) {
+                return Some(EntryProblem::SameCopyName(*j));
+            }
+            seen.push((key, i));
+            None
+        })
+        .collect()
+}
+
+/// Checks a files list under STRIP_PREFIX `strip` (empty: none); returns
+/// the number of entries or the first bad line. Lines split on `\n` only,
+/// as the helper's `read`: a CRLF list keeps its `\r` and is rejected, as
+/// the helper rejects it (blank and comment lines are skipped first, as
+/// there). An empty list is not refused here (`files_list_verdict` does).
+pub fn check_files_list(text: &str, strip: &str) -> Result<usize, String> {
+    let lines: Vec<(usize, &str)> = text
+        .split('\n')
+        .enumerate()
+        .filter(|(_, l)| !is_skipped_line(l))
+        .collect();
+    let entries: Vec<&str> = lines.iter().map(|(_, l)| *l).collect();
+    for (k, v) in entry_verdicts(&entries, strip).iter().enumerate() {
+        let why = match v {
+            None => continue,
+            Some(EntryProblem::Line(r)) => r.to_string(),
+            Some(EntryProblem::SameCopyName(j)) => {
+                format!("same copy name as line {}", lines[*j].0 + 1)
+            }
+        };
+        return Err(format!("line {}: {why}", lines[k].0 + 1));
+    }
+    Ok(entries.len())
+}
+
+/// One line of a files list as the in-app list keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListLine {
+    /// A comment or blank line (`is_skipped_line`): kept in place, unseen.
+    Kept(String),
+    /// A path (valid or not).
+    Entry(String),
+}
+
+/// A files list being edited: its lines in file order. Entries are
+/// addressed by their index among the entries. Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesList {
+    pub lines: Vec<ListLine>,
+}
+
+impl FilesList {
+    /// Splits on `\n` (a final `\n` ends the last line); a comment or
+    /// blank line loses a trailing `\r` (the list is written with LF
+    /// endings; the helper skips it either way), an entry keeps it (and is
+    /// flagged).
+    pub fn parse(text: &str) -> FilesList {
+        let mut parts: Vec<&str> = text.split('\n').collect();
+        if parts.last() == Some(&"") {
+            parts.pop();
+        }
+        let lines = parts
+            .into_iter()
+            .map(|l| {
+                if is_skipped_line(l) {
+                    ListLine::Kept(l.strip_suffix('\r').unwrap_or(l).to_string())
+                } else {
+                    ListLine::Entry(l.to_string())
+                }
+            })
+            .collect();
+        FilesList { lines }
+    }
+
+    pub fn entries(&self) -> Vec<&str> {
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                ListLine::Entry(e) => Some(e.as_str()),
+                ListLine::Kept(_) => None,
+            })
+            .collect()
+    }
+
+    fn line_of(&self, entry: usize) -> Option<usize> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l, ListLine::Entry(_)))
+            .nth(entry)
+            .map(|(i, _)| i)
+    }
+
+    /// Appends an entry; returns its index.
+    pub fn add(&mut self, e: String) -> usize {
+        self.lines.push(ListLine::Entry(e));
+        self.entries().len() - 1
+    }
+
+    /// Replaces entry `i` in place.
+    pub fn set(&mut self, i: usize, e: String) {
+        if let Some(n) = self.line_of(i) {
+            self.lines[n] = ListLine::Entry(e);
+        }
+    }
+
+    /// Drops entry `i`.
+    pub fn remove(&mut self, i: usize) {
+        if let Some(n) = self.line_of(i) {
+            self.lines.remove(n);
+        }
+    }
+
+    /// The file: every line, each ended by `\n`.
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        for l in &self.lines {
+            match l {
+                ListLine::Kept(t) | ListLine::Entry(t) => s.push_str(t),
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    pub fn verdicts(&self, strip: &str) -> Vec<Option<EntryProblem>> {
+        entry_verdicts(&self.entries(), strip)
+    }
+
+    /// The verdict of `text` typed as entry `at` (None: a new one, appended),
+    /// against the rest of the list: its own problem, else a clash of copy
+    /// names with any other entry (earlier or later).
+    pub fn try_entry(&self, at: Option<usize>, text: &str, strip: &str) -> Option<EntryProblem> {
+        let mut entries = self.entries();
+        let i = match at {
+            Some(i) if i < entries.len() => {
+                entries[i] = text;
+                i
+            }
+            _ => {
+                entries.push(text);
+                entries.len() - 1
+            }
+        };
+        let v = entry_verdicts(&entries, strip);
+        if let Some(p) = &v[i] {
+            return Some(p.clone());
+        }
+        v.iter()
+            .position(|p| *p == Some(EntryProblem::SameCopyName(i)))
+            .map(EntryProblem::SameCopyName)
+    }
+
+    /// Why entry `p` is refused, in words (`entries` as the list has them).
+    pub fn problem_text(&self, p: &EntryProblem) -> String {
+        match p {
+            EntryProblem::Line(r) => r.to_string(),
+            EntryProblem::SameCopyName(j) => format!(
+                "same copy name as {}",
+                self.entries().get(*j).copied().unwrap_or("another entry")
+            ),
+        }
+    }
+
+    /// May the list be saved: at least one entry, none refused. The error
+    /// names the first refused entry.
+    pub fn save_check(&self, strip: &str) -> Result<usize, String> {
+        let entries = self.entries();
+        if entries.is_empty() {
+            return Err("The list names no file: press a to add one".into());
+        }
+        for (i, v) in self.verdicts(strip).iter().enumerate() {
+            if let Some(p) = v {
+                return Err(format!(
+                    "Not saved: entry {} ({}) is refused: {} — fix it (Enter) or remove it (d)",
+                    i + 1,
+                    shown(entries[i]),
+                    self.problem_text(p)
+                ));
+            }
+        }
+        Ok(entries.len())
+    }
+}
+
+/// An entry as shown on screen: control characters spelled out (`\r`).
+pub fn shown(e: &str) -> String {
+    e.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -484,19 +754,197 @@ mod tests {
 
     #[test]
     fn files_lists() {
-        assert_eq!(check_files_list(&files_template("j", "r:")).unwrap(), 0);
-        assert_eq!(check_files_list("# c\na/b.kdbx\n\nc.key\n").unwrap(), 2);
-        assert!(check_files_list("/abs\n").is_err());
-        assert!(check_files_list("a/../b\n").is_err());
+        assert_eq!(check_files_list(&files_template("j", "r:"), "").unwrap(), 0);
+        assert_eq!(check_files_list("# c\na/b.kdbx\n\nc.key\n", "").unwrap(), 2);
+        assert!(check_files_list("/abs\n", "").is_err());
+        assert!(check_files_list("a/../b\n", "").is_err());
         // CRLF: the helper's `read` keeps the \r and rejects the line.
-        let e = check_files_list("# c\r\na/b.kdbx\r\n").unwrap_err();
+        let e = check_files_list("# c\r\na/b.kdbx\r\n", "").unwrap_err();
         assert!(e.starts_with("line 2: control character"), "{e}");
-        assert!(check_files_list("a\x1b.kdbx\n").is_err());
+        assert!(check_files_list("a\x1b.kdbx\n", "").is_err());
         // Blank and comment lines with a \r are skipped, as there.
-        assert_eq!(check_files_list("\r\n# c\r\na.kdbx\n").unwrap(), 1);
-        assert_eq!(check_files_list("a.kdbx").unwrap(), 1);
+        assert_eq!(check_files_list("\r\n# c\r\na.kdbx\n", "").unwrap(), 1);
+        assert_eq!(check_files_list("a.kdbx", "").unwrap(), 1);
         for bad in ["./a\n", "a//b\n", "dir/\n"] {
-            assert!(check_files_list(bad).is_err(), "{bad:?}");
+            assert!(check_files_list(bad, "").is_err(), "{bad:?}");
         }
+        // The duplicate names the earlier line, as the helper does.
+        assert_eq!(
+            check_files_list("# h\nacme/A/B.kdbx\n\nA/B.kdbx\n", "acme/").unwrap_err(),
+            "line 4: same copy name as line 2"
+        );
+        assert_eq!(
+            check_files_list("acme/x\n", "acme").unwrap_err(),
+            "line 1: nothing left after STRIP_PREFIX"
+        );
+    }
+
+    /// Decodes a fixture field: \t \r \\ \xHH (bytes, UTF-8 as a whole), as
+    /// the scripts test decodes it with printf %b; any other escape is a
+    /// fixture error.
+    fn unescape(f: &str) -> String {
+        let b = f.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\\' {
+                out.push(b[i]);
+                i += 1;
+                continue;
+            }
+            match b.get(i + 1) {
+                Some(b't') => out.push(b'\t'),
+                Some(b'r') => out.push(b'\r'),
+                Some(b'\\') => out.push(b'\\'),
+                Some(b'x') => {
+                    let h = std::str::from_utf8(&b[i + 2..i + 4]).unwrap();
+                    out.push(u8::from_str_radix(h, 16).unwrap());
+                    i += 2;
+                }
+                _ => panic!("fixture escape in {f:?}"),
+            }
+            i += 2;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn files_lines_fixture() {
+        let text = include_str!("../../tests/fixtures/files-lines.tsv");
+        let mut n = 0;
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let mut f = line.split('\t');
+            let kind = f.next().unwrap();
+            let strip = match f.next().unwrap() {
+                "-" => String::new(),
+                s => unescape(s),
+            };
+            let lines: Vec<String> = f.map(unescape).collect();
+            assert!(!lines.is_empty(), "{line:?}");
+            let list: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            let checked = check_files_list(&list, &strip).is_ok_and(|n| n > 0);
+            let model = FilesList::parse(&list);
+            let saved = model.save_check(&strip);
+            assert_eq!(checked, saved.is_ok(), "{line:?}: {saved:?}");
+            // Written back, the list keeps its verdict.
+            let again = FilesList::parse(&model.render()).save_check(&strip);
+            assert_eq!(saved.is_ok(), again.is_ok(), "{line:?}");
+            match kind {
+                "valid" => assert!(checked, "{line:?}: {saved:?}"),
+                "invalid" | "stricter" => assert!(!checked, "{line:?}"),
+                k => panic!("unknown kind {k}"),
+            }
+            n += 1;
+        }
+        assert!(n >= 40, "{n} cases");
+    }
+
+    #[test]
+    fn typed_entries() {
+        // What the helper would skip is refused as an entry, with why.
+        for (e, why) in [
+            ("", "blank"),
+            ("   ", "blank"),
+            ("# x", "comment"),
+            ("  #x.kdbx", "comment"),
+            ("\t#x", "comment"),
+            ("\u{2003}", "locale"),
+            ("\u{3000}#x", "locale"),
+            ("\u{a0}", "locale"),
+            ("a\rb", "control"),
+            ("a\u{2028}b", "separator"),
+            ("/a", "relative"),
+            ("a/", "relative"),
+        ] {
+            let p = line_problem(e).unwrap_or_else(|| panic!("{e:?} accepted"));
+            assert!(p.contains(why), "{e:?}: {p}");
+        }
+        assert!(line_problem(&"a".repeat(1025)).unwrap().contains("1024"));
+        for ok in [
+            "a.kdbx",
+            "a #b",
+            " a",
+            "Segurança/x.kdbx",
+            &"a".repeat(1024),
+        ] {
+            assert_eq!(line_problem(ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn copy_names_follow_the_helper() {
+        let c = |l: &str, s: &str| copy_name(l, s).map(|(a, b)| format!("{a}|{b}"));
+        assert_eq!(c("acme/A/B/C.kdbx", "acme/"), Ok("A__B__C|.kdbx".into()));
+        assert_eq!(c("Team.old.kdbx", ""), Ok("Team.old|.kdbx".into()));
+        assert_eq!(c(".hidden", ""), Ok(".hidden|".into()));
+        assert_eq!(c("a.", ""), Ok("a.|".into()));
+        assert_eq!(c("d.x/README", ""), Ok("d.x__README|".into()));
+        assert_eq!(c("..b", ""), Ok(".|.b".into()));
+        // STRIP_PREFIX is a plain string prefix, and may cut into the
+        // extension: the stem is then the whole rest.
+        assert_eq!(c("acme.kdbx", "acme.kd"), Ok("bx|.kdbx".into()));
+        assert_eq!(c("other/x", "acme/"), Ok("other__x|".into()));
+        assert!(c("acme/x", "acme").is_err());
+        assert!(c("acme/", "acme/").is_err());
+    }
+
+    #[test]
+    fn files_list_model() {
+        let text = "# Files backed up by job j\r\n\nold/a.kdbx\n# mid\nb.kdbx\r\nc.kdbx";
+        let mut m = FilesList::parse(text);
+        assert_eq!(m.entries(), ["old/a.kdbx", "b.kdbx\r", "c.kdbx"]);
+        // The CRLF entry is flagged; the others are fine.
+        let v = m.verdicts("");
+        assert_eq!(v[0], None);
+        assert!(matches!(v[1], Some(EntryProblem::Line(r)) if r.starts_with("control")));
+        let e = m.save_check("").unwrap_err();
+        assert!(e.contains("entry 2 (b.kdbx\\r)"), "{e}");
+        // Edited in place, removed, added at the end; comments stay put,
+        // LF endings.
+        m.set(1, "b.kdbx".into());
+        m.remove(0);
+        assert_eq!(m.add("new/d.kdbx".into()), 2);
+        assert_eq!(
+            m.render(),
+            "# Files backed up by job j\n\n# mid\nb.kdbx\nc.kdbx\nnew/d.kdbx\n"
+        );
+        assert_eq!(m.save_check(""), Ok(3));
+        assert_eq!(check_files_list(&m.render(), ""), Ok(3));
+        // A typed entry clashing with an earlier or a later one.
+        assert_eq!(
+            m.try_entry(None, "x/c.kdbx", "x/"),
+            Some(EntryProblem::SameCopyName(1))
+        );
+        assert_eq!(
+            m.try_entry(Some(0), "new/d.kdbx", ""),
+            Some(EntryProblem::SameCopyName(2))
+        );
+        assert_eq!(m.try_entry(Some(1), "c.kdbx", ""), None);
+        assert_eq!(
+            m.problem_text(&EntryProblem::SameCopyName(2)),
+            "same copy name as new/d.kdbx"
+        );
+        assert_eq!(
+            m.try_entry(None, "# x", ""),
+            Some(EntryProblem::Line(line_problem("# x").unwrap()))
+        );
+        // A new job: the template header, no entry, not savable.
+        let t = FilesList::parse(&files_template("j", "r:"));
+        assert!(t.entries().is_empty());
+        assert!(t.save_check("").unwrap_err().contains("names no file"));
+        assert_eq!(t.render(), files_template("j", "r:"));
+        let mut one = t.clone();
+        one.add("a.kdbx".into());
+        assert_eq!(
+            one.render(),
+            format!("{}a.kdbx\n", files_template("j", "r:"))
+        );
+        // Removing past the end is a no-op.
+        one.remove(5);
+        assert_eq!(one.entries(), ["a.kdbx"]);
+        assert_eq!(shown("a\rb\u{2028}"), "a\\rb\\u{2028}");
     }
 }

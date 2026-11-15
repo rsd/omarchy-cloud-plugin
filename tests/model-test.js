@@ -1527,6 +1527,93 @@ test("D1 roots: every line of tests/fixtures/roots.tsv, HOME=/home/tester", () =
   assert.ok(!model.isValidRoot("/", ""))
 })
 
+// The lines of a tab-separated fixture, "#" lines and empty lines skipped.
+const tsvCases = (name) => fs.readFileSync(path.join(pluginDir, "tests/fixtures", name), "utf8")
+  .split("\n").filter(l => l !== "" && l[0] !== "#").map(l => l.split("\t"))
+
+test("D1 homes: every line of tests/fixtures/homes.tsv, the home normalised the same everywhere", () => {
+  let n = 0
+  for (const [kind, home, root] of tsvCases("homes.tsv")) {
+    assert.ok(kind === "valid" || kind === "invalid", kind)
+    const want = kind === "valid"
+    const shown = JSON.stringify([home, root])
+    assert.strictEqual(model.isValidRoot(root, home), want, shown)
+    // The panel's real path: the setting through rootSetting, and the check
+    // run only for a valid one.
+    const env = Buffer.from("OMARCHY_CLOUD_ROOT=" + root + "\n")
+    const scan = model.parseScan(settingOutput(env, false), TOKEN, model.scanDirs("/home/tester", "/home/tester/.local/state"))
+    assert.strictEqual(model.rootSetting(scan, home).state, want ? "valid" : "invalid", "scan " + shown)
+    assert.strictEqual(model.rootCheckArgv(root, home).length > 0, want, "check " + shown)
+    n++
+  }
+  assert.ok(n >= 17, "fixture read: " + n)
+  assert.strictEqual(model.normaliseHome("/home//u/./"), "/home/u")
+  assert.strictEqual(model.normaliseHome("/home/../u"), "/home/../u", ".. kept as written")
+  for (const none of ["", "/", "//", "/./", "/.", null, undefined, 1]) assert.strictEqual(model.normaliseHome(none), "", String(none))
+})
+
+test("D1 resolved roots: every line of tests/fixtures/resolved-roots.tsv through the real ROOT_CHECK_SCRIPT", () => {
+  const cp = require("child_process")
+  const os = require("os")
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "resolved-")))
+  let n = 0, valid = 0
+  try {
+    for (const [kind, setup, rel] of tsvCases("resolved-roots.tsv")) {
+      assert.ok(kind === "valid" || kind === "invalid", kind)
+      const t = path.join(base, "case" + n)
+      fs.mkdirSync(t)
+      const steps = setup === "-" ? [] : setup.split(";")
+      if (!steps.some(s => s.startsWith("link:home="))) fs.mkdirSync(path.join(t, "home"))
+      for (const step of steps) {
+        if (step.startsWith("dir:")) fs.mkdirSync(path.join(t, step.slice(4)), { recursive: true })
+        else if (step.startsWith("link:")) {
+          const eq = step.indexOf("=")
+          const at = path.join(t, step.slice(5, eq))
+          const target = step.slice(eq + 1)
+          fs.mkdirSync(path.dirname(at), { recursive: true })
+          fs.symlinkSync(target.startsWith("@/") ? path.join(t, target.slice(2)) : target, at)
+        } else assert.fail("bad fixture step " + step)
+      }
+      const home = path.join(t, "home"), root = path.join(t, rel)
+      const shown = JSON.stringify([kind, setup, rel])
+      assert.ok(model.isValidRoot(root, home), "T must pass valid_root: " + shown)
+      const a = model.rootCheckArgv(root, home)
+      const got = model.parseRootCheck(cp.spawnSync(a[0], a.slice(1), { encoding: "utf8" }).stdout)
+      if (kind === "valid") {
+        assert.ok(got === "ok" || got === "missing", shown + ": " + got)
+        valid++
+      } else assert.strictEqual(got, "inhome", shown)
+      n++
+    }
+    // A realpath that fails: refused as unresolved, not judged ok.
+    const stub = path.join(base, "stub")
+    fs.mkdirSync(stub)
+    fs.writeFileSync(path.join(stub, "realpath"), "#!/bin/sh\nexit 1\n", { mode: 0o755 })
+    fs.mkdirSync(path.join(base, "plain"))
+    const a = model.rootCheckArgv(path.join(base, "plain"), path.join(base, "case0", "home"))
+    const env = Object.assign({}, process.env, { PATH: stub + ":" + process.env.PATH })
+    assert.strictEqual(model.parseRootCheck(cp.spawnSync(a[0], a.slice(1), { encoding: "utf8", env }).stdout), "unresolved")
+    // The home as written counts on its own: a resolver that puts the home
+    // elsewhere still refuses a root resolving under the written one.
+    const stub2 = path.join(base, "stub2")
+    fs.mkdirSync(stub2)
+    fs.writeFileSync(path.join(stub2, "realpath"), "#!/bin/sh\ncase $3 in */home) echo /elsewhere;; *) exec /usr/bin/realpath \"$@\";; esac\n", { mode: 0o755 })
+    fs.mkdirSync(path.join(base, "h", "home", "Cloud"), { recursive: true })
+    fs.symlinkSync(path.join(base, "h", "home", "Cloud"), path.join(base, "ln"))
+    const c = model.rootCheckArgv(path.join(base, "ln"), path.join(base, "h", "home"))
+    const env2 = Object.assign({}, process.env, { PATH: stub2 + ":" + process.env.PATH })
+    assert.strictEqual(model.parseRootCheck(cp.spawnSync(c[0], c.slice(1), { encoding: "utf8", env: env2 }).stdout), "inhome")
+    // No home: nothing resolved, the directory check only.
+    const b = model.rootCheckArgv(path.join(base, "plain"), "/")
+    assert.strictEqual(model.parseRootCheck(cp.spawnSync(b[0], b.slice(1), { encoding: "utf8", env }).stdout), "ok")
+  } finally { fs.rmSync(base, { recursive: true, force: true }) }
+  assert.ok(n >= 16 && valid >= 6 && n - valid >= 10, "fixture read: " + n + " (" + valid + " valid)")
+  // The verdict reaches the notice.
+  const setting = { state: "valid", path: "/mnt/cloud", value: "/mnt/cloud" }
+  assert.strictEqual(model.rootStatus(setting, { path: "/mnt/cloud", result: "inhome" }), "inhome")
+  assert.ok(model.rootNotice("inhome", setting).startsWith("Mount root not set up: /mnt/cloud resolves inside your home"))
+})
+
 // A scan with the setting file `content` (undefined: no file).
 const scanWithSetting = (content, o) => {
   const opt = o || {}
@@ -1591,21 +1678,26 @@ test("D1 the root is parsed from cloud.env (never sourced) and mountPath follows
 
 test("D1 the root check: the root as its own argument, never in the script", () => {
   const argv = model.rootCheckArgv("/srv/cloud", "/home/tester")
-  assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.ROOT_CHECK_SCRIPT, "cloud-mounts-root", "/srv/cloud"])
-  assert.ok(/^if \[ -d "\$1" \] && \[ -w "\$1" \] && \[ -x "\$1" \]; then echo root-ok; else echo root-missing; fi$/.test(model.ROOT_CHECK_SCRIPT), model.ROOT_CHECK_SCRIPT)
+  assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.ROOT_CHECK_SCRIPT, "cloud-mounts-root", "/srv/cloud", "/home/tester"])
+  assert.ok(/^r=\$1 h=\$2\n/.test(model.ROOT_CHECK_SCRIPT), model.ROOT_CHECK_SCRIPT)
+  assert.ok(/\nif \[ -d "\$r" \] && \[ -w "\$r" \] && \[ -x "\$r" \]; then echo root-ok; else echo root-missing; fi$/.test(model.ROOT_CHECK_SCRIPT), model.ROOT_CHECK_SCRIPT)
+  // The helpers' own resolver, for the root and the home.
+  assert.strictEqual((model.ROOT_CHECK_SCRIPT.match(/timeout -k 1 5 realpath -m -- /g) || []).length, 2)
+  // The home as its own argument, normalised; "" for none.
+  assert.deepStrictEqual(model.rootCheckArgv("/srv/cloud", "/home//tester/./").slice(-2), ["/srv/cloud", "/home/tester"])
   // Only a valid root (the home rule included) is ever checked.
   for (const c of rootCases()) {
     const root = c.text
     const a = model.rootCheckArgv(root, "/home/tester")
     if (c.kind === "valid") {
-      assert.strictEqual(a[a.length - 1], root, root)
+      assert.strictEqual(a[a.length - 2], root, root)
       assert.strictEqual(a.filter(x => x.includes(root)).length, 1, "the root is one element: " + root)
       assert.ok(!model.ROOT_CHECK_SCRIPT.includes(root))
     } else assert.deepStrictEqual(a, [], JSON.stringify(root))
   }
   // A HOME that is "" or "/" skips only the home rule, as bash and Rust do.
   for (const h of ["", "/"]) {
-    assert.deepStrictEqual(model.rootCheckArgv("/srv/cloud", h).slice(-1), ["/srv/cloud"], "HOME " + JSON.stringify(h))
+    assert.deepStrictEqual(model.rootCheckArgv("/srv/cloud", h).slice(-2), ["/srv/cloud", ""], "HOME " + JSON.stringify(h))
     assert.deepStrictEqual(model.rootCheckArgv("/srv/a/../b", h), [], "still the other rules")
   }
   // Through a real sh: a writable dir is ok, a missing or read-only one is
@@ -1631,7 +1723,11 @@ test("D1 the root check: the root as its own argument, never in the script", () 
     assert.strictEqual(check(crafted), "missing")
     assert.ok(!fs.existsSync(path.join(tmp, "PWNED2")) && !fs.readdirSync(tmp).some(f => /PWNED/.test(f)), "nothing in the root ran")
   } finally { fs.rmSync(tmp, { recursive: true, force: true }) }
-  for (const bad of ["", "root-ok", "root-ok\nroot-ok\n", "ok\n", null, "root-missing \n"]) assert.strictEqual(model.parseRootCheck(bad), "", String(bad))
+  for (const bad of ["", "root-ok", "root-ok\nroot-ok\n", "ok\n", null, "root-missing \n", "root-inhome", "inhome\n", "root-inhome\nroot-ok\n", "root-unresolved \n"]) assert.strictEqual(model.parseRootCheck(bad), "", String(bad))
+  assert.strictEqual(model.parseRootCheck("root-ok\n"), "ok")
+  assert.strictEqual(model.parseRootCheck("root-missing\n"), "missing")
+  assert.strictEqual(model.parseRootCheck("root-inhome\n"), "inhome")
+  assert.strictEqual(model.parseRootCheck("root-unresolved\n"), "unresolved")
   // The status: absent / invalid from the setting; a valid one by its check,
   // and only the check of that path.
   const valid = { state: "valid", path: "/srv/cloud", value: "/srv/cloud" }
@@ -1642,6 +1738,9 @@ test("D1 the root check: the root as its own argument, never in the script", () 
   assert.strictEqual(model.rootStatus(valid, { path: "/srv/old", result: "ok" }), "")
   assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "missing" }), "missing")
   assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "ok" }), "ok")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "inhome" }), "inhome")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "unresolved" }), "unresolved")
+  assert.strictEqual(model.rootStatus(valid, { path: "/srv/cloud", result: "bogus" }), "")
 })
 
 test("D5 the notice: not installed, mount root not set up, out of date; Set up… while not installed", () => {
@@ -1660,6 +1759,11 @@ test("D5 the notice: not installed, mount root not set up, out of date; Set up�
     "Mount root not set up: the setting (empty) in ~/.config/omarchy-cloud/cloud.env is not a valid root — run Set up…")
   assert.strictEqual(model.setupNotice(vOk, "missing", valid),
     "Mount root not set up: /srv/cloud does not exist or is not writable — run Set up…, or create it once with: sudo install -d -o \"$USER\" -m 755 '/srv/cloud'")
+  assert.strictEqual(model.setupNotice(vOk, "inhome", valid),
+    "Mount root not set up: /srv/cloud resolves inside your home (through a symbolic link): programs that crawl the home (file search, indexers, backups) would follow it into the cloud drive — run Set up… and choose a real folder outside your home")
+  assert.strictEqual(model.setupNotice(vOk, "unresolved", valid),
+    "Mount root not set up: /srv/cloud could not be resolved, so it cannot be checked against your home — run Set up…")
+  assert.strictEqual(model.installTipLine(model.setupNotice(vOk, "inhome", valid)), "Mount root not set up — open the panel")
   assert.strictEqual(model.setupNotice(vOk, "ok", valid), "")
   assert.strictEqual(model.setupNotice(vOk, "", null), "", "nothing claimed before the scan")
   // Nothing installed comes first; then the root; then the version.
@@ -1671,7 +1775,7 @@ test("D5 the notice: not installed, mount root not set up, out of date; Set up�
   assert.strictEqual(model.SETUP_BUTTON_TEXT, "Set up…")
   assert.strictEqual(model.installButtonText(vNone, ""), "Set up…")
   assert.strictEqual(model.installButtonText(vNone, "ok"), "Set up…")
-  for (const st of ["absent", "invalid", "missing"]) assert.strictEqual(model.installButtonText(vOk, st), "Set up…", st)
+  for (const st of ["absent", "invalid", "missing", "inhome", "unresolved"]) assert.strictEqual(model.installButtonText(vOk, st), "Set up…", st)
   assert.strictEqual(model.installButtonText(vOld, "ok"), "Update installed parts")
   assert.strictEqual(model.installButtonText(vOld, ""), "Update installed parts")
   // The tooltip (a shell component with no plain-text setting) gets a fixed
@@ -1691,6 +1795,20 @@ test("D5 the notice: not installed, mount root not set up, out of date; Set up�
   }
 })
 
+test("backups are described as dated copies of important files, never folders", () => {
+  const bar = qmlCode("BarWidget.qml")
+  assert.strictEqual(model.BACKUPS_BLURB, "Dated copies of important files (single files, not folders)")
+  assert.strictEqual(model.NOTHING_SET_UP_TEXT,
+    "Nothing set up yet: no mounts, offline folders or backups (dated copies of important files). Configure… below sets them up.")
+  assert.strictEqual(model.CONFIGURE_TOOLTIP, "Mounts, offline folders and backups, dated copies of important files (omarchy-cloud)")
+  // The section keeps its name, the blurb right under its header.
+  assert.ok(/text: "BACKUPS"[\s\S]{0,120}\}\s*Text \{\s*width: parent\.width\s*text: Model\.BACKUPS_BLURB\s*textFormat: Text\.PlainText/.test(bar))
+  assert.ok(/\? Model\.NOTHING_SET_UP_TEXT/.test(bar) && /tooltipText: Model\.CONFIGURE_TOOLTIP/.test(bar))
+  // No other backup wording in the panel's strings.
+  const strings = (bar + model.BACKUPS_BLURB).match(/"[^"\n]*[Bb]ackup[^"\n]*"/g) || []
+  assert.deepStrictEqual(strings.filter(x => !/^"(BACKUPS|backups|backup)"$/.test(x)), [], "every backup string is one of the constants")
+})
+
 test("D5 the panel: the same button, its label from the model, run only on a click", () => {
   const bar = qmlCode("BarWidget.qml")
   const state = qmlCode("CloudState.qml")
@@ -1703,12 +1821,17 @@ test("D5 the panel: the same button, its label from the model, run only on a cli
   assert.strictEqual((bar.match(/Model\.installArgv\(/g) || []).length, 1)
   assert.ok(!/installArgv/.test(state))
   // The singleton: the setting from the scan, the root in use, the check.
-  assert.ok(/readonly property var rootSetting: root\.scanned \? Model\.rootSetting\(root\.scanData, root\.home\) : null/.test(state))
+  assert.ok(/readonly property var rootSetting: root\.scanned \? Model\.rootSetting\(root\.scanData, root\.rootHome\) : null/.test(state))
+  // The root rule's home is $HOME normalised, not cleanHome's (which is ""
+  // for a HOME with "//" in it and would skip the home rule).
+  assert.ok(/readonly property string rootHome: Model\.normaliseHome\(Quickshell\.env\("HOME"\)\)/.test(state))
+  assert.ok(/var setting = Model\.rootSetting\(root\.scanData, root\.rootHome\)/.test(state))
+  assert.ok(!/Model\.(rootSetting|rootCheckArgv)\([^)]*root\.home\)/.test(state), "no root rule with cleanHome's home")
   assert.ok(/readonly property string mountRoot: Model\.mountRoot\(root\.rootSetting\)/.test(state))
   assert.ok(/readonly property string rootStatus: Model\.rootStatus\(root\.rootSetting, root\.rootCheck\)/.test(state))
   assert.ok(/root\.scanned = true\s*root\.recheckRoot\(\)/.test(state), "checked after each good scan")
   assert.ok(/if \(!setting \|\| setting\.state !== "valid"\) return/.test(state))
-  assert.ok(/var argv = Model\.rootCheckArgv\(setting\.path, root\.home\)\s*if \(argv\.length === 0\) return\s*rootProc\.path = setting\.path\s*rootProc\.command = argv/.test(state))
+  assert.ok(/var argv = Model\.rootCheckArgv\(setting\.path, root\.rootHome\)\s*if \(argv\.length === 0\) return\s*rootProc\.path = setting\.path\s*rootProc\.command = argv/.test(state))
   assert.ok(/if \(rootProc\.running\) \{ root\.rootPending = true; return \}/.test(state))
   // The stop checks use the root in use.
   assert.ok(/Model\.fuserArgv\(row\.name, CloudState\.mountRoot\)/.test(bar))
@@ -1717,7 +1840,7 @@ test("D5 the panel: the same button, its label from the model, run only on a cli
 
 test("D5 the root notice clears on the next poll after Set up or the sudo command", () => {
   // Only a root that is not set up costs a poll anything extra.
-  for (const s of ["absent", "invalid", "missing"]) assert.strictEqual(model.rootNeedsReread(s), true, s)
+  for (const s of ["absent", "invalid", "missing", "inhome", "unresolved"]) assert.strictEqual(model.rootNeedsReread(s), true, s)
   for (const s of ["ok", "", undefined, null]) assert.strictEqual(model.rootNeedsReread(s), false, String(s))
   // The read is SCAN_SCRIPT's own, the path its own argument.
   const argv = model.settingArgv("/home/tester", TOKEN)

@@ -1,0 +1,79 @@
+# Files-list cases: the ONE set every files-list verdict is tested against
+# (Rust conf::check_files_list and conf::FilesList::save_check, through the
+# app's in-screen list and its finish check; bin/rclone-backup `list`, whose
+# load() is also what `validate` and `run` read).
+#
+# Format: <kind><TAB><strip><TAB><line>[<TAB><line>...]
+#   kind   valid    the app accepts the list; `rclone-backup list` exits 0
+#                   (in the C locale and in C.UTF-8);
+#          invalid  the app refuses it; `rclone-backup list` exits 64 (both
+#                   locales); an empty list (no entry) is invalid;
+#          stricter the app refuses it, `rclone-backup list` in the C locale
+#                   exits 0: a line the helper reads differently per locale
+#                   (non-ASCII spaces, U+0085, U+2028), so the app never
+#                   accepts what one locale would skip or refuse.
+#   strip  the job's STRIP_PREFIX (a STRIP_PREFIX= line in its conf); "-" for
+#          none.
+#   line   the lines of the files list, in order, each written with a final
+#          LF; several fields make a list of several lines (duplicate copy
+#          names). An empty field is a blank line. Escapes: \t tab, \r
+#          carriage return, \\ backslash, \xHH one byte (UTF-8 for
+#          non-ASCII); no other backslash sequence.
+# Lines starting with "#" (this header) are comments.
+valid	-	a.kdbx
+valid	-	acme/Admin/Team.kdbx
+valid	-	Segurança/Team.kdbx
+valid	-	.hidden
+valid	-	README
+valid	-	a..b
+valid	-	...
+valid	-	a.
+valid	-	a #b.kdbx
+valid	-	 a.kdbx
+valid	-	a.kdbx 
+valid	-	# a header	a.kdbx
+valid	-	   # an indented comment	a.kdbx
+valid	-	\t# a tab, then a comment	a.kdbx
+valid	-		a.kdbx
+valid	-	   	a.kdbx
+valid	-	\r	# a CRLF comment\r	a.kdbx
+valid	-	\x0b\x0c	a.kdbx
+valid	-	a.kdbx	b.kdbx	c/a.kdbx
+invalid	-	# only a comment
+invalid	-	
+invalid	-	   
+invalid	-	/abs.kdbx
+invalid	-	a/../b.kdbx
+invalid	-	./a.kdbx
+invalid	-	a/.
+invalid	-	..
+invalid	-	a//b.kdbx
+invalid	-	dir/
+invalid	-	a.kdbx\r
+invalid	-	# c\r	a.kdbx\r
+invalid	-	a\x1bb.kdbx
+invalid	-	a\x7fb.kdbx
+invalid	-	a\tb.kdbx
+invalid	-	a.kdbx	/etc/passwd
+valid	acme/	acme/x.kdbx
+valid	acme/	other/x.kdbx
+valid	ac	acme/x.kdbx
+invalid	acme	acme/x.kdbx
+invalid	acme/x.kdbx	acme/x.kdbx
+valid	-	acme/A/B.kdbx	A/B.kdbx
+invalid	acme/	acme/A/B.kdbx	A/B.kdbx
+invalid	-	a.kdbx	a.kdbx
+invalid	-	a/b.kdbx	a__b.kdbx
+invalid	acme/	acme/Admin/Team.kdbx	# between	acme/Admin/Team.kdbx
+valid	acme/	acme/Team.kdbx	acme/Team.old.kdbx
+invalid	-	x.tar.gz	x.tar.gz
+valid	-	x.tar.gz	x.tar.bz
+invalid	acme.kd	acme.kdbx	bx.kdbx
+valid	acme.kd	acme.kdbx	bx
+valid	-	README	README.md
+invalid	-	.hidden	.hidden
+stricter	-	\xc2\xa0
+stricter	-	\xe2\x80\x83	a.kdbx
+stricter	-	\xe2\x80\x83# not a comment in C	a.kdbx
+stricter	-	a\xe2\x80\xa8b.kdbx
+stricter	-	a\xc2\x85b.kdbx

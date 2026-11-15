@@ -580,7 +580,7 @@ Panel {
             visible: root.polled && root.rows.length === 0
             width: parent.width
             text: root.nothingSetUp
-              ? "Nothing set up yet: no mounts, offline folders or backups. Configure… below sets them up."
+              ? Model.NOTHING_SET_UP_TEXT
               : "No rclone-mount@ units or ~/.config/rclone-mount/*.env files found."
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -656,6 +656,16 @@ Panel {
               text: "BACKUPS"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: Model.BACKUPS_BLURB
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
             }
 
             Repeater {
@@ -755,7 +765,7 @@ Panel {
               id: configureButton
               text: "Configure…"
               iconText: Model.ICON.settings
-              tooltipText: "Mounts, offline folders and backups (omarchy-cloud)"
+              tooltipText: Model.CONFIGURE_TOOLTIP
               enabled: root.appInstalled
               opacity: enabled ? 1 : 0.45
               hasCursor: root.cursorActive && root.cursorAt === "configure"

@@ -23,7 +23,7 @@ This page is the one place where all the keys are listed.
 | Tab, Left/Right, `h`/`l`, or `1`-`4` | Switch section |
 | Up/Down or `j`/`k` | Move |
 | `r` | Refresh |
-| `?` | Show help (any key closes it) |
+| `?` | Show help (any key closes it). It lists the keys of every section, including the files list screen; it works on the main screens, not inside the files list |
 | `q` or Esc | Quit (`q` waits for a running task) |
 | Ctrl-C | Quit and stop a running task (see [how-it-works.md](how-it-works.md#stopping-a-task-with-ctrl-c)) |
 
@@ -65,13 +65,37 @@ or uploads are waiting.
 
 ## Backups
 
+A backup keeps dated copies of important files: **single files, not folders**.
+
 | Key | Does |
 |---|---|
 | `a` / `e` | Add / edit |
-| `f` | Edit the files list in your editor (`$VISUAL`, `$EDITOR`; see [backups.md](backups.md#add-one)) |
+| `f` | Open the [files list screen](#the-files-list-screen): the single files this backup copies (see [backups.md](backups.md#add-one)) |
 | Enter | Run now |
 | `p` | Schedule on / off |
 | `d` | Remove (keeps the destination and the files list) |
+
+### The files list screen
+
+It opens with `f` on a backup, and by itself right after you create a backup.
+
+| Key | Does |
+|---|---|
+| Up/Down or `j`/`k`, Home/End | Move, or jump to the first / last entry |
+| `a` | Add a path |
+| Enter | Edit the selected path |
+| `d` | Remove the selected path (no question; nothing is written until you save) |
+| `s` | Save, then check the backup (and set it up). Refused while an entry shows `✗` or the list is empty |
+| `E` | Open the list in `$VISUAL` / `$EDITOR` instead. Refused while you have unsaved changes |
+| Esc or `q` | Close. With unsaved changes it asks first: Esc or `q` again discards them, `s` saves, any other key goes back |
+
+While you type a path: Enter keeps it, Esc goes back without it, Backspace deletes a
+character, Ctrl-U clears the line, and a paste works. The path is checked as you
+type: `✓ copied as <job>@<stem>.<date><ext>` shows the name of the copies, and `✗`
+and a reason means it cannot be used (see [backups.md](backups.md#add-one)).
+
+A list that is a symlink, is not UTF-8 text or is over 1 MiB cannot be shown here:
+`f` then opens it straight in your editor and says so.
 
 ## Maintenance
 

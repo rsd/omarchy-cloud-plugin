@@ -40,9 +40,10 @@ conflict copies").
   timer is on but stopped, the row says "Folder watch stopped (…)" or "Timer
   stopped (…)" with the commands that restart it (or press `w` in the app). The
   folder's conflict copies are listed (at most 5 named, then a count).
-- **Backups.** One row per backup: the last run and the next scheduled run; a
+- **Backups.** Dated copies of important files (single files, not folders). One row per backup: the last run and the next scheduled run; a
   "show log" button after a failed run.
-- Sections with nothing to show are hidden; with nothing at all, a hint points to
+- Sections with nothing to show are hidden; with nothing at all, a hint ("Nothing set up yet: no mounts, offline folders or
+  backups (dated copies of important files).") points to
   **Configure…**. Rows are capped at 16 per section ("Showing 16 of N") and
   remotes at 32. The panel is capped in height and scrolls past it.
 - **Configure…** (bottom) opens the app in a small terminal window. If the app is
@@ -56,7 +57,7 @@ At the bottom of the panel, one notice and button may appear:
 | You see | What it means | What to do |
 |---|---|---|
 | "Installed parts: not installed — run install.sh" and **Set up…** | The plugin was added, but its helper files (the "installed parts") were not copied yet | Click **Set up…**: a terminal runs the installer and asks the questions |
-| "Mount root not set up: …" and **Set up…** | The [mount folder](mount-folder.md) does not exist yet, or its setting is missing or invalid. The notice names the folder and shows the one-time command. For an invalid setting it reads "Mount root not set up: the setting … in ~/.config/omarchy-cloud/cloud.env is not a valid root — run Set up…" | Click **Set up…** (the installer asks), or follow [the step-by-step](mount-folder.md#create-the-mount-folder-step-by-step) |
+| "Mount root not set up: …" and **Set up…** | The [mount folder](mount-folder.md) does not exist yet, its setting is missing or invalid, or it leads into your home through a link. The notice names the folder and shows the one-time command. For an invalid setting it reads "Mount root not set up: the setting … in ~/.config/omarchy-cloud/cloud.env is not a valid root — run Set up…". If the folder is a symbolic link into your home it reads "Mount root not set up: <folder> resolves inside your home (through a symbolic link): programs that crawl the home (file search, indexers, backups) would follow it into the cloud drive — run Set up… and choose a real folder outside your home" | Click **Set up…** (the installer asks), or follow [the step-by-step](mount-folder.md#create-the-mount-folder-step-by-step) |
 | "Installed parts are … , plugin is …" or "…(no version recorded)" and **Update installed parts** | The plugin was updated but the helper files are older | Click **Update installed parts** |
 
 If several apply, the order is: not installed, mount folder not set up, out of

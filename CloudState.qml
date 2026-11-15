@@ -33,12 +33,14 @@ import "Model.js" as Model
 //     changed, and on a panel opening. Conflict copies the user deletes by hand
 //     therefore stay listed until the next sync run rewrites the state file
 //     (the timer's interval at most, while it is enabled) or a panel opens.
-//   - root check (one `sh` asking whether the mount root is a writable
-//     directory; Model.ROOT_CHECK_SCRIPT, the root as "$1"): after each good
+//   - root check (one `sh` asking whether the mount root resolves outside
+//     the home and is a writable directory; Model.ROOT_CHECK_SCRIPT, the root
+//     as "$1", the home as "$2"): after each good
 //     scan or setting read whose setting is a valid root, never otherwise.
 //   - setting read (one `sh` reading only cloud.env; Model.SETTING_SCRIPT):
 //     on a poll that starts no scan, and only while the root is not set up
-//     (Model.rootNeedsReread: absent, invalid or missing), followed by the
+//     (Model.rootNeedsReread: absent, invalid, missing, inhome or
+//     unresolved), followed by the
 //     root check; so Set up or the one-time sudo command clears the notice on
 //     the next poll. Nothing extra runs while the root is ready. A scan can
 //     start while a setting read runs, so each read of the setting (scan or
@@ -59,6 +61,9 @@ Singleton {
   id: root
 
   readonly property string home: Model.cleanHome(Quickshell.env("HOME"))
+  // The home the root rule compares with (Model.normaliseHome): unlike
+  // `home`, a HOME with "//" or "/./" in it is still a home here.
+  readonly property string rootHome: Model.normaliseHome(Quickshell.env("HOME"))
   // HOME-fixed, as the scripts and the TUI write it (XDG_STATE_HOME is never read).
   readonly property string stateDir: Model.stateHome(root.home)
   // This file's own folder, the plugin's (manifest.json, install.sh).
@@ -101,7 +106,7 @@ Singleton {
   // null before one), the root mounts use (the default without a valid
   // setting), the last root check ({ path, result }) and what the notice
   // makes of them (Model.rootStatus: "" until known).
-  readonly property var rootSetting: root.scanned ? Model.rootSetting(root.scanData, root.home) : null
+  readonly property var rootSetting: root.scanned ? Model.rootSetting(root.scanData, root.rootHome) : null
   readonly property string mountRoot: Model.mountRoot(root.rootSetting)
   property var rootCheck: ({ path: "", result: "" })
   readonly property string rootStatus: Model.rootStatus(root.rootSetting, root.rootCheck)
@@ -140,10 +145,10 @@ Singleton {
   // Only for a valid setting (Model.rootCheckArgv refuses anything else); the
   // answer is kept with the path it was asked about.
   function recheckRoot() {
-    var setting = Model.rootSetting(root.scanData, root.home)
+    var setting = Model.rootSetting(root.scanData, root.rootHome)
     if (!setting || setting.state !== "valid") return
     if (rootProc.running) { root.rootPending = true; return }
-    var argv = Model.rootCheckArgv(setting.path, root.home)
+    var argv = Model.rootCheckArgv(setting.path, root.rootHome)
     if (argv.length === 0) return
     rootProc.path = setting.path
     rootProc.command = argv

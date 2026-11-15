@@ -1,13 +1,13 @@
 # Backups
 
-A **backup** downloads chosen files from a remote on a schedule and keeps several
-dated copies of each on your computer. Use it for files you want to be able to go
-back in time on, for example a copy of your budget spreadsheet kept for the last
-14 days.
+A **backup** keeps dated copies of important files. On a schedule it downloads
+the files you chose from a remote and keeps several dated copies of each on your
+computer. Use it for files you want to be able to go back in time on, for example
+a copy of your budget spreadsheet kept for the last 14 days.
 
-**A backup is a list of single files.** You list each file by its path. Folders
-are not supported: do not list a folder, and wildcards such as `*.pdf` are not
-expanded. If you need a whole folder kept on your computer, use an
+**A backup is a list of single files, not folders.** You list each file by its
+path. Do not list a folder, and wildcards such as `*.pdf` are not expanded. If you
+need a whole folder kept on your computer, use an
 [offline folder](offline-folders.md) instead.
 
 A backup only **downloads**: it never changes or deletes anything in the cloud,
@@ -31,39 +31,44 @@ and removing a backup never deletes the copies on your computer.
    | Strip prefix | Optional, for tidy file names: text removed from the front of each path when naming copies |
    | Files list | Where the list of files is stored. Empty uses the default, `~/.config/rclone-backup/<name>.files` |
 
-3. **A text editor opens on the files list.** Write one file per line, as its path
-   in the cloud (starting inside the remote prefix, if you set one), with no
-   leading `/`. For example:
+3. **The files list opens.** This is a small screen inside the app where you
+   add the files to back up, one path per entry. Nothing to learn: the keys are
+   shown at the bottom. A path is the file's path in the cloud (starting inside the
+   remote prefix, if you set one), with no leading `/`, for example
+   `Documents/budget.xlsx` or `Documents/contracts/lease.pdf`. To see the exact
+   names, look in `~/Cloud/<remote>` in the file manager.
 
-   ```
-   # Files backed up by documents-backup
-   Documents/budget.xlsx
-   Documents/contracts/lease.pdf
-   ```
+   - Press `a`, type or paste a path, and press Enter to keep it. Each path is
+     checked as you type: `✓ copied as <name>@<file>.<date><ext>` shows the name
+     the copies will get, `✗` and a reason means the path cannot be used (for
+     example it starts or ends with `/`, or has `//`, `.` or `..` parts). The app
+     cannot tell a folder name without a trailing `/` from a file, so make sure
+     each entry really is a file.
+   - Move with the arrow keys; press Enter on an entry to change it and `d` to
+     remove it. Nothing is written to disk until you press `s`.
+   - Press `s` to save. It is refused while an entry shows `✗` or the list is
+     empty; fix the entry (Enter) or remove it (`d`).
+   - Press Esc (or `q`) to close without saving. If you changed something it asks
+     first: press Esc (or `q`) again to throw the changes away.
 
-   Lines starting with `#` are notes and are ignored. Each line is one file, not
-   a folder. To see the exact names, look in `~/Cloud/<remote>` in the file
-   manager.
-
-   **Which editor?** The app uses `$VISUAL`, else `$EDITOR`, else `nvim` if it is
-   installed, else `vi`. On Omarchy `$EDITOR` is set to open your default editor
-   (set in Omarchy's settings; it is usually **nvim**). If nvim (or vim/vi) opens,
-   it does not react to typing like other programs (it starts in a mode where keys are commands). Do this:
-
-   1. Press `i` (insert mode; `-- INSERT --` appears at the bottom).
-   2. Type or paste your lines (paste with `Ctrl` + `Shift` + `V`).
-   3. Press `Esc`.
-   4. Type `:wq` and press Enter. That saves and quits.
-
-   If you want to leave without saving, press `Esc`, type `:q!` and press Enter.
-   If a different terminal editor opens (for example `nano`), save and close it the
-   usual way (in nano: `Ctrl`+`O`, Enter, then `Ctrl`+`X`). The app continues when
-   the editor closes. If your Omarchy default editor is a graphical one, the app may
-   not wait for it: finish editing, then press `f` on the backup to check the list.
+   All the keys are in [tui.md](tui.md#the-files-list-screen).
 4. The app checks the list and the settings, saves the backup and turns its
    schedule on.
 
    You should see `Backup <name> saved and scheduled (Enter runs it now)`.
+
+**Editing the file directly (optional).** The list is a plain text file, one path
+per line, with `#` lines as notes. Press `E` on the files-list screen to open it in
+your own editor instead (`$VISUAL`, else `$EDITOR`, else `nvim` if installed, else
+`vi`; `E` is refused while you have unsaved changes). Omarchy's usual editor,
+nvim, starts in a mode where keys are commands: press `i` to type, `Esc` then `:wq`
+and Enter to save and quit, or `Esc` then `:q!` and Enter to leave without saving.
+The app opens the editor for you automatically only when the screen cannot handle
+the file: a list that is a symlink, is not UTF-8 text or is over 1 MiB (it then
+says so, for example `~/.config/rclone-backup/<name>.files is not UTF-8 text of at
+most 1 MiB: opened in $VISUAL / $EDITOR`). If your editor is a graphical one, the
+app may not wait for it: finish editing, then press `f` on the backup to check the
+list.
 
 The destination must not overlap an offline folder, another backup's destination,
 the [mount folder](mount-folder.md), `~/Cloud` or a mounted drive. The app refuses
@@ -72,7 +77,7 @@ such a destination and says which one.
 ## Day to day
 
 Press `3` in the app. Enter runs a backup now; `e` edits its settings; `f`
-edits the files list again; `p` switches the schedule on and off; `d` removes it
+opens the files list again; `p` switches the schedule on and off; `d` removes it
 (keeping the copies). All keys are in [tui.md](tui.md#backups).
 
 The [panel](panel.md) shows each backup's last run and the schedule's next run,

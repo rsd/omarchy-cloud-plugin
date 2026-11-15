@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 /// fuser runs under `timeout -k 2 10`, like the plugin's stop check.
 pub const CHECK_TIMEOUT_S: &str = "10";
 pub const CHECK_KILL_S: &str = "2";
+/// realpath runs under `timeout -k 1 5`, as in the helpers and install.sh.
+pub const RESOLVE_TIMEOUT_S: &str = "5";
+pub const RESOLVE_KILL_S: &str = "1";
 
 /// Where everything lives. HOME-fixed: `~/.config`, `~/.local/state` and
 /// `~/.cache`, whatever XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_CACHE_HOME
@@ -388,6 +391,24 @@ pub fn backup_cmd(paths: &Paths, sub: &str, job: &str) -> Vec<String> {
         sub.to_string(),
         job.to_string(),
     ]
+}
+
+/// `realpath -m` of each path (symlinks followed as far as they go, missing
+/// parts fine), one NUL-terminated answer per path (`-z`), under the same
+/// `timeout -k 1 5` as the helpers' and install.sh's root check.
+pub fn realpath_cmd(paths: &[&Path]) -> Vec<String> {
+    let mut argv = v(&[
+        "timeout",
+        "-k",
+        RESOLVE_KILL_S,
+        RESOLVE_TIMEOUT_S,
+        "realpath",
+        "-m",
+        "-z",
+        "--",
+    ]);
+    argv.extend(paths.iter().map(|p| path_str(p)));
+    argv
 }
 
 /// Who has files open on a mount: `timeout -k 2 10 fuser -v -M -m <mnt>`.
@@ -847,6 +868,12 @@ mod tests {
                 "-M",
                 "-m",
                 "/mnt/cloud/gdrive"
+            ]
+        );
+        assert_eq!(
+            realpath_cmd(&[Path::new("/srv/c"), Path::new("/home/u")]),
+            [
+                "timeout", "-k", "1", "5", "realpath", "-m", "-z", "--", "/srv/c", "/home/u"
             ]
         );
     }

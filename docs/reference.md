@@ -114,10 +114,29 @@ rclone-mount check|start <remote> <root> <home> [-- <command…>]
 
 `rclone-mount` is run by the mount unit, not by you: it checks the mount folder
 before and while a mount starts. `check` exits 0 (go on) or 1 (skip: the folder is
-valid but not set up yet); `start` exits 78 when the folder or the remote name is
-refused (the unit then fails and is not restarted), else it creates
-`<root>/<remote>` and runs the command; 64 is a usage error. See
-[how-it-works.md](how-it-works.md#the-mount-unit-and-the-mount-folder).
+valid but not set up yet); it also exits 0 for a refusal and for "cannot resolve",
+because `start` decides those. `start` exits:
+
+- **78** when the setting or the mount point is refused, so the unit fails and is
+  **not** restarted: an invalid folder or remote name; a folder that differs from what
+  systemd passed (the message names `cloud.env`, an `rclone-mount/<remote>.env` line
+  and the systemd drop-ins `~/.config/systemd/user/rclone-mount@.service.d/*.conf` or
+  `rclone-mount@<remote>.service.d/*.conf` as places to look); a folder that resolves
+  to your home or inside it; a mount point that is a file or a symbolic link; and a
+  badly formed `start` call;
+- **75** for a temporary problem, so the unit **is** restarted: the folder or your
+  home could not be resolved within 5 s; the mount point did not answer within 5 s;
+  `mkdir` failed with nothing in the way; or a stale FUSE mount ("Transport endpoint
+  is not connected") that `fusermount3 -uz` could not clear (the message then says
+  `Fix: run fusermount3 -uz <mount point>.`). A stale mount that `fusermount3 -uz`
+  does clear is simply mounted again;
+- **1** for "not usable yet", unchanged; **64** for an unknown mode. Otherwise it
+  creates `<root>/<remote>` and runs the command.
+
+The home folder is compared with the same rule everywhere (the installer, the unit's
+script, the app and the panel): a doubled `/`, `/./` and a trailing `/` in it are
+ignored, and a mount folder that resolves into it through a symbolic link counts as
+inside it. See [how-it-works.md](how-it-works.md#the-mount-unit-and-the-mount-folder).
 
 `setup` writes the systemd drop-ins an offline folder or backup needs (the
 app does this). `teardown` removes them and never touches the local folder, the

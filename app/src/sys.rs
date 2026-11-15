@@ -611,6 +611,48 @@ pub fn read_root(paths: &crate::cmd::Paths) -> crate::envfile::RootSetting {
     }
 }
 
+/// Where a valid mount root really points (tests/fixtures/resolved-roots.tsv).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootResolution {
+    /// Not the home nor inside it, resolved (or there is no home).
+    Outside,
+    /// Resolves to this path: the home or inside it.
+    InHome(PathBuf),
+    /// realpath failed or timed out: refused, as it cannot be checked.
+    Unresolved,
+}
+
+/// The answer of `cmd::realpath_cmd` for `n` paths: exactly `n` non-empty
+/// NUL-terminated paths after a clean exit, else None. Pure.
+pub fn parse_realpath(out: &Output, n: usize) -> Option<Vec<String>> {
+    if !out.ok() {
+        return None;
+    }
+    let body = out.stdout.strip_suffix('\0')?;
+    let parts: Vec<String> = body.split('\0').map(str::to_string).collect();
+    (parts.len() == n && parts.iter().all(|p| !p.is_empty())).then_some(parts)
+}
+
+/// Resolves `root` and `home` with the same `realpath -m` the helpers,
+/// install.sh and the bar run (one rule, one resolver), and judges the
+/// result (`validate::resolves_into_home`). A home that normalises to `/` or
+/// "" is no home: Outside, nothing run.
+pub fn resolve_root(root: &Path, home: &Path) -> RootResolution {
+    let written = home.to_string_lossy();
+    if crate::validate::normalise_home(&written).is_none() {
+        return RootResolution::Outside;
+    }
+    let out = run(&crate::cmd::realpath_cmd(&[root, home]));
+    let Some(r) = parse_realpath(&out, 2) else {
+        return RootResolution::Unresolved;
+    };
+    if crate::validate::resolves_into_home(&r[0], &written, &r[1]) {
+        RootResolution::InHome(PathBuf::from(&r[0]))
+    } else {
+        RootResolution::Outside
+    }
+}
+
 /// Why `dir` cannot hold mount points: missing, not a directory, or not
 /// writable and searchable by this user (`access(W_OK|X_OK)`). None: usable.
 pub fn dir_problem(dir: &Path) -> Option<&'static str> {
@@ -1329,6 +1371,133 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn realpath_answer() {
+        let out = |code: Option<i32>, stdout: &str| Output {
+            code,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            parse_realpath(&out(Some(0), "/a\0/b\0"), 2),
+            Some(vec!["/a".to_string(), "/b".to_string()])
+        );
+        for (code, text) in [
+            (Some(0), "/a\0"),
+            (Some(0), "/a\0/b"),
+            (Some(0), "/a\0\0"),
+            (Some(0), "/a\0/b\0/c\0"),
+            (Some(1), "/a\0/b\0"),
+            (None, "/a\0/b\0"),
+            (Some(0), ""),
+        ] {
+            assert_eq!(
+                parse_realpath(&out(code, text), 2),
+                None,
+                "{code:?} {text:?}"
+            );
+        }
+    }
+
+    /// Builds one tests/fixtures/resolved-roots.tsv case under `t` (see its
+    /// header): T/home a directory unless a step links it, then the steps.
+    fn build_resolved_case(t: &Path, setup: &str) {
+        let links_home = setup.split(';').any(|s| s.starts_with("link:home="));
+        if !links_home {
+            fs::create_dir_all(t.join("home")).unwrap();
+        }
+        for step in setup.split(';').filter(|s| *s != "-") {
+            if let Some(p) = step.strip_prefix("dir:") {
+                fs::create_dir_all(t.join(p)).unwrap();
+            } else if let Some(l) = step.strip_prefix("link:") {
+                let (p, target) = l.split_once('=').expect("link:<p>=<t>");
+                let at = t.join(p);
+                fs::create_dir_all(at.parent().unwrap()).unwrap();
+                let target = match target.strip_prefix("@/") {
+                    Some(rest) => t.join(rest),
+                    None => PathBuf::from(target),
+                };
+                std::os::unix::fs::symlink(target, at).unwrap();
+            } else {
+                panic!("bad fixture step {step:?}");
+            }
+        }
+    }
+
+    /// The one list of symlinked-root cases shared with the helpers,
+    /// install.sh and the bar: each case's tree built fresh under a temp
+    /// dir T with home T/home, judged by the real resolver.
+    #[test]
+    fn resolved_roots_fixture() {
+        let text = include_str!("../../tests/fixtures/resolved-roots.tsv");
+        let base = scratch("resolved");
+        let base = fs::canonicalize(&base).unwrap();
+        let (mut n, mut valid, mut invalid) = (0, 0, 0);
+        for line in text.split('\n') {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            let [want, setup, root] = f[..] else {
+                panic!("<valid|invalid><TAB><setup><TAB><root>: {line:?}");
+            };
+            let expect = match want {
+                "valid" => true,
+                "invalid" => false,
+                other => panic!("bad fixture verdict {other:?}"),
+            };
+            let t = base.join(format!("case{n}"));
+            fs::create_dir_all(&t).unwrap();
+            let (home, root) = (t.join("home"), t.join(root));
+            assert!(
+                crate::validate::is_valid_root(&root.to_string_lossy(), &home),
+                "T must pass valid_root: {}",
+                root.display()
+            );
+            build_resolved_case(&t, setup);
+            let got = resolve_root(&root, &home);
+            assert_eq!(got == RootResolution::Outside, expect, "{line:?}: {got:?}");
+            if expect {
+                valid += 1;
+            } else {
+                assert!(
+                    matches!(got, RootResolution::InHome(_)),
+                    "{line:?}: {got:?}"
+                );
+                invalid += 1;
+            }
+            n += 1;
+        }
+        fs::remove_dir_all(&base).unwrap();
+        assert!(
+            n >= 16 && valid >= 6 && invalid >= 10,
+            "only {n} cases read ({valid} valid, {invalid} invalid)"
+        );
+    }
+
+    #[test]
+    fn resolve_root_without_a_home() {
+        // No home ("/" or ""): nothing to be inside, nothing run.
+        for home in ["/", "", "//", "/./"] {
+            assert_eq!(
+                resolve_root(Path::new("/srv/x"), Path::new(home)),
+                RootResolution::Outside,
+                "{home:?}"
+            );
+        }
+        // The home as written, with // and ., still counts (homes.tsv).
+        let d = scratch("resolvehome");
+        let d = fs::canonicalize(&d).unwrap();
+        fs::create_dir_all(d.join("home/x")).unwrap();
+        std::os::unix::fs::symlink(d.join("home/x"), d.join("ln")).unwrap();
+        let written = format!("{}//home/./", d.display());
+        assert!(matches!(
+            resolve_root(&d.join("ln"), Path::new(&written)),
+            RootResolution::InHome(_)
+        ));
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

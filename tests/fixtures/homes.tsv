@@ -1,0 +1,24 @@
+# Home paths: how every root validator compares a root with $HOME (Rust
+# validate::is_valid_root, the shared bash valid_root, rclone-mount, Model.js).
+# The home is normalised the same way everywhere before the comparison: runs
+# of / collapsed to one, every "." component dropped, every trailing / dropped
+# (".." is kept as written). A home that normalises to "/" (or "") is no home:
+# the home rule is skipped. Roots here pass every other rule of roots.tsv.
+# Format: <valid|invalid><TAB><home><TAB><path>; "#" lines are comments.
+valid	/home/tester	/mnt/cloud
+invalid	/home/tester	/home/tester
+invalid	/home/tester	/home/tester/Cloud
+valid	/home/tester	/home/tester2/Cloud
+invalid	/home/tester/	/home/tester
+invalid	/home/tester//	/home/tester/Cloud
+invalid	/home//tester	/home/tester/Cloud
+invalid	//home/tester	/home/tester
+invalid	/home/./tester	/home/tester/Cloud
+invalid	/home/tester/.	/home/tester/Cloud
+invalid	/./home/tester/./	/home/tester
+valid	/home//tester	/home/tester2/Cloud
+valid	/home/./tester	/home/testerCloud
+valid	/	/home/tester/Cloud
+valid	//	/home/tester/Cloud
+valid	/./	/home/tester/Cloud
+valid	/.	/home/tester/Cloud

@@ -761,11 +761,13 @@ mkdir -p "$RHOME" "$SCRATCH/roots"
 for r in "$SCRATCH/roots/a;id>PWNED" "$SCRATCH/roots/(id)>PWNED|x&y" "$SCRATCH/roots/-n" "$SCRATCH/roots/ok"; do
   [[ $r == */ok ]] && mkdir -p "$r"
   mapfile -d '' -t argv < <(model_argv 'm.rootCheckArgv(a, b)' "$r" "$RHOME")
-  if [[ ${argv[0]} != timeout || ${argv[4]} != sh || ${argv[5]} != -c || ${argv[-1]} != "$r" || ${#argv[@]} != 9 ]]; then
+  # The root is $1 and the home $2: second to last and last, never in the script.
+  if [[ ${argv[0]} != timeout || ${argv[4]} != sh || ${argv[5]} != -c || ${argv[-2]} != "$r" || ${argv[-1]} != "$RHOME" || ${#argv[@]} != 10 ]]; then
     fail "root check argv for $r: ${argv[*]}"
     continue
   fi
   [[ ${argv[6]} == *"$r"* ]] && fail "the root is inside the script: $r"
+  [[ ${argv[6]} == *"$RHOME"* ]] && fail "the home is inside the script: $RHOME"
   got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | model_eval 'm.parseRootCheck(s)')
   want=missing
   [[ $r == */ok ]] && want=ok
@@ -785,6 +787,21 @@ if ((${#argv[@]} == 0)); then
   pass "a root inside HOME is never checked"
 else
   fail "root inside HOME: ${argv[*]}"
+fi
+# A root outside HOME by its text but a symlink into HOME: the real script
+# resolves it and answers inhome (the home passed with a trailing slash too).
+mkdir -p "$RHOME/target"
+ln -sfn "$RHOME/target" "$SCRATCH/roots/linked"
+mapfile -d '' -t argv < <(model_argv 'm.rootCheckArgv(a, b)' "$SCRATCH/roots/linked" "$RHOME/")
+if [[ ${argv[-2]} == "$SCRATCH/roots/linked" && ${argv[-1]} == "$RHOME" ]]; then
+  got=$(cd "$SCRATCH/cwd" && "${argv[@]}" | model_eval 'm.parseRootCheck(s)')
+  if [[ $got == inhome ]]; then
+    pass "root check: inhome for a symlink into HOME"
+  else
+    fail "root check for a symlink into HOME: $got"
+  fi
+else
+  fail "root check argv for a symlink into HOME: ${argv[*]}"
 fi
 # BOUNDED_SCRIPT around a stand-in journalctl: argv intact, a forged end line
 # (another token's, and this run's own mid-stream) is content, output capped.

@@ -42,7 +42,11 @@
 #      --mount-root and its refusals, an existing cloud.env never rewritten,
 #      kept by --uninstall; a root must be searchable too (x), not only
 #      writable; tests/fixtures/roots.tsv (raw bytes) through install.sh's
-#      valid_root; the diff hint for a path with a '; the mount unit: its
+#      valid_root; every case of tests/fixtures/resolved-roots.tsv through
+#      --mount-root (a root that resolves into the home refused, one realpath
+#      cannot resolve too), and a default, a typed root and an existing
+#      setting that link into the home (not adopted, refused, named); the
+#      diff hint for a path with a '; the mount unit: its
 #      lines (the guard bin/rclone-mount in ExecCondition and ExecStart, no
 #      ExecStartPre, RestartPreventExitStatus=78), and those lines run as
 #      systemd would against the installed guard.
@@ -982,6 +986,84 @@ check "valid_root: every case of tests/fixtures/roots.tsv ($roots_n)" eval '((ro
 vr_home() { HOME=$1 bash -c "$VALID_ROOT"$'\nvalid_root "$1"' _ "$2"; }
 check "valid_root: HOME=/home/tester// still refuses /home/tester/x and /home/tester; HOME=// skips the home rule" \
   eval '! vr_home /home/tester// /home/tester/x && ! vr_home /home/tester/// /home/tester && vr_home // /home/x && vr_home /home/tester// /home/testerx'
+
+# The root with its symlinks resolved (root_outside_home; the shared block
+# itself, and every copy of it, is covered by tests/scripts-test.sh): every
+# case of tests/fixtures/resolved-roots.tsv through --mount-root, the tree
+# built under the scratch dir (rr_build, the fixture's header) with
+# HOME=<it>/home. A valid root is created when missing, so it is saved; an
+# invalid one is refused (exit 1), naming the home and why, nothing written.
+# rr_build <T> <setup>: the tree of one case under T.
+rr_build() {
+  local t=$1 step p tg steps=()
+  [[ $2 == - ]] || IFS=';' read -ra steps <<<"$2"
+  mkdir -p "$t" || return 1
+  [[ ";$2;" == *";link:home="* ]] || mkdir -p "$t/home" || return 1
+  for step in "${steps[@]}"; do
+    case $step in
+      dir:*) mkdir -p "$t/${step#dir:}" || return 1 ;;
+      link:*=*)
+        p=${step#link:} tg=${step#*=}
+        p=${p%%=*}
+        [[ $tg == @/* ]] && tg=$t/${tg#@/}
+        mkdir -p "$(dirname -- "$t/$p")" && ln -s -- "$tg" "$t/$p" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+CRAWL="programs that crawl the home (file search, indexers, backups) would follow the link into the cloud drive"
+rr_n=0 rr_bad=()
+while IFS=$'\t' read -r kind setup root; do
+  rr_n=$((rr_n + 1))
+  fresh
+  rr_build "$T/rr" "$setup" || { rr_bad+=("unbuildable $setup"); continue; }
+  export HOME=$T/rr/home
+  ENVF=$HOME/.config/omarchy-cloud/cloud.env
+  mkdir -p "$HOME/.config"
+  r=$T/rr/$root
+  [[ $kind == valid && ! -e $r ]] && mkdir -p "$r"
+  runc "$INSTALL" --no-build --mount-root "$r"
+  if [[ $kind == valid ]]; then
+    { rc_is 0 && env_is "$r"; } || rr_bad+=("valid $setup $root rc=$RC")
+  else
+    { rc_is 1 && [[ ! -e $ENVF && $OUT == *"stopping, nothing was changed: the mount root "*" at or inside your home "*": $CRAWL."* ]]; } ||
+      rr_bad+=("invalid $setup $root rc=$RC")
+  fi
+done < <(grep -v '^#' "$PLUGIN_DIR/tests/fixtures/resolved-roots.tsv" | grep $'\t')
+check "resolved-roots.tsv: --mount-root saves every valid root and refuses every invalid one, nothing written ($rr_n cases${rr_bad:+; wrong: ${rr_bad[*]}})" \
+  eval '((rr_n >= 15 && ${#rr_bad[@]} == 0))'
+# A root that cannot be resolved (realpath failing): refused by the reader.
+RPFAIL=$SCRATCH/rpfail
+mkdir -p "$RPFAIL"
+printf '#!/bin/bash\necho "realpath: stand-in failure" >&2\nexit 1\n' >"$RPFAIL/realpath"
+chmod +x "$RPFAIL/realpath"
+fresh
+mkdir -p "$T/srv/cloud"
+PATH="$RPFAIL:$PATH" runc "$INSTALL" --no-build --mount-root "$T/srv/cloud"
+check "--mount-root, a root realpath cannot resolve: refused (exit 1), says so, nothing written" \
+  eval 'rc_is 1 && [[ ! -e $ENVF && $OUT == *"stopping, nothing was changed: the mount root $T/srv/cloud could not be resolved"* ]]'
+# The default root a link into the home: not adopted, the reason printed.
+fresh
+mkdir -p "$HOME/CloudDir" "$T/mnt"
+ln -s "$HOME/CloudDir" "$T/mnt/cloud"
+runc "$INSTALL" --no-build
+check "root: a default root that links into HOME is not adopted; the reason, --mount-root PATH, nothing written" \
+  eval 'rc_is 0 && [[ ! -e $ENVF && $OUT != *adopted* && $OUT == *"not set up, so no mount can start yet: the mount root $T/mnt/cloud resolves to $HOME/CloudDir, at or inside your home $HOME: $CRAWL."* && $OUT == *"--mount-root PATH"* && $OUT != *"sudo install"* ]]'
+# Asked on a terminal: a typed root that links into the home is refused.
+fresh
+mkdir -p "$HOME/CloudDir" "$T/srv"
+ln -s "$HOME/CloudDir" "$T/srv/link"
+runi "$T/srv/link"$'\n' "$INSTALL" --no-build
+check "root, asked: a typed root that links into HOME is refused with the reason, asked again, nothing written" \
+  eval 'rc_is 0 && [[ ! -e $ENVF && $OUT == *"the mount root $T/srv/link resolves to $HOME/CloudDir, at or inside your home $HOME: $CRAWL."*"Type a real folder outside your home."*"Mount root ["* ]]'
+# An existing setting that links into the home: named, left as it is.
+mkdir -p "${ENVF%/*}"
+printf 'OMARCHY_CLOUD_ROOT=%s\n' "$T/srv/link" >"$ENVF"
+before=$(sha "$ENVF")
+runc "$INSTALL" --no-build
+check "root: an existing setting that links into HOME is named with the reason, left as it is" \
+  eval 'rc_is 0 && [[ $(sha "$ENVF") == "$before" && $OUT == *"the mount root setting in $ENVF cannot be used, so no mount starts: the mount root $T/srv/link resolves to $HOME/CloudDir, at or inside your home $HOME: $CRAWL."* && $OUT == *"--mount-root PATH"* ]]'
 
 # The diff hint pastes as is when a path holds a '.
 R4="$SCRATCH/it's here"

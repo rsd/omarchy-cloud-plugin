@@ -34,8 +34,9 @@ EnvironmentFile=-%h/.config/rclone-mount/%i.env
 # whitespace trimming, no backslash processing), and holds the root to their
 # rule (tests/fixtures/roots.tsv): absolute, not "/", no empty, "." or ".."
 # component, no whitespace, control character, $ % \ " ' or backquote, not
-# the home directory (%h, trailing / dropped) nor inside it, at most 255
-# bytes, valid UTF-8 without U+FFFD. The root systemd read (passed as
+# the home directory (%h, normalised) nor inside it, also with symlinks
+# resolved (tests/fixtures/resolved-roots.tsv), at most 255 bytes, valid
+# UTF-8 without U+FFFD. The root systemd read (passed as
 # ${OMARCHY_CLOUD_ROOT}, one word) must be the same one: systemd parses an
 # EnvironmentFile its own way (quotes, whitespace, backslashes, indented
 # lines; a line that is not valid UTF-8 is skipped and the default wins),
@@ -43,9 +44,14 @@ EnvironmentFile=-%h/.config/rclone-mount/%i.env
 # A refused root (or remote name) FAILS the unit: ExecStart= exits 78 with
 # one line in the journal (the remote, the path, the reason, the fix), and
 # RestartPreventExitStatus=78 keeps it from restarting until the setting is
-# fixed. A valid root that is not yet an existing directory the user can
-# write to and search SKIPS the start: ExecCondition= exits 1 with one line
-# in the journal (a skipped unit is neither failed nor restarted). Nothing
+# fixed; so does a non-directory or a symlink where <root>/%i goes. A
+# transient failure exits 75 and is restarted by Restart=on-failure: a stale
+# FUSE mount at <root>/%i (left by an rclone that died; ExecStart= clears it
+# with fusermount3 -uz first, and fails only when that fails), a root that
+# cannot be resolved now. A valid root that is not yet an existing directory
+# the user can write to and search SKIPS the start: ExecCondition= exits 1
+# with one line in the journal (a skipped unit is neither failed nor
+# restarted). Nothing
 # here creates the root (created once, by the user, when it is a place like
 # /mnt): ExecStart= creates only <root>/<remote>, then execs rclone (the
 # same PID, so Type=notify works).

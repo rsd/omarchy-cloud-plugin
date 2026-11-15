@@ -10,7 +10,7 @@
 - An **offline folder** syncs both ways, so a file you delete on one side is deleted
   on the other, as with any sync tool. If you only want copies you can go back to,
   use a backup.
-- A **backup** only downloads. It deletes only its own old dated copies, when there
+- A **backup** (dated copies of important files) only downloads. It deletes only its own old dated copies, when there
   are more than "keep".
 - If the same file changes on both sides, both versions are kept and you are told.
 
@@ -44,7 +44,8 @@ command that makes you its owner. The installer never runs `sudo` itself. Steps:
 ## Why are my cloud drives not inside my home folder?
 
 So search and backup tools do not crawl a slow or huge cloud drive. `~/Cloud/<remote>`
-is a shortcut to the real mount, so you still find your files there. More:
+is a shortcut to the real mount, so you still find your files there. For the same
+reason the mount folder cannot be a link that leads into your home folder. More:
 [mount-folder.md](mount-folder.md#why-it-is-outside-your-home-folder).
 
 ## Can I use another folder than `/mnt/cloud`?
@@ -58,7 +59,8 @@ See [mount-folder.md](mount-folder.md#choosing-another-folder).
   them, so it needs a connection (recently used files are cached).
 - An **offline folder** keeps one folder on your computer in two-way sync with a
   folder on a remote. The files are really on your disk.
-- A **backup** downloads chosen single files on a schedule and keeps dated copies.
+- A **backup** keeps dated copies of important files: it downloads the single files you
+  chose (not folders) on a schedule.
 
 ## What about Google Docs, Sheets and Slides?
 
@@ -70,7 +72,9 @@ folder or a backup: try it on a copy first.
 ## What happens when I am offline?
 
 Mounts retry every 15 seconds until the network is back, syncs are retried by their
-timer, backups by their next scheduled run. Nothing needs to be restarted.
+timer, backups by their next scheduled run. Nothing needs to be restarted. A mount
+that was killed hard (say, out of memory) clears its own leftovers and starts again by
+itself: [troubleshooting.md](troubleshooting.md#a-mount-stopped-working-transport-endpoint-is-not-connected).
 
 ## What does it do with my data allowance?
 
