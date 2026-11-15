@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 
 const HEADER_MAX: u64 = 4096;
 const MANIFEST_MAX: u64 = 64 * 1024;
+/// A header line longer than this (after one trailing CR is dropped) is no
+/// header line. The same limit as INSTALL_HEADER_LINE_MAX in Model.js, which
+/// counts UTF-16 code units where this counts `char`s; the two agree for the
+/// ASCII header lines install.sh writes.
+const HEADER_LINE_MAX: usize = 1024;
 
 fn read_head(p: &Path, max: u64) -> Option<String> {
     let mut buf = Vec::new();
@@ -36,11 +41,18 @@ fn is_version(s: &str) -> bool {
 
 /// `(version, repo)` from the header lines at the top of the installed-files
 /// manifest; the first appearance of each key wins, valid or not, and every
-/// line is scanned (same as the JS reader).
+/// line is scanned (same as the JS reader). A line over `HEADER_LINE_MAX` is
+/// skipped, so it does not count as the key's first appearance.
 pub fn parse_header(text: &str) -> (Option<String>, Option<PathBuf>) {
     let (mut version, mut repo) = (None, None);
     let (mut seen_v, mut seen_r) = (false, false);
-    for line in text.lines() {
+    // Split on \n and drop one trailing \r, as the JS reader does (`lines()`
+    // would not drop a bare \r on the last line).
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.chars().count() > HEADER_LINE_MAX {
+            continue;
+        }
         if let Some(v) = line.strip_prefix("#version=") {
             if !seen_v {
                 seen_v = true;
@@ -113,6 +125,31 @@ mod tests {
             (Some("4.5.6".into()), Some(PathBuf::from("/a")))
         );
         assert_eq!(parse_header("#repo=/a\u{1}b\n").1, None);
+    }
+
+    #[test]
+    fn header_line_length_limit() {
+        // "#repo=/" is 7 chars; pad the line to exactly the limit.
+        let at = |n: usize| format!("#repo=/{}", "a".repeat(n - 7));
+        let ok = (None, Some(PathBuf::from(&at(HEADER_LINE_MAX)[6..])));
+        assert_eq!(parse_header(&format!("{}\n", at(HEADER_LINE_MAX))), ok);
+        // One over: skipped, and a skipped line is not the key's first
+        // appearance, so a later valid line wins (as in Model.js).
+        let t = format!("{}\n#repo=/b\n", at(HEADER_LINE_MAX + 1));
+        assert_eq!(parse_header(&t), (None, Some(PathBuf::from("/b"))));
+        // The CR of a CRLF line does not count toward the limit.
+        let t = format!("{}\r\n", at(HEADER_LINE_MAX));
+        assert_eq!(parse_header(&t), ok);
+        let t = format!("{}\r", at(HEADER_LINE_MAX));
+        assert_eq!(parse_header(&t), ok);
+        let t = format!("{}\r\n", at(HEADER_LINE_MAX + 1));
+        assert_eq!(parse_header(&t), (None, None));
+        // Same for #version=.
+        let long = format!("#version=1.2.3{}", "9".repeat(HEADER_LINE_MAX));
+        assert_eq!(
+            parse_header(&format!("{long}\n#version=4.5.6\n")),
+            (Some("4.5.6".into()), None)
+        );
     }
 
     #[test]

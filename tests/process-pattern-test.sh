@@ -383,7 +383,7 @@ install_argv() {
 VPLUG="$SCRATCH/ver/\$(touch PWNED) a'b \"c\" \`touch PWNED\`/plugin"
 VSTATE="$SCRATCH/ver/state \$(touch PWNED)"
 mkdir -p "$VPLUG" "$VSTATE/omarchy-cloud" "$SCRATCH/cwd"
-printf '{\n  "id": "x",\n  "version": "0.3.3"\n}\n' >"$VPLUG/manifest.json"
+printf '{\n  "id": "x",\n  "version": "0.3.4"\n}\n' >"$VPLUG/manifest.json"
 printf '#version=0.3.2\n#repo=/src/x\n%064d  /home/u/.local/bin/x\n' 0 >"$SCRATCH/installed-target"
 ln -s "$SCRATCH/installed-target" "$VSTATE/omarchy-cloud/installed-files"
 mapfile -d '' -t argv < <(versions_argv "$VPLUG" "$VSTATE" "$TOKEN")
@@ -394,7 +394,7 @@ out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
 status=$?
 [[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the plugin or state path ran" || pass "nothing in the plugin or state path ran"
 got=$(parse_versions "$TOKEN" <<<"$out")
-want='{"ok":true,"plugin":"0.3.3","installedPresent":true,"installedVersion":"0.3.2","installedRepo":"/src/x","legacy":false,"installer":false,"state":"mismatch"}'
+want='{"ok":true,"plugin":"0.3.4","installedPresent":true,"installedVersion":"0.3.2","installedRepo":"/src/x","legacy":false,"installer":false,"state":"mismatch"}'
 ((status == 0)) && [[ $got == "$want" ]] && pass "manifest.json and the header read through a symlink: mismatch" || {
   fail "versions parsed (status $status)"
   echo "     want: $want"

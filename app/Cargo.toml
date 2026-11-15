@@ -1,6 +1,6 @@
 [package]
 name = "omarchy-cloud"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Keyboard-driven TUI to manage rclone mounts, offline folders and backups on Omarchy"
 license = "MIT"

@@ -3,7 +3,7 @@
 Everything for rclone cloud storage on an [Omarchy](https://omarchy.org)
 desktop, kept in one repository:
 
-- **The bar plugin** (Cloud Mounts, 0.3.3, id `io.github.rsd.cloud-mounts`): a
+- **The bar plugin** (Cloud Mounts, 0.3.4, id `io.github.rsd.cloud-mounts`): a
   shell bar widget that shows rclone remotes mounted by systemd user units, the
   offline folders kept in sync with a remote, and the scheduled backups, and has
   a **Configure...** button (a right-click on the bar icon opens it too).
@@ -209,7 +209,7 @@ There is no symlink in the repository (checked by `tests/install-test.sh` and
 
 1. Bump the version in `app/Cargo.toml` (and `app/Cargo.lock`),
    `manifest.json`, `tests/manifest-test.js` and this README; commit to `main`.
-2. `git tag v0.3.3 && git push origin main v0.3.3`.
+2. `git tag v0.3.4 && git push origin main v0.3.4`.
 3. `.github/workflows/release.yml` runs two jobs. **build** (token
    `contents: read`, not kept in the checkout) checks that the tag equals both
    versions, digests the tagged `app/` sources (`src_sha256`, the same pipeline

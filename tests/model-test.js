@@ -960,6 +960,17 @@ test("installed parts: header lines, first of each key wins, bounded", () => {
   assert.strictEqual(h(SHA.repeat(80) + "#version=0.3.3\n").version, "")
   assert.strictEqual(h("#repo=/" + "x".repeat(model.INSTALL_HEADER_LINE_MAX) + "\n#version=0.3.3\n").repo, "")
   assert.strictEqual(h("#repo=/" + "x".repeat(model.INSTALL_HEADER_LINE_MAX) + "\n#version=0.3.3\n").version, "0.3.3")
+  // The boundary: a line of exactly INSTALL_HEADER_LINE_MAX chars is read, one more is
+  // skipped (and, skipped, does not count as the key's first line). app/src/version.rs
+  // has the same cases.
+  const LIM = model.INSTALL_HEADER_LINE_MAX
+  const repoLine = n => "#repo=/" + "a".repeat(n - 7)
+  assert.strictEqual(LIM, 1024)
+  assert.strictEqual(h(repoLine(LIM) + "\n").repo, repoLine(LIM).slice(6))
+  assert.strictEqual(h(repoLine(LIM) + "\r\n").repo, repoLine(LIM).slice(6), "the CR does not count")
+  assert.strictEqual(h(repoLine(LIM + 1) + "\n").repo, "")
+  assert.strictEqual(h(repoLine(LIM + 1) + "\n#repo=/b\n").repo, "/b", "a skipped line is not seen")
+  assert.strictEqual(h("#version=1.2.3" + "9".repeat(LIM) + "\n#version=4.5.6\n").version, "4.5.6")
   assert.ok(model.INSTALL_HEADER_MAX_BYTES <= 4096)
 })
 
@@ -1187,7 +1198,18 @@ test("panel: stable rows, theme tokens, capped height, dim hero, no dead tooltip
   assert.ok(!/Qt\.rgba\(/.test(bar), "fills come from Style, not literals")
   assert.ok(!/radius:\s*Style\.space/.test(bar), "radius follows Style.cornerRadius")
   assert.strictEqual((bar.match(/radius:\s*Style\.cornerRadius/g) || []).length, 2)
-  assert.ok(/fittedContentHeight\(column\.implicitHeight, Style\.space\(\d+\)\)/.test(bar), "panel height is capped")
+  assert.ok(/contentHeight: panel\.fittedContentHeight\(column\.implicitHeight\)\s*$/m.test(bar),
+    "panel height follows the content, capped only by the screen (no constant cap)")
+  assert.ok(!/fittedContentHeight\([^)]*,/.test(bar), "no fixed height cap")
+  // The scroll bar has a strip of its own while the panel scrolls, not the controls' right edge.
+  assert.ok(/ScrollBar\.vertical: ScrollBar \{\s*id: panelScroll\b/.test(bar))
+  assert.ok(/id: column\s*width: panelFlick\.width - \(panelFlick\.interactive \? panelScroll\.width \+ Style\.space\(\d+\) : 0\)/.test(bar),
+    "the column's width reserves the scroll bar gutter when the panel scrolls")
+  assert.ok(!/width: panelFlick\.width\s*$/m.test(bar), "nothing is sized from the full flickable width")
+  // The badge's size does not depend on a Style token older shells lack.
+  assert.strictEqual((bar.match(/Style\.bar\.iconSize/g) || []).length, 1, "read once, through barIconSize")
+  assert.ok(/readonly property real barIconSize: \{\s*var s = Number\(Style\.bar\.iconSize\)\s*return isFinite\(s\) && s > 0 \? s : \d+/.test(bar), "with a fallback")
+  assert.strictEqual((bar.match(/root\.barIconSize/g) || []).length, 3)
   assert.ok(/iconOpacity: root\.agg === "none" \|\| root\.agg === "unknown"/.test(bar))
   // A disabled control shows no tooltip, so none carries a "why disabled".
   assert.ok(!/tooltipText:[^\n]*(canSyncNow|syncDisabledText|not installed)/.test(bar))

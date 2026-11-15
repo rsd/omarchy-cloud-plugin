@@ -52,6 +52,13 @@ Panel {
 
   // ------------------------------------------------------------- state
 
+  // The bar glyph's size, for the installed-parts badge. Style.bar.iconSize
+  // is missing from older shells (reading it gives undefined, and a badge
+  // sized from that is NaN, so invisible): 12 is the shell's default.
+  readonly property real barIconSize: {
+    var s = Number(Style.bar.iconSize)
+    return isFinite(s) && s > 0 ? s : 12
+  }
   readonly property string home: CloudState.home
   readonly property bool polled: CloudState.polled
   readonly property var rows: Model.remoteRows(CloudState.remotes, CloudState.units, CloudState.sizes)
@@ -452,15 +459,15 @@ Panel {
     // the slot so a vertical bar does not clip it. Quieter than the error's
     // urgent colour, which wins.
     BorderSurface {
-      readonly property real size: Math.max(7, Math.round(Style.bar.iconSize * 0.42))
+      readonly property real size: Math.max(7, Math.round(root.barIconSize * 0.42))
       visible: root.installNotice !== "" && root.agg !== "error"
       width: size
       height: size
       radius: size / 2
       color: button.foreground
       borderSpec: Border.flat(Commons.Color.popups.background, 1)
-      x: Math.max(0, Math.min(button.width - size, Math.round(button.width / 2 + Style.bar.iconSize / 2 - size / 2)))
-      y: Math.max(0, Math.min(button.height - size, Math.round(button.height / 2 - Style.bar.iconSize / 2 - size / 2)))
+      x: Math.max(0, Math.min(button.width - size, Math.round(button.width / 2 + root.barIconSize / 2 - size / 2)))
+      y: Math.max(0, Math.min(button.height - size, Math.round(button.height / 2 - root.barIconSize / 2 - size / 2)))
     }
   }
 
@@ -479,8 +486,10 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(440))
-    // Capped like the shell's own panels; past it the content scrolls.
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    // As tall as the content, capped only by the screen the panel can use
+    // (as the shell's network panel); past that the content scrolls, with
+    // the scroll bar in a strip of its own (see the Column's width).
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -503,11 +512,16 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        ScrollBar.vertical: ScrollBar {
+          id: panelScroll
+          policy: ScrollBar.AsNeeded
+        }
 
         Column {
           id: column
-          width: panelFlick.width
+          // When the panel scrolls, the bar gets its own strip rather than
+          // sitting on top of the right-aligned switches and buttons.
+          width: panelFlick.width - (panelFlick.interactive ? panelScroll.width + Style.space(6) : 0)
           spacing: Style.space(10)
 
           PanelHero {

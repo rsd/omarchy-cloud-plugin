@@ -35,10 +35,11 @@
 # rclone-backup-*.lock), install.sh names it and waits up to
 # OMARCHY_CLOUD_INSTALL_WAIT_S seconds (default 60), then stops with exit 75
 # and nothing changed. A run may still start right after the wait; it is
-# safe because every copy is an atomic rename. The locks are only looked at
-# (in /proc/locks), not taken, so a timer run is not made to skip; only when
-# /proc/locks or findmnt is unusable does a fallback `flock -n` probe hold
-# each lock for an instant.
+# safe because every copy is an atomic rename. Normally the locks are only
+# looked at (in /proc/locks), not opened or taken, so a timer run is not made
+# to skip; only when /proc/locks or findmnt is unusable does a fallback open
+# each lock file read-only and probe it with `flock -n`, holding it for an
+# instant.
 #
 # An existing file in the way is replaced only when it is absent, a symlink
 # into this repo (an install by an older install.sh, which linked), identical
@@ -204,18 +205,20 @@ write_manifest() {
 # Running syncs and backups: the per-pair and per-job locks bin/rclone-bisync
 # and bin/rclone-backup hold for a run (their lock(), an flock). Only existing
 # regular lock files owned by this user are looked at (with XDG_RUNTIME_DIR
-# unset the dir is /tmp, shared with other users), and none is ever opened or
-# locked: the helpers take theirs with flock -n, so even an instant's probe
-# lock would make a run starting in that instant skip. Instead each file's
-# device and inode are matched against the FLOCK entries in /proc/locks,
-# "<id>: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<inode> 0 EOF" (waiters
+# unset the dir is /tmp, shared with other users). The primary path never
+# opens or locks them: the helpers take theirs with flock -n, so even an
+# instant's probe lock would make a run starting in that instant skip.
+# Instead each file's device and inode are matched against the FLOCK entries
+# in /proc/locks, "<id>: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<inode> 0 EOF" (waiters
 # carry a "->" after the id). maj:min there is the superblock's device in
 # hex, which is not stat's st_dev on btrfs (a subvolume reports its own
 # anonymous device there), so it is taken from the mount table instead:
 # findmnt's MAJ:MIN (decimal), the same superblock device. Every copy is an
 # atomic rename, so a running helper keeps reading its old inode; this is
 # belt and braces against a run that starts another helper and would see a
-# mix of old and new files.
+# mix of old and new files. Only the fallback (no usable /proc/locks or
+# findmnt) opens each file read-only and probes it with flock -n for an
+# instant.
 #
 # busy_locks: prints "<kind> <name>" for each lock held right now.
 busy_locks() {
