@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic bisync of offline folder %i
+
+[Timer]
+# `rclone-bisync setup %i` overrides the interval in
+# rclone-bisync@%i.timer.d/10-interval.conf (INTERVAL= in the pair's conf).
+OnStartupSec=1min
+OnUnitInactiveSec=2min
+Unit=rclone-bisync@%i.service
+
+[Install]
+WantedBy=timers.target

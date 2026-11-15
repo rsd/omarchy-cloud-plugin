@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rsd.cloud-mounts",
+  "name": "Cloud Mounts",
+  "version": "0.3.2",
+  "author": "Raul Dias",
+  "license": "MIT",
+  "description": "State of the rclone-mount@ systemd user mounts, the rclone-bisync@ offline folders and the rclone-backup@ backups, with mount, unmount, open, sync, log and configure actions.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Cloud Mounts",
+    "description": "Cloud icon showing whether every rclone mount is up and flagging sync conflicts; click for one row per remote (mount toggle, open folder, cache size, log), each offline folder (last sync, Sync now, conflict copies) and each backup (last and next run), and Configure… to open the omarchy-cloud TUI.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

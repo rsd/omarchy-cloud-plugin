@@ -1,0 +1,27 @@
+# Pair and job names: the ONE list of cases every validator is tested against
+# (Rust is_valid_name, bin/rclone-bisync and bin/rclone-backup NAME_RE, the
+# bar's Model.js). Format: <valid|invalid><TAB><name>; "#" lines are comments.
+# Rule: ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ (1..64 chars; ".." inside is allowed).
+valid	a
+valid	Z
+valid	9
+valid	personal
+valid	team-vaults
+valid	vault_A
+valid	a.b
+valid	a..b
+valid	a-
+valid	x.conf
+valid	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+invalid	-a
+invalid	.a
+invalid	_a
+invalid	a/b
+invalid	a b
+invalid	a:b
+invalid	a@b
+invalid	a\b
+invalid	é
+invalid	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+invalid	..
+invalid	

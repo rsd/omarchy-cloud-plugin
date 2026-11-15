@@ -1,0 +1,502 @@
+//! Offline-folder (bisync pair) and backup-job config files, in the contract
+//! format: KEY=VALUE per line, `#` comments and blank lines ignored, no
+//! quoting, unknown or repeated keys rejected. Parse and render are pure.
+
+use crate::validate::{
+    expand_local, has_control, is_valid_files_line, is_valid_interval, is_valid_prefix,
+    is_valid_schedule, parse_keep, split_remote_spec,
+};
+use std::path::{Path, PathBuf};
+
+/// Parses KEY=VALUE lines, accepting only `allowed` keys, each at most once.
+/// Lines end at `\n` only, so a `\r` (a CRLF file) stays in the line and
+/// makes it invalid, as the helpers' parse_conf rejects it.
+pub fn parse_kv(text: &str, allowed: &[&str]) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (i, line) in text.split('\n').enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!("line {}: expected KEY=VALUE", i + 1));
+        };
+        if !allowed.contains(&k) {
+            return Err(format!(
+                "line {}: unknown key {:?}",
+                i + 1,
+                k.chars().take(40).collect::<String>()
+            ));
+        }
+        if out.iter().any(|(ok, _)| ok == k) {
+            return Err(format!("line {}: {k} given twice", i + 1));
+        }
+        if has_control(v) {
+            return Err(format!("line {}: control character in {k}", i + 1));
+        }
+        out.push((k.to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
+fn take(kv: &mut Vec<(String, String)>, key: &str) -> Option<String> {
+    let i = kv.iter().position(|(k, _)| k == key)?;
+    Some(kv.remove(i).1)
+}
+
+/// A config path value: absolute or `~/…`.
+fn check_local(key: &str, v: &str, home: &Path) -> Result<(), String> {
+    expand_local(v, home)
+        .map(|_| ())
+        .map_err(|e| format!("{key}: {e}"))
+}
+
+// ------------------------------------------------------------ bisync pair
+
+pub const PAIR_KEYS: [&str; 4] = ["LOCAL", "REMOTE", "FILTER", "INTERVAL"];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairConf {
+    /// As written: absolute or `~/…`.
+    pub local: String,
+    /// `<remote>:<path>`.
+    pub remote: String,
+    pub filter: Option<String>,
+    pub interval: Option<String>,
+}
+
+impl PairConf {
+    pub fn parse(text: &str, home: &Path) -> Result<PairConf, String> {
+        let mut kv = parse_kv(text, &PAIR_KEYS)?;
+        let local = take(&mut kv, "LOCAL").ok_or("LOCAL is missing")?;
+        let remote = take(&mut kv, "REMOTE").ok_or("REMOTE is missing")?;
+        let c = PairConf {
+            local,
+            remote,
+            filter: take(&mut kv, "FILTER"),
+            interval: take(&mut kv, "INTERVAL"),
+        };
+        c.validate(home)?;
+        Ok(c)
+    }
+
+    pub fn validate(&self, home: &Path) -> Result<(), String> {
+        check_local("LOCAL", &self.local, home)?;
+        // A backslash could end a line of the generated drop-in.
+        if self.local.contains('\\') {
+            return Err("LOCAL: must not contain a backslash".into());
+        }
+        split_remote_spec(&self.remote)
+            .ok_or("REMOTE: expected <remote>:<path> with a valid remote name")?;
+        // `FILTER=` (empty) means no filter at all.
+        if let Some(f) = &self.filter
+            && !f.is_empty()
+        {
+            check_local("FILTER", f, home)?;
+        }
+        if let Some(i) = &self.interval
+            && !is_valid_interval(i)
+        {
+            return Err(
+                "INTERVAL: a systemd timespan of at least 30s, like 30s, 2min, 1h, 1d".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The filter file the helper uses: FILTER when set (empty = none), else
+    /// the pair's default file when it exists.
+    pub fn filter_file(&self, home: &Path, default: &Path) -> Result<Option<PathBuf>, String> {
+        match self.filter.as_deref() {
+            Some("") => Ok(None),
+            Some(f) => expand_local(f, home)
+                .map(Some)
+                .map_err(|e| format!("FILTER: {e}")),
+            None => Ok(default.exists().then(|| default.to_path_buf())),
+        }
+    }
+
+    pub fn remote_name(&self) -> &str {
+        self.remote.split_once(':').map(|(n, _)| n).unwrap_or("")
+    }
+
+    pub fn render(&self) -> String {
+        let mut s =
+            String::from("# Offline folder (rclone bisync pair), managed by omarchy-cloud.\n");
+        s.push_str(&format!("LOCAL={}\nREMOTE={}\n", self.local, self.remote));
+        if let Some(f) = &self.filter {
+            s.push_str(&format!("FILTER={f}\n"));
+        }
+        if let Some(i) = &self.interval {
+            s.push_str(&format!("INTERVAL={i}\n"));
+        }
+        s
+    }
+}
+
+const FILTER_HEADER: &str =
+    "# Generated by omarchy-cloud: the included files and their conflict copies.";
+
+/// The filter file for include patterns: `+ P`, `+ P.conflict*` for each
+/// (a folder pattern, ending in `/`, is `+ P**`: everything in it, no
+/// conflict line), then `- **`. No patterns → None (the whole folder, no
+/// filter file).
+pub fn filter_text(patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut s = format!("{FILTER_HEADER}\n");
+    for p in patterns {
+        if p.ends_with('/') {
+            s.push_str(&format!("+ {p}**\n"));
+        } else {
+            s.push_str(&format!("+ {p}\n+ {p}.conflict*\n"));
+        }
+    }
+    s.push_str("- **\n");
+    Some(s)
+}
+
+/// The include patterns of a filter written by `filter_text` (the inverse),
+/// or None when the text is not such a filter (hand-written or changed).
+pub fn patterns_of_filter(text: &str) -> Option<Vec<String>> {
+    let mut lines = text.split('\n');
+    if lines.next()? != FILTER_HEADER {
+        return None;
+    }
+    let rules: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+    let (last, rules) = rules.split_last()?;
+    if *last != "- **" {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rules.len() {
+        let p = rules[i].strip_prefix("+ ").filter(|p| !p.is_empty())?;
+        let conflict = format!("+ {p}.conflict*");
+        if rules.get(i + 1) == Some(&conflict.as_str()) {
+            out.push(p.to_string());
+            i += 2;
+        } else {
+            let dir = p.strip_suffix("**").filter(|d| d.ends_with('/'))?;
+            out.push(dir.to_string());
+            i += 1;
+        }
+    }
+    (!out.is_empty() && filter_text(&out).as_deref() == Some(text)).then_some(out)
+}
+
+/// Patterns as the form's field shows them: joined with `, `.
+pub fn patterns_field(patterns: &[String]) -> String {
+    patterns.join(", ")
+}
+
+// ------------------------------------------------------------- backup job
+
+pub const JOB_KEYS: [&str; 6] = [
+    "REMOTE",
+    "FILES",
+    "DEST",
+    "KEEP",
+    "SCHEDULE",
+    "STRIP_PREFIX",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobConf {
+    /// `<remote>:` or `<remote>:<prefix>`.
+    pub remote: String,
+    pub files: Option<String>,
+    pub dest: String,
+    pub keep: Option<u32>,
+    pub schedule: Option<String>,
+    pub strip_prefix: Option<String>,
+}
+
+impl JobConf {
+    pub fn parse(text: &str, home: &Path) -> Result<JobConf, String> {
+        let mut kv = parse_kv(text, &JOB_KEYS)?;
+        let remote = take(&mut kv, "REMOTE").ok_or("REMOTE is missing")?;
+        let dest = take(&mut kv, "DEST").ok_or("DEST is missing")?;
+        let keep = match take(&mut kv, "KEEP") {
+            Some(k) => Some(parse_keep(&k).ok_or("KEEP: expected a number from 1 to 365")?),
+            None => None,
+        };
+        let c = JobConf {
+            remote,
+            files: take(&mut kv, "FILES"),
+            dest,
+            keep,
+            schedule: take(&mut kv, "SCHEDULE"),
+            strip_prefix: take(&mut kv, "STRIP_PREFIX"),
+        };
+        c.validate(home)?;
+        Ok(c)
+    }
+
+    pub fn validate(&self, home: &Path) -> Result<(), String> {
+        let (_, prefix) = split_remote_spec(&self.remote)
+            .ok_or("REMOTE: expected <remote>: or <remote>:<prefix> with a valid remote name")?;
+        if !is_valid_prefix(prefix) {
+            return Err(
+                "REMOTE: the prefix must be a relative path (no leading or trailing /, no //, . or ..)"
+                    .into(),
+            );
+        }
+        check_local("DEST", &self.dest, home)?;
+        if let Some(f) = &self.files {
+            check_local("FILES", f, home)?;
+        }
+        if let Some(k) = self.keep
+            && !(1..=365).contains(&k)
+        {
+            return Err("KEEP: expected a number from 1 to 365".into());
+        }
+        if let Some(s) = &self.schedule
+            && !is_valid_schedule(s)
+        {
+            return Err("SCHEDULE: expected an OnCalendar value like daily or *-*-* 03:00".into());
+        }
+        if let Some(p) = &self.strip_prefix
+            && (has_control(p) || p.len() > crate::validate::MAX_TEXT)
+        {
+            return Err("STRIP_PREFIX: control characters are not allowed".into());
+        }
+        Ok(())
+    }
+
+    pub fn remote_name(&self) -> &str {
+        self.remote.split_once(':').map(|(n, _)| n).unwrap_or("")
+    }
+
+    pub fn render(&self) -> String {
+        let mut s = String::from(
+            "# Backup job (read-only copies from a remote), managed by omarchy-cloud.\n",
+        );
+        s.push_str(&format!("REMOTE={}\n", self.remote));
+        if let Some(f) = &self.files {
+            s.push_str(&format!("FILES={f}\n"));
+        }
+        s.push_str(&format!("DEST={}\n", self.dest));
+        if let Some(k) = self.keep {
+            s.push_str(&format!("KEEP={k}\n"));
+        }
+        if let Some(sc) = &self.schedule {
+            s.push_str(&format!("SCHEDULE={sc}\n"));
+        }
+        if let Some(p) = &self.strip_prefix {
+            s.push_str(&format!("STRIP_PREFIX={p}\n"));
+        }
+        s
+    }
+}
+
+/// The template for a new files list.
+pub fn files_template(job: &str, remote: &str) -> String {
+    format!(
+        "# Files backed up by job {job}: one path per line, relative to {remote}\n\
+         # (no leading or trailing /, no //, . or .. segments). Lines starting with # are ignored.\n"
+    )
+}
+
+/// Checks a files list; returns the number of entries or the first bad line.
+/// Lines split on `\n` only, as the helper's `read`: a CRLF list keeps its
+/// `\r` and is rejected, as the helper rejects it (blank and comment lines
+/// are skipped first, as there).
+pub fn check_files_list(text: &str) -> Result<usize, String> {
+    let mut n = 0;
+    for (i, l) in text.split('\n').enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if has_control(l) {
+            return Err(format!(
+                "line {}: control character (a CRLF line ending? save the list with LF endings)",
+                i + 1
+            ));
+        }
+        if !is_valid_files_line(l) {
+            return Err(format!(
+                "line {}: paths must be relative (no leading or trailing /, no //, . or ..)",
+                i + 1
+            ));
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const HOME: &str = "/home/u";
+
+    #[test]
+    fn pair_roundtrip() {
+        let home = Path::new(HOME);
+        let text = "# comment\n\nLOCAL=~/Vaults\nREMOTE=onedrive:Backup/Vaults\nFILTER=~/.config/rclone-bisync/vault-A.filter\nINTERVAL=2min\n";
+        let c = PairConf::parse(text, home).unwrap();
+        assert_eq!(c.local, "~/Vaults");
+        assert_eq!(c.remote_name(), "onedrive");
+        assert_eq!(c.interval.as_deref(), Some("2min"));
+        assert_eq!(PairConf::parse(&c.render(), home).unwrap(), c);
+        let min = PairConf {
+            local: "/srv/a".into(),
+            remote: "gdrive:".into(),
+            filter: None,
+            interval: None,
+        };
+        assert_eq!(
+            min.render(),
+            "# Offline folder (rclone bisync pair), managed by omarchy-cloud.\nLOCAL=/srv/a\nREMOTE=gdrive:\n"
+        );
+        assert_eq!(PairConf::parse(&min.render(), home).unwrap(), min);
+        let nf = PairConf::parse("LOCAL=/a\nREMOTE=x:y\nFILTER=\n", home).unwrap();
+        assert_eq!(nf.filter.as_deref(), Some(""));
+        let dflt = Path::new("/nonexistent/omarchy-cloud/p.filter");
+        assert_eq!(nf.filter_file(home, dflt).unwrap(), None);
+        assert_eq!(min.filter_file(home, dflt).unwrap(), None);
+        assert_eq!(
+            c.filter_file(home, dflt).unwrap(),
+            Some(PathBuf::from(
+                "/home/u/.config/rclone-bisync/vault-A.filter"
+            ))
+        );
+    }
+
+    #[test]
+    fn pair_rejects() {
+        let home = Path::new(HOME);
+        for bad in [
+            "LOCAL=/a\nREMOTE=x:y\nCOLOR=red\n",
+            "LOCAL=/a\nREMOTE=x:y\nLOCAL=/b\n",
+            "REMOTE=x:y\n",
+            "LOCAL=/a\n",
+            "LOCAL=rel\nREMOTE=x:y\n",
+            "LOCAL=/a\nREMOTE=noremote\n",
+            "LOCAL=/a\nREMOTE=-x:y\n",
+            "LOCAL=/a\nREMOTE=x:y\nINTERVAL=2m\n",
+            "LOCAL=/a\nREMOTE=x:y\njunk\n",
+            "LOCAL = /a\nREMOTE=x:y\n",
+            "LOCAL=/a\\b\nREMOTE=x:y\n",
+            "LOCAL=/a\nREMOTE=x:y\nINTERVAL=500ms\n",
+            "LOCAL=/a\nREMOTE=x:y\nINTERVAL=10s\n",
+            "LOCAL=~\nREMOTE=x:y\n",
+            // CRLF or any other control character in a KEY=VALUE line.
+            "LOCAL=/a\r\nREMOTE=x:y\r\n",
+            "LOCAL=/a\nREMOTE=x:y\r\n",
+            "LOCAL=/a\nREMOTE=x:y\nINTERVAL=2min\r",
+            "LOCAL=/a\x01\nREMOTE=x:y\n",
+        ] {
+            assert!(PairConf::parse(bad, home).is_err(), "{bad:?}");
+        }
+        // Comments and blank lines may carry a \r, as in the helpers.
+        assert!(PairConf::parse("# c\r\n\r\nLOCAL=/a\nREMOTE=x:y\n", home).is_ok());
+        assert!(JobConf::parse("REMOTE=r:\r\nDEST=/b\n", home).is_err());
+    }
+
+    #[test]
+    fn filters() {
+        assert_eq!(filter_text(&[]), None);
+        let f = filter_text(&["a.kdbx".into(), "b/*.key".into()]).unwrap();
+        let rules: Vec<&str> = f.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            rules,
+            [
+                "+ a.kdbx",
+                "+ a.kdbx.conflict*",
+                "+ b/*.key",
+                "+ b/*.key.conflict*",
+                "- **"
+            ]
+        );
+        // A folder pattern takes everything in it; spaces stay in a pattern.
+        let pats: Vec<String> = vec!["Docs/".into(), "My Vault.kdbx".into()];
+        let f = filter_text(&pats).unwrap();
+        let rules: Vec<&str> = f.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            rules,
+            [
+                "+ Docs/**",
+                "+ My Vault.kdbx",
+                "+ My Vault.kdbx.conflict*",
+                "- **"
+            ]
+        );
+        // Read back into the form's field.
+        assert_eq!(patterns_of_filter(&f).as_deref(), Some(pats.as_slice()));
+        assert_eq!(
+            patterns_field(&patterns_of_filter(&f).unwrap()),
+            "Docs/, My Vault.kdbx"
+        );
+        let g = filter_text(&["a.kdbx".into(), "c/**".into()]).unwrap();
+        assert_eq!(
+            patterns_field(&patterns_of_filter(&g).unwrap()),
+            "a.kdbx, c/**"
+        );
+        for not_ours in [
+            "+ a\n- **\n",
+            &format!("{FILTER_HEADER}\n+ a\n- **\n"),
+            &format!("{FILTER_HEADER}\n+ a\n+ a.conflict*\n"),
+            &format!("{FILTER_HEADER}\n+ a\n+ a.conflict*\n- **\n- x\n"),
+            &format!("{FILTER_HEADER}\n- **\n"),
+            "",
+        ] {
+            assert_eq!(patterns_of_filter(not_ours), None, "{not_ours:?}");
+        }
+    }
+
+    #[test]
+    fn job_roundtrip() {
+        let home = Path::new(HOME);
+        let text = "REMOTE=work_drive:\nFILES=~/.config/rclone-backup/archive-vaults.files\nDEST=~/Backups/vaults\nKEEP=14\nSCHEDULE=daily\nSTRIP_PREFIX=acme/\n";
+        let c = JobConf::parse(text, home).unwrap();
+        assert_eq!(c.keep, Some(14));
+        assert_eq!(c.strip_prefix.as_deref(), Some("acme/"));
+        assert_eq!(c.remote_name(), "work_drive");
+        assert_eq!(JobConf::parse(&c.render(), home).unwrap(), c);
+        let min = JobConf::parse("REMOTE=r:pre/fix\nDEST=/backup\n", home).unwrap();
+        assert_eq!(min.keep, None);
+        assert_eq!(JobConf::parse(&min.render(), home).unwrap(), min);
+    }
+
+    #[test]
+    fn job_rejects() {
+        let home = Path::new(HOME);
+        for bad in [
+            "REMOTE=r:\nDEST=/b\nEXTRA=1\n",
+            "REMOTE=r:\n",
+            "DEST=/b\n",
+            "REMOTE=r:pre/\nDEST=/b\n",
+            "REMOTE=r:\nDEST=/b\nKEEP=0\n",
+            "REMOTE=r:\nDEST=/b\nKEEP=400\n",
+            "REMOTE=r:\nDEST=/b\nSCHEDULE=daily;reboot\n",
+            "REMOTE=r:\nDEST=relative\n",
+            "REMOTE=r:\nDEST=/b\nDEST=/c\n",
+            "REMOTE=r:/pre\nDEST=/b\n",
+            "REMOTE=r:a//b\nDEST=/b\n",
+            "REMOTE=r:a/../b\nDEST=/b\n",
+        ] {
+            assert!(JobConf::parse(bad, home).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn files_lists() {
+        assert_eq!(check_files_list(&files_template("j", "r:")).unwrap(), 0);
+        assert_eq!(check_files_list("# c\na/b.kdbx\n\nc.key\n").unwrap(), 2);
+        assert!(check_files_list("/abs\n").is_err());
+        assert!(check_files_list("a/../b\n").is_err());
+        // CRLF: the helper's `read` keeps the \r and rejects the line.
+        let e = check_files_list("# c\r\na/b.kdbx\r\n").unwrap_err();
+        assert!(e.starts_with("line 2: control character"), "{e}");
+        assert!(check_files_list("a\x1b.kdbx\n").is_err());
+        // Blank and comment lines with a \r are skipped, as there.
+        assert_eq!(check_files_list("\r\n# c\r\na.kdbx\n").unwrap(), 1);
+        assert_eq!(check_files_list("a.kdbx").unwrap(), 1);
+        for bad in ["./a\n", "a//b\n", "dir/\n"] {
+            assert!(check_files_list(bad).is_err(), "{bad:?}");
+        }
+    }
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=Watch the local folder of offline folder %i
+
+[Path]
+# PathChanged= is not set here: `rclone-bisync setup %i` writes it into
+# rclone-bisync@%i.path.d/10-local.conf (the pair's LOCAL directory). An
+# instance without that drop-in is refused by systemd ("lacks path setting").
+# A directory watch (inotify) catches temp-file + rename saves; a file watch
+# would lose the inode on rename.
+Unit=rclone-bisync@%i.service
+# A path unit that hits its trigger limit FAILS and stops watching until it
+# is restarted (systemd.path(5)), so the limit must be one that editor saves
+# cannot reach: each save is a handful of inotify events, and triggers that
+# arrive while a run is active merge into it. Only an event storm (a program
+# rewriting the folder in a loop) gets here; the bar plugin and omarchy-cloud
+# then show "watch stopped" and omarchy-cloud restarts it (w).
+TriggerLimitIntervalSec=2s
+TriggerLimitBurst=200
+
+[Install]
+WantedBy=default.target

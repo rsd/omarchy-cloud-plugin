@@ -1,0 +1,38 @@
+[Unit]
+Description=rclone mount of %i: at /mnt/cloud/%i
+# No network-online.target: the user manager has no such unit, so ordering
+# on it does nothing. A mount started before the network is up fails and is
+# restarted every RestartSec until it comes up; with no start limit it never
+# gives up (one start per 15s could not reach the default limit either).
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+# rclone signals READY once the mount is up; a start stuck longer than this
+# (an unreachable remote) fails and is retried by Restart=.
+TimeoutStartSec=2min
+# Defaults suit remotes WITHOUT change polling (S3). Remotes with ChangeNotify
+# (Drive, OneDrive) override these in %h/.config/rclone-mount/<remote>.env
+# (RCLONE_* environment variables; the file wins over Environment=).
+# The tunables live here as Environment=, never as command-line flags: an rclone
+# flag beats its environment variable, so a flag would shadow the .env file.
+Environment=RCLONE_DIR_CACHE_TIME=5m
+Environment=RCLONE_POLL_INTERVAL=1m
+Environment=RCLONE_VFS_CACHE_MAX_SIZE=10G
+Environment=RCLONE_VFS_CACHE_MAX_AGE=72h
+Environment=RCLONE_VFS_WRITE_BACK=1s
+EnvironmentFile=-%h/.config/rclone-mount/%i.env
+ExecStartPre=/usr/bin/mkdir -p /mnt/cloud/%i
+ExecStart=/usr/bin/rclone mount %i: /mnt/cloud/%i \
+    --cache-dir %h/.cache/rclone \
+    --vfs-cache-mode full \
+    --vfs-read-chunk-size 8M \
+    --vfs-read-chunk-size-limit 32M \
+    --vfs-read-ahead 8M \
+    --buffer-size 4M
+ExecStop=/usr/bin/fusermount3 -uz /mnt/cloud/%i
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

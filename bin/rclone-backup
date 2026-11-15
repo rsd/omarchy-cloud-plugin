@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# Dated local backup copies of files on a remote ("backup job"). Read-only
+# toward the remote: the only rclone verb used is `copyto <remote> <local>`.
+#
+#   rclone-backup run <job>       one run (used by rclone-backup@<job>.service)
+#   rclone-backup setup <job>     write the timer drop-in (SCHEDULE), daemon-reload
+#   rclone-backup teardown <job>  remove that drop-in, daemon-reload
+#   rclone-backup list <job>      print the validated files list (exit 64 when
+#                                 the conf, or the list, is invalid or empty)
+#   rclone-backup validate <job>  the conf, the files list and every setup-time
+#                                 guard, refusing; writes nothing, runs no rclone
+#                                 nor systemctl (exit 0 valid, 64 not)
+#
+# Config: ~/.config/rclone-backup/<job>.conf (KEY=VALUE; parsed, never sourced):
+#   REMOTE=remote:[prefix]  DEST=~/dir  [FILES=~/file] [KEEP=14] [SCHEDULE=daily]
+#   [STRIP_PREFIX=dir/]
+# Copy names: <job>@, then the path minus STRIP_PREFIX with / -> __, date
+# before the extension: job admin, acme/A/B/C.kdbx -> admin@A__B__C.2026-11-14.kdbx.
+# A job name has no @, so two jobs sharing a DEST never touch each other's
+# copies. The newest KEEP per file stay. Copies named without the prefix
+# (<stem>.<date><ext>, written up to 0.3.1) are left as they are: never
+# pruned, renamed or deleted.
+# DEST is created 700 when missing; an existing DEST keeps its mode.
+# One run per job at a time (flock on ${XDG_RUNTIME_DIR:-/tmp}/rclone-backup-<job>.lock):
+# a run that finds another one active says so and exits 0.
+# Guards, as written and with symlinks resolved: DEST must not overlap (equal,
+# contain or be inside) the LOCAL folder of any offline folder
+# (~/.config/rclone-bisync/*.conf; the copies, and their pruning, would be
+# synced to that remote), nor the DEST of any other job; DEST must not be
+# inside a cloud location (/mnt/cloud, ~/Cloud, or a FUSE mount point of
+# $OMARCHY_CLOUD_MOUNTS, default /proc/self/mounts). setup and validate refuse
+# with exit 64; run only prints a warning on stderr and goes on (a backup is
+# never stopped).
+# Exit 64 on a usage error, an invalid name or an invalid conf (an empty files
+# list included; run then notifies and records exit=64); 1 if a copy failed.
+set -u
+umask 077
+
+PROG=rclone-backup
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rclone-backup"
+BISYNC_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rclone-bisync"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-backup"
+MOUNTS_FILE=${OMARCHY_CLOUD_MOUNTS:-/proc/self/mounts}
+DATE_GLOB='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+
+usage() {
+  echo "usage: $PROG {run|setup|teardown|list|validate} <job>" >&2
+  exit 64
+}
+
+# Set by `run` so that a conf error there is notified and recorded too.
+ON_INVALID=
+
+die64() {
+  echo "$PROG: $*" >&2
+  [[ -n $ON_INVALID ]] && $ON_INVALID "$*"
+  exit 64
+}
+
+# valid_name <name>: NAME_RE in the C locale (in a UTF-8 locale bash's
+# [A-Za-z] also matches letters like é).
+valid_name() {
+  local LC_ALL=C
+  [[ $1 =~ $NAME_RE ]]
+}
+
+expand_path() {
+  local v=$1
+  # shellcheck disable=SC2088 # a literal ~/ prefix is what is matched
+  [[ ${v:0:2} == '~/' ]] && v="$HOME/${v:2}"
+  [[ $v == /* ]] || return 1
+  printf '%s' "$v"
+}
+
+# A relative remote path: no leading or trailing /, no empty, . or .. segment.
+valid_rel() {
+  local p=$1 seg segs=()
+  [[ -n $p && $p != /* && $p != */ && $p != *[[:cntrl:]]* ]] || return 1
+  IFS=/ read -ra segs <<<"$p"
+  for seg in "${segs[@]}"; do
+    [[ -n $seg && $seg != . && $seg != .. ]] || return 1
+  done
+  [[ $p != *//* ]]
+}
+
+declare -A CONF=()
+parse_conf() {
+  local file=$1 line n=0 key
+  shift
+  local -A allowed=()
+  for key; do allowed[$key]=1; done
+  [[ -f $file && -r $file ]] || die64 "no conf $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z_]*)=([^[:cntrl:]]*)$ ]] || die64 "$file:$n: not a KEY=VALUE line"
+    key=${BASH_REMATCH[1]}
+    [[ -n ${allowed[$key]:-} ]] || die64 "$file:$n: unknown key $key"
+    [[ -z ${CONF[$key]+x} ]] || die64 "$file:$n: $key given twice"
+    CONF[$key]=${BASH_REMATCH[2]}
+  done <"$file"
+}
+
+# load <job>: validates the name, the conf and the files list. Sets REMOTE_BASE
+# (prefix to put before a path), DEST KEEP SCHEDULE STRIP, and PATHS[] with
+# STEMS[] / EXTS[] (copy name = JOB@STEM.<date>EXT). An empty files list is
+# an invalid conf.
+load() {
+  JOB=$1
+  valid_name "$JOB" || die64 "invalid job name"
+  CONF=()
+  parse_conf "$CONF_DIR/$JOB.conf" REMOTE FILES DEST KEEP SCHEDULE STRIP_PREFIX
+
+  local remote=${CONF[REMOTE]:-} prefix
+  [[ -n $remote ]] || die64 "$JOB: REMOTE is required"
+  if [[ $remote != *:* ]] || ! valid_name "${remote%%:*}"; then
+    die64 "$JOB: REMOTE must be <remote>: or <remote>:<prefix>"
+  fi
+  prefix=${remote#*:}
+  if [[ -n $prefix ]]; then
+    valid_rel "$prefix" || die64 "$JOB: invalid prefix in REMOTE (no leading or trailing /, no ..)"
+    REMOTE_BASE="$remote/"
+  else
+    REMOTE_BASE=$remote
+  fi
+
+  [[ -n ${CONF[DEST]:-} ]] || die64 "$JOB: DEST is required"
+  DEST=$(expand_path "${CONF[DEST]}") || die64 "$JOB: DEST must be absolute or start with ~/"
+
+  KEEP=${CONF[KEEP]:-14}
+  if ! [[ $KEEP =~ ^[0-9]{1,3}$ ]] || ((10#$KEEP < 1 || 10#$KEEP > 365)); then
+    die64 "$JOB: KEEP must be 1..365"
+  fi
+  KEEP=$((10#$KEEP))
+
+  SCHEDULE=${CONF[SCHEDULE]:-daily}
+  [[ $SCHEDULE =~ ^[A-Za-z0-9*:,./\ -]{1,64}$ ]] || die64 "$JOB: invalid SCHEDULE"
+
+  STRIP=${CONF[STRIP_PREFIX]:-}
+  [[ $STRIP != *[[:cntrl:]]* ]] || die64 "$JOB: invalid STRIP_PREFIX"
+
+  local files
+  if [[ -n ${CONF[FILES]+x} ]]; then
+    files=$(expand_path "${CONF[FILES]}") || die64 "$JOB: FILES must be absolute or start with ~/"
+  else
+    files=$CONF_DIR/$JOB.files
+  fi
+  [[ -f $files && -r $files ]] || die64 "$JOB: files list $files does not exist"
+
+  PATHS=() STEMS=() EXTS=()
+  local -A seen=()
+  local line n=0 base last stem ext
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    valid_rel "$line" || die64 "$files:$n: not a relative path (no leading /, no . or .. segments)"
+    base=$line
+    [[ -n $STRIP && $base == "$STRIP"* ]] && base=${base#"$STRIP"}
+    [[ -n $base && $base != /* ]] || die64 "$files:$n: nothing left after STRIP_PREFIX"
+    base=${base//\//__}
+    last=${line##*/}
+    if [[ $last =~ ^.+\.([^.]+)$ ]]; then
+      ext=.${BASH_REMATCH[1]}
+      stem=${base%"$ext"}
+    else
+      ext='' stem=$base
+    fi
+    [[ -z ${seen[$stem$ext]:-} ]] || die64 "$files:$n: same copy name as line ${seen[$stem$ext]}"
+    seen[$stem$ext]=$n
+    PATHS+=("$line") STEMS+=("$stem") EXTS+=("$ext")
+  done <"$files"
+  ((${#PATHS[@]})) || die64 "$JOB: the files list $files is empty"
+}
+
+# FUSE_MPS: the FUSE mount points (fuse_mounts), read once by load_fuse.
+FUSE_MPS=()
+FUSE_LOADED=
+load_fuse() {
+  local mp _type
+  [[ -z $FUSE_LOADED ]] || return 0
+  FUSE_LOADED=1
+  while IFS=$'\t' read -r mp _type; do
+    [[ -n $mp ]] && FUSE_MPS+=("$mp")
+  done < <(fuse_mounts)
+}
+
+# canon <absolute path>: symlinks and .. resolved (realpath -m: missing parts
+# are fine), or the path as is when realpath is not available, fails, or
+# takes more than 5 s. A path at or under a FUSE mount point (as written) is
+# returned as is, never resolved: a hung mount would block realpath, and a
+# guard must never stop a run.
+canon() {
+  local c mp
+  load_fuse
+  for mp in "${FUSE_MPS[@]}"; do
+    within "$1" "$mp" && { printf '%s' "$1"; return 0; }
+  done
+  c=$(timeout -k 1 5 realpath -m -- "$1" 2>/dev/null) || c=$1
+  printf '%s' "$c"
+}
+
+# overlaps <a> <b>: a and b are the same directory or one is inside the
+# other, compared by path components (/a/b and /a/bc do not overlap).
+overlaps() {
+  local a=${1%/} b=${2%/}
+  [[ -z $a || -z $b || $a == "$b" || $a == "$b"/* || $b == "$a"/* ]]
+}
+
+# within <path> <root>: path is root or inside it, by path components.
+within() {
+  local p=${1%/} r=${2%/}
+  [[ -z $r || $p == "$r" || $p == "$r"/* ]]
+}
+
+# guard_hit <refuse|warn> <message>: refuse (exit 64) or warn on stderr.
+guard_hit() {
+  [[ $1 == refuse ]] && die64 "$2"
+  echo "$PROG: warning: $2; continuing" >&2
+}
+
+# conf_value <file> <KEY>: the first KEY= value of a conf (another job's or
+# pair's: only that line is read, its own validation is its script's).
+conf_value() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
+
+# guard_pairs <refuse|warn>: when DEST overlaps the LOCAL folder of an
+# offline folder, as written or with symlinks resolved, refuse (exit 64) or
+# print a warning on stderr and return 0.
+guard_pairs() {
+  local mode=$1 f v l pair
+  for f in "$BISYNC_CONF_DIR"/*.conf; do
+    [[ -f $f && -r $f ]] || continue
+    v=$(conf_value "$f" LOCAL)
+    [[ -n $v ]] || continue
+    l=$(expand_path "$v") || continue
+    pair=${f##*/}
+    pair=${pair%.conf}
+    if overlaps "$DEST" "$l" || overlaps "$(canon "$DEST")" "$(canon "$l")"; then
+      guard_hit "$mode" "$JOB: DEST $DEST overlaps LOCAL $l of offline folder $pair; a backup destination must not be inside an offline folder, nor contain one"
+    fi
+  done
+}
+
+# guard_jobs <refuse|warn>: DEST against the DEST of every other job (their
+# copies and their pruning would mix).
+guard_jobs() {
+  local mode=$1 f v d other
+  for f in "$CONF_DIR"/*.conf; do
+    [[ -f $f && -r $f && $f != "$CONF_DIR/$JOB.conf" ]] || continue
+    v=$(conf_value "$f" DEST)
+    [[ -n $v ]] || continue
+    d=$(expand_path "$v") || continue
+    other=${f##*/}
+    other=${other%.conf}
+    if overlaps "$DEST" "$d" || overlaps "$(canon "$DEST")" "$(canon "$d")"; then
+      guard_hit "$mode" "$JOB: DEST $DEST overlaps DEST $d of backup job $other; each backup job needs its own destination"
+    fi
+  done
+}
+
+# fuse_mounts: the mount points of FUSE file systems (fstype fuse or fuse.*,
+# not fusectl) in $MOUNTS_FILE, octal escapes (\040) decoded, one per line
+# as "<mount point>\t<fstype>".
+fuse_mounts() {
+  local _src mp type _rest out rest
+  [[ -r $MOUNTS_FILE ]] || return 0
+  while read -r _src mp type _rest; do
+    [[ $type == fuse || $type == fuse.* ]] || continue
+    out=
+    while [[ $mp =~ ^([^\\]*)\\([0-7]{3})(.*)$ ]]; do
+      rest=${BASH_REMATCH[3]}
+      # shellcheck disable=SC2059 # the octal escape is the format on purpose
+      out+=${BASH_REMATCH[1]}$(printf "\\${BASH_REMATCH[2]}")
+      mp=$rest
+    done
+    printf '%s\t%s\n' "$out$mp" "$type"
+  done <"$MOUNTS_FILE"
+}
+
+# guard_cloud <refuse|warn>: DEST must not be inside a cloud location:
+# /mnt/cloud, ~/Cloud (as written and resolved; canon never resolves a root
+# that is, or is inside, a FUSE mount), or any FUSE mount point (the
+# copies and their pruning would go to a remote; with the mount down, into
+# the bare mount point the next mount hides).
+guard_cloud() {
+  local mode=$1 c r mp type
+  c=$(canon "$DEST")
+  for r in /mnt/cloud "$HOME/Cloud"; do
+    if within "$DEST" "$r" || within "$c" "$r" || within "$c" "$(canon "$r")"; then
+      guard_hit "$mode" "$JOB: DEST $DEST is inside the cloud location $r; a backup destination must be a local folder"
+      return 0
+    fi
+  done
+  while IFS=$'\t' read -r mp type; do
+    [[ -n $mp ]] || continue
+    if within "$DEST" "$mp" || within "$c" "$mp"; then
+      guard_hit "$mode" "$JOB: DEST $DEST is inside the FUSE mount $mp ($type); a backup destination must be a local folder"
+      return 0
+    fi
+  done < <(fuse_mounts)
+}
+
+# guards <refuse|warn>: every overlap guard.
+guards() {
+  load_fuse
+  guard_pairs "$1"
+  guard_jobs "$1"
+  guard_cloud "$1"
+}
+
+# check_schedule: SCHEDULE must parse as OnCalendar (when systemd-analyze is
+# there; read-only).
+check_schedule() {
+  if command -v systemd-analyze >/dev/null && ! systemd-analyze calendar "$SCHEDULE" >/dev/null 2>&1; then
+    die64 "$JOB: SCHEDULE '$SCHEDULE' is not a valid OnCalendar value"
+  fi
+}
+
+write_state() {
+  local tmp
+  mkdir -p "$STATE_DIR" || return 1
+  tmp=$(mktemp "$STATE_DIR/.$JOB.state.XXXXXX") || return 1
+  if ! printf 'time=%s\nexit=%s\nok=%s\nfailed=%s\n' "$(date +%s)" "$1" "$2" "$3" >"$tmp" ||
+    ! mv -f "$tmp" "$STATE_DIR/$JOB.state"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+notify_failure() {
+  command -v notify-send >/dev/null &&
+    notify-send -u normal -a rclone-backup "Backup $JOB" "$1; see: journalctl --user -u rclone-backup@$JOB"
+}
+
+run_invalid() {
+  notify_failure "Invalid configuration: $1"
+  write_state 64 0 0
+}
+
+cmd_run() {
+  local today i path stem ext out tmp ok=0 failed=0 old
+  today=$(date +%F)
+  # Only a DEST created here is made 700: an existing folder keeps its mode.
+  if [[ ! -d $DEST ]] && { ! install -d -m 700 "$DEST" || ! chmod 700 "$DEST"; }; then
+    echo "$PROG: cannot create $DEST" >&2
+    notify_failure "Cannot create $DEST"
+    write_state 1 0 "${#PATHS[@]}"
+    exit 1
+  fi
+  shopt -s nullglob
+  for i in "${!PATHS[@]}"; do
+    path=${PATHS[i]} stem=$JOB@${STEMS[i]} ext=${EXTS[i]}
+    out="$DEST/$stem.$today$ext"
+    tmp="$out.part"
+    # Leftovers of an interrupted run of this file (any day).
+    # shellcheck disable=SC2086 # DATE_GLOB is a glob on purpose
+    rm -f -- "$DEST/$stem".$DATE_GLOB"$ext".part
+    if ! rclone copyto "$REMOTE_BASE$path" "$tmp" --retries 3 --log-level ERROR; then
+      rm -f -- "$tmp"
+      echo "$PROG: FAILED $path" >&2
+      failed=$((failed + 1))
+      continue
+    fi
+    # A copy that could not be put in place is a failure too, and its older
+    # copies are not pruned: nothing new replaces them.
+    if ! mv -f -- "$tmp" "$out" || ! chmod 600 "$out"; then
+      rm -f -- "$tmp"
+      echo "$PROG: FAILED $path (cannot put ${out##*/} in place)" >&2
+      failed=$((failed + 1))
+      continue
+    fi
+    echo "$PROG: $path -> ${out##*/}"
+    ok=$((ok + 1))
+    # Dated names sort chronologically: keep the newest $KEEP.
+    # shellcheck disable=SC2086 # DATE_GLOB is a glob on purpose
+    mapfile -t old < <(printf '%s\n' "$DEST/$stem".$DATE_GLOB"$ext" | LC_ALL=C sort | head -n -"$KEEP")
+    ((${#old[@]})) && rm -f -- "${old[@]}"
+  done
+  if ((failed)); then
+    notify_failure "$failed of ${#PATHS[@]} files failed to back up"
+    write_state 1 "$ok" "$failed"
+    exit 1
+  fi
+  write_state 0 "$ok" 0
+  exit 0
+}
+
+# lock: per-job flock; busy -> message and exit 0.
+lock() {
+  local file="${XDG_RUNTIME_DIR:-/tmp}/rclone-backup-$JOB.lock"
+  exec 9>"$file" || {
+    echo "$PROG: cannot open lock $file" >&2
+    exit 1
+  }
+  flock -n 9 || {
+    echo "$PROG: $JOB: another run is active, skipping"
+    exit 0
+  }
+}
+
+cmd_setup() {
+  local d="$UNIT_DIR/rclone-backup@$JOB.timer.d" tmp
+  check_schedule
+  mkdir -p "$d" || exit 1
+  tmp=$(mktemp "$d/10-schedule.conf.XXXXXX") || exit 1
+  # An empty OnCalendar= resets the template's daily before the job's value.
+  if ! printf '[Timer]\nOnCalendar=\nOnCalendar=%s\n' "$SCHEDULE" >"$tmp" || ! chmod 644 "$tmp" ||
+    ! mv -f "$tmp" "$d/10-schedule.conf"; then
+    rm -f "$tmp"
+    exit 1
+  fi
+  systemctl --user daemon-reload
+}
+
+cmd_teardown() {
+  local d="$UNIT_DIR/rclone-backup@$JOB.timer.d"
+  rm -f -- "$d/10-schedule.conf"
+  [[ -d $d ]] && rmdir --ignore-fail-on-non-empty -- "$d"
+  systemctl --user daemon-reload
+}
+
+(($# == 2)) || usage
+case $1 in
+  run)
+    JOB=$2
+    valid_name "$JOB" && ON_INVALID=run_invalid
+    load "$2"
+    guards warn
+    lock
+    cmd_run
+    ;;
+  setup)
+    load "$2"
+    guards refuse
+    cmd_setup
+    ;;
+  validate)
+    load "$2"
+    guards refuse
+    check_schedule
+    ;;
+  list)
+    load "$2"
+    printf '%s\n' "${PATHS[@]}"
+    ;;
+  teardown)
+    JOB=$2
+    valid_name "$JOB" || die64 "invalid job name"
+    cmd_teardown
+    ;;
+  *) usage ;;
+esac

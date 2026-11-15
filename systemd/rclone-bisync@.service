@@ -1,0 +1,24 @@
+[Unit]
+Description=Bisync offline folder %i
+# No start limit: a service start-limit failure is propagated to the path
+# unit, which would then stop watching the folder. Runs cannot loop fast
+# without one: every start sleeps 3s first (ExecStartPre), path triggers
+# that arrive during a run merge into it, the timer waits INTERVAL (at least
+# 30s) after each run, and the script's per-pair flock serializes the rest.
+# A failed run (offline etc.) is retried by the timer.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Editors (KeePassXC) save via temp file + rename: let it settle before syncing.
+ExecStartPre=/usr/bin/sleep 3
+ExecStart=%h/.local/bin/rclone-bisync run %i
+# A hung rclone must not hold the pair's flock (and so every later run)
+# forever. One hour is far past a normal run of an offline folder (seconds
+# to minutes) and still leaves room for a large first upload. On timeout
+# (or a stop) systemd sends SIGTERM: rclone bisync lets transfers drain for
+# 30s, then cancels them and may take up to 60s more to clean up and remove
+# its lock file. TimeoutStopSec covers that before the SIGKILL;
+# --max-lock expires a lock a SIGKILL leaves behind.
+TimeoutStartSec=1h
+TimeoutStopSec=2min

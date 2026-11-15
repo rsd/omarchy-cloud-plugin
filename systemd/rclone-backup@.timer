@@ -1,0 +1,13 @@
+[Unit]
+Description=Scheduled run of backup job %i
+
+[Timer]
+# `rclone-backup setup %i` overrides the schedule in
+# rclone-backup@%i.timer.d/10-schedule.conf (SCHEDULE= in the job's conf).
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10min
+Unit=rclone-backup@%i.service
+
+[Install]
+WantedBy=timers.target

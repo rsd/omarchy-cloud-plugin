@@ -1,0 +1,10 @@
+[Unit]
+Description=Dated backup copies for backup job %i
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/rclone-backup run %i
+# A hung copy must not hold the job's flock forever: a job copies a list of
+# single files, which takes seconds to minutes; one hour leaves room for
+# large files on a slow link.
+TimeoutStartSec=1h

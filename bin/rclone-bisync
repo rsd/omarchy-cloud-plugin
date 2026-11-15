@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# Two-way sync of an "offline folder" (bisync pair) between a local directory
+# and a remote path. Never picks a winner on conflict: a file changed on both
+# sides is kept as numbered copies, <name>.conflictN (with --conflict-loser num
+# the numbers depend on the copies already present, so which N is local and
+# which remote is not fixed), and <name> itself is renamed until the user
+# merges them into one file, renames it back to <name> and deletes the others.
+#
+#   rclone-bisync run <pair>        normal run (used by rclone-bisync@<pair>.service)
+#   rclone-bisync check <pair>      0 = identical, 1 = differ (printed), 2 = error,
+#                                   4 = identical but empty (no file on either
+#                                   side after the filter: nothing to sync)
+#   rclone-bisync resync <pair>     one-off baseline; REFUSES unless identical
+#                                   (exit 3 differ, 2 error, 4 empty)
+#   rclone-bisync dry-run <pair>    what a run would do, changes nothing
+#   rclone-bisync conflicts <pair>  list conflict copies under LOCAL (all of them,
+#                                   whatever the filter says)
+#   rclone-bisync setup <pair>      write the path/timer drop-ins, daemon-reload;
+#                                   warns when the filter would not sync the
+#                                   conflict copies of an included file
+#   rclone-bisync teardown <pair>   remove those drop-ins, daemon-reload
+#   rclone-bisync validate <pair>   the conf and every setup-time guard, refusing;
+#                                   writes nothing, runs no rclone nor systemctl
+#                                   (exit 0 valid, 64 not)
+#
+# Config: ~/.config/rclone-bisync/<pair>.conf (KEY=VALUE; parsed, never sourced):
+#   LOCAL=~/dir  REMOTE=remote:path  [FILTER=~/file]  [INTERVAL=2min]
+#   FILTER absent: <pair>.filter next to the conf if it exists, else no filter;
+#   FILTER= (empty): no filter. INTERVAL: <n>s|min|h|d, at least 30s.
+# Every bisync call uses the workdir $HOME/.cache/rclone/bisync (pinned: the
+# service and a terminal may have different XDG_CACHE_HOME).
+# Guards, as written and with symlinks resolved: LOCAL must not overlap (equal,
+# contain or be inside) the DEST of any backup job (~/.config/rclone-backup/
+# *.conf; the backups would be synced, and their pruning with them), nor the
+# LOCAL of any other pair; LOCAL must not be inside a cloud location
+# (/mnt/cloud, ~/Cloud, or a FUSE mount point of $OMARCHY_CLOUD_MOUNTS,
+# default /proc/self/mounts). setup and validate refuse with exit 64; run,
+# check, resync and dry-run only print a warning on stderr and go on (a sync
+# is never stopped).
+# The pair lock is busy (another run of the pair is active):
+#   run exits 0 (a path/timer trigger that finds a run active has nothing to do);
+#   resync and dry-run exit 75 (EX_TEMPFAIL: nothing was done, try again).
+# Exit 64 on a usage error, an invalid name or an invalid conf.
+set -u
+
+PROG=rclone-bisync
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rclone-bisync"
+BACKUP_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rclone-backup"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-bisync"
+WORKDIR="$HOME/.cache/rclone/bisync"
+MOUNTS_FILE=${OMARCHY_CLOUD_MOUNTS:-/proc/self/mounts}
+DEFAULT_INTERVAL=2min
+
+usage() {
+  echo "usage: $PROG {run|check|resync|dry-run|conflicts|setup|teardown|validate} <pair>" >&2
+  echo "exit: 64 usage or invalid conf; check/resync 4 nothing to sync; pair busy: run 0, resync/dry-run 75" >&2
+  exit 64
+}
+
+die64() {
+  echo "$PROG: $*" >&2
+  exit 64
+}
+
+# valid_name <name>: NAME_RE in the C locale (in a UTF-8 locale bash's
+# [A-Za-z] also matches letters like é).
+valid_name() {
+  local LC_ALL=C
+  [[ $1 =~ $NAME_RE ]]
+}
+
+# expand_path <value>: a leading ~/ becomes $HOME/; the result must be absolute.
+expand_path() {
+  local v=$1
+  # shellcheck disable=SC2088 # a literal ~/ prefix is what is matched
+  [[ ${v:0:2} == '~/' ]] && v="$HOME/${v:2}"
+  [[ $v == /* ]] || return 1
+  printf '%s' "$v"
+}
+
+# parse_conf <file> <allowed key>...: fills CONF[]; strict KEY=VALUE lines,
+# '#' comments and blank lines skipped, unknown or repeated keys rejected.
+declare -A CONF=()
+parse_conf() {
+  local file=$1 line n=0 key
+  shift
+  local -A allowed=()
+  for key; do allowed[$key]=1; done
+  [[ -f $file && -r $file ]] || die64 "no conf $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z_]*)=([^[:cntrl:]]*)$ ]] || die64 "$file:$n: not a KEY=VALUE line"
+    key=${BASH_REMATCH[1]}
+    [[ -n ${allowed[$key]:-} ]] || die64 "$file:$n: unknown key $key"
+    [[ -z ${CONF[$key]+x} ]] || die64 "$file:$n: $key given twice"
+    CONF[$key]=${BASH_REMATCH[2]}
+  done <"$file"
+}
+
+# load <pair>: validates the name and the conf; sets LOCAL REMOTE FILTER INTERVAL.
+load() {
+  PAIR=$1
+  valid_name "$PAIR" || die64 "invalid pair name"
+  CONF=()
+  parse_conf "$CONF_DIR/$PAIR.conf" LOCAL REMOTE FILTER INTERVAL
+
+  [[ -n ${CONF[LOCAL]:-} ]] || die64 "$PAIR: LOCAL is required"
+  LOCAL=$(expand_path "${CONF[LOCAL]}") || die64 "$PAIR: LOCAL must be absolute or start with ~/"
+  # A backslash could end a line of the generated drop-in (continuation).
+  [[ $LOCAL != *\\* ]] || die64 "$PAIR: LOCAL must not contain a backslash"
+  [[ -d $LOCAL ]] || die64 "$PAIR: LOCAL $LOCAL is not an existing directory"
+
+  REMOTE=${CONF[REMOTE]:-}
+  [[ -n $REMOTE ]] || die64 "$PAIR: REMOTE is required"
+  [[ $REMOTE == *:* ]] || die64 "$PAIR: REMOTE must be <remote>:<path>"
+  valid_name "${REMOTE%%:*}" || die64 "$PAIR: invalid remote name in REMOTE"
+
+  if [[ -n ${CONF[FILTER]+x} && -z ${CONF[FILTER]} ]]; then
+    FILTER= # FILTER= (empty) is an explicit "no filter"
+  elif [[ -n ${CONF[FILTER]+x} ]]; then
+    FILTER=$(expand_path "${CONF[FILTER]}") || die64 "$PAIR: FILTER must be absolute or start with ~/"
+    [[ -f $FILTER ]] || die64 "$PAIR: FILTER $FILTER does not exist"
+  elif [[ -f $CONF_DIR/$PAIR.filter ]]; then
+    FILTER=$CONF_DIR/$PAIR.filter
+  else
+    FILTER=
+  fi
+
+  # At least 30s: the service has no start limit (a start-limit failure would
+  # stop the folder watch), so the interval is what keeps the timer from
+  # running the pair back to back (each run lists the remote).
+  INTERVAL=${CONF[INTERVAL]:-$DEFAULT_INTERVAL}
+  local -A unit_s=([s]=1 [min]=60 [h]=3600 [d]=86400)
+  if ! [[ $INTERVAL =~ ^([0-9]{1,9})(s|min|h|d)$ ]] ||
+    ((10#${BASH_REMATCH[1]} * ${unit_s[${BASH_REMATCH[2]}]} < 30)); then
+    die64 "$PAIR: INTERVAL must be <n>s, <n>min, <n>h or <n>d, at least 30s (like 2min)"
+  fi
+
+  # bisync takes the filter as --filters-file; every other rclone command
+  # (check, lsl, lsf) only knows --filter-from (same syntax).
+  FILTER_ARGS=() LIST_FILTER_ARGS=()
+  [[ -n $FILTER ]] && FILTER_ARGS=(--filters-file "$FILTER") LIST_FILTER_ARGS=(--filter-from "$FILTER")
+  # --max-lock 2m (rclone's minimum): a running bisync keeps renewing its lock
+  # file, so only the lock of a run that died without removing it (SIGKILL,
+  # power loss) expires, 2m after its last renewal. With the default (0) the
+  # lock never expires and blocks every later run until it is deleted by
+  # hand. A SIGTERMed run removes its lock itself. The per-pair flock
+  # already keeps two runs of the pair apart. --workdir: the listings are
+  # where the TUI looks, whatever XDG_CACHE_HOME the caller has.
+  COMMON=("${FILTER_ARGS[@]}" --conflict-resolve none --conflict-loser num
+    --resilient --recover --create-empty-src-dirs=false --max-lock 2m -v
+    --workdir "$WORKDIR")
+}
+
+# FUSE_MPS: the FUSE mount points (fuse_mounts), read once by load_fuse.
+FUSE_MPS=()
+FUSE_LOADED=
+load_fuse() {
+  local mp _type
+  [[ -z $FUSE_LOADED ]] || return 0
+  FUSE_LOADED=1
+  while IFS=$'\t' read -r mp _type; do
+    [[ -n $mp ]] && FUSE_MPS+=("$mp")
+  done < <(fuse_mounts)
+}
+
+# canon <absolute path>: symlinks and .. resolved (realpath -m: missing parts
+# are fine), or the path as is when realpath is not available, fails, or
+# takes more than 5 s. A path at or under a FUSE mount point (as written) is
+# returned as is, never resolved: a hung mount would block realpath, and a
+# guard must never stop a run.
+canon() {
+  local c mp
+  load_fuse
+  for mp in "${FUSE_MPS[@]}"; do
+    within "$1" "$mp" && { printf '%s' "$1"; return 0; }
+  done
+  c=$(timeout -k 1 5 realpath -m -- "$1" 2>/dev/null) || c=$1
+  printf '%s' "$c"
+}
+
+# overlaps <a> <b>: a and b are the same directory or one is inside the
+# other, compared by path components (/a/b and /a/bc do not overlap).
+overlaps() {
+  local a=${1%/} b=${2%/}
+  [[ -z $a || -z $b || $a == "$b" || $a == "$b"/* || $b == "$a"/* ]]
+}
+
+# within <path> <root>: path is root or inside it, by path components.
+within() {
+  local p=${1%/} r=${2%/}
+  [[ -z $r || $p == "$r" || $p == "$r"/* ]]
+}
+
+# guard_hit <refuse|warn> <message>: refuse (exit 64) or warn on stderr.
+guard_hit() {
+  [[ $1 == refuse ]] && die64 "$2"
+  echo "$PROG: warning: $2; continuing" >&2
+}
+
+# conf_value <file> <KEY>: the first KEY= value of a conf (another job's or
+# pair's: only that line is read, its own validation is its script's).
+conf_value() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
+
+# guard_backups <refuse|warn>: when LOCAL overlaps the DEST of a backup job,
+# as written or with symlinks resolved, refuse (exit 64) or print a warning on
+# stderr and return 0.
+guard_backups() {
+  local mode=$1 f v d job
+  for f in "$BACKUP_CONF_DIR"/*.conf; do
+    [[ -f $f && -r $f ]] || continue
+    v=$(conf_value "$f" DEST)
+    [[ -n $v ]] || continue
+    d=$(expand_path "$v") || continue
+    job=${f##*/}
+    job=${job%.conf}
+    if overlaps "$LOCAL" "$d" || overlaps "$(canon "$LOCAL")" "$(canon "$d")"; then
+      guard_hit "$mode" "$PAIR: LOCAL $LOCAL overlaps DEST $d of backup job $job; a backup destination must not be inside an offline folder, nor contain one"
+    fi
+  done
+}
+
+# guard_pairs <refuse|warn>: LOCAL against the LOCAL of every other pair (two
+# pairs on one folder would share, or nest, bisync's listings and baseline).
+guard_pairs() {
+  local mode=$1 f v l other
+  for f in "$CONF_DIR"/*.conf; do
+    [[ -f $f && -r $f && $f != "$CONF_DIR/$PAIR.conf" ]] || continue
+    v=$(conf_value "$f" LOCAL)
+    [[ -n $v ]] || continue
+    l=$(expand_path "$v") || continue
+    other=${f##*/}
+    other=${other%.conf}
+    if overlaps "$LOCAL" "$l" || overlaps "$(canon "$LOCAL")" "$(canon "$l")"; then
+      guard_hit "$mode" "$PAIR: LOCAL $LOCAL overlaps LOCAL $l of offline folder $other; two offline folders must not share a folder, nor be inside one another"
+    fi
+  done
+}
+
+# fuse_mounts: the mount points of FUSE file systems (fstype fuse or fuse.*,
+# not fusectl) in $MOUNTS_FILE, octal escapes (\040) decoded, one per line
+# as "<mount point>\t<fstype>".
+fuse_mounts() {
+  local _src mp type _rest out rest
+  [[ -r $MOUNTS_FILE ]] || return 0
+  while read -r _src mp type _rest; do
+    [[ $type == fuse || $type == fuse.* ]] || continue
+    out=
+    while [[ $mp =~ ^([^\\]*)\\([0-7]{3})(.*)$ ]]; do
+      rest=${BASH_REMATCH[3]}
+      # shellcheck disable=SC2059 # the octal escape is the format on purpose
+      out+=${BASH_REMATCH[1]}$(printf "\\${BASH_REMATCH[2]}")
+      mp=$rest
+    done
+    printf '%s\t%s\n' "$out$mp" "$type"
+  done <"$MOUNTS_FILE"
+}
+
+# guard_cloud <refuse|warn>: LOCAL must not be inside a cloud location:
+# /mnt/cloud, ~/Cloud (as written and resolved; canon never resolves a root
+# that is, or is inside, a FUSE mount), or any FUSE mount point.
+guard_cloud() {
+  local mode=$1 c r mp type
+  c=$(canon "$LOCAL")
+  for r in /mnt/cloud "$HOME/Cloud"; do
+    if within "$LOCAL" "$r" || within "$c" "$r" || within "$c" "$(canon "$r")"; then
+      guard_hit "$mode" "$PAIR: LOCAL $LOCAL is inside the cloud location $r; an offline folder must be a local folder"
+      return 0
+    fi
+  done
+  while IFS=$'\t' read -r mp type; do
+    [[ -n $mp ]] || continue
+    if within "$LOCAL" "$mp" || within "$c" "$mp"; then
+      guard_hit "$mode" "$PAIR: LOCAL $LOCAL is inside the FUSE mount $mp ($type); an offline folder must be a local folder"
+      return 0
+    fi
+  done < <(fuse_mounts)
+}
+
+# guards <refuse|warn>: every overlap guard.
+guards() {
+  load_fuse
+  guard_backups "$1"
+  guard_pairs "$1"
+  guard_cloud "$1"
+}
+
+# lock <busy rc>: per-pair flock; busy -> message and exit <busy rc>.
+lock() {
+  local busy_rc=$1 file="${XDG_RUNTIME_DIR:-/tmp}/rclone-bisync-$PAIR.lock"
+  exec 9>"$file" || {
+    echo "$PROG: cannot open lock $file" >&2
+    exit 1
+  }
+  flock -n 9 || {
+    echo "$PROG: $PAIR: another run is active, skipping"
+    exit "$busy_rc"
+  }
+}
+
+# list_conflicts: every conflict copy under LOCAL, one relative path per line;
+# returns rclone's status. The pair's filter is NOT applied: a hand-written
+# filter without `+ X.conflict*` would hide the copies bisync made of X.
+list_conflicts() {
+  local out rc line
+  out=$(rclone lsf -R --files-only --include '*.conflict[0-9]*' "$LOCAL")
+  rc=$?
+  while IFS= read -r line; do
+    [[ -n $line && ${line##*/} == *.conflict[0-9]* ]] && printf '%s\n' "$line"
+  done <<<"$out"
+  return $rc
+}
+
+# write_state <rc> <n> <conflict>×n <notified>...: atomic tmp + mv. One
+# conflict= line per conflict copy present, one notified= line per copy a
+# notification was sent for.
+write_state() {
+  local rc=$1 n=$2 tmp c i=0
+  shift 2
+  mkdir -p "$STATE_DIR" || return 1
+  tmp=$(mktemp "$STATE_DIR/.$PAIR.state.XXXXXX") || return 1
+  {
+    printf 'time=%s\nexit=%s\n' "$(date +%s)" "$rc"
+    for c; do
+      if ((i++ < n)); then printf 'conflict=%s\n' "$c"; else printf 'notified=%s\n' "$c"; fi
+    done
+  } >"$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv -f "$tmp" "$STATE_DIR/$PAIR.state" || rm -f "$tmp"
+}
+
+# state_lines <key>: the non-empty <key>= values of the previous state file.
+state_lines() {
+  local line
+  [[ -f $STATE_DIR/$PAIR.state ]] || return 0
+  while IFS= read -r line; do
+    [[ $line == "$1="?* ]] && printf '%s\n' "${line#"$1="}"
+  done <"$STATE_DIR/$PAIR.state"
+}
+
+# finish <rc>: log every conflict copy, notify once per NEW one (not yet
+# notified= in the previous state file), write the state file, exit rc. A
+# copy counts as notified only when notify-send exists and succeeded, so a
+# failed notification is retried on the next run. When the copies cannot be
+# listed, the previous state's copies and notified set are kept as they were
+# (an empty list would hide them and re-notify all of them next time).
+finish() {
+  local rc=$1 out names c conflicts=() fresh=() notified=()
+  local -A seen=()
+  if ! out=$(list_conflicts); then
+    echo "$PROG: $PAIR: warning: could not list the conflict copies; keeping the previous list" >&2
+    mapfile -t conflicts < <(state_lines conflict)
+    mapfile -t notified < <(state_lines notified)
+    write_state "$rc" "${#conflicts[@]}" "${conflicts[@]}" "${notified[@]}"
+    exit "$rc"
+  fi
+  [[ -n $out ]] && mapfile -t conflicts <<<"$out"
+  if ((${#conflicts[@]})); then
+    while IFS= read -r c; do seen[$c]=1; done < <(state_lines notified)
+    for c in "${conflicts[@]}"; do
+      if [[ -n ${seen[$c]:-} ]]; then notified+=("$c"); else fresh+=("$c"); fi
+    done
+    names=$(printf '%s ' "${conflicts[@]##*/}")
+    echo "$PROG: $PAIR: CONFLICT copies present: ${names% }"
+  fi
+  if ((${#fresh[@]})); then
+    names=$(printf '%s ' "${fresh[@]##*/}")
+    if command -v notify-send >/dev/null &&
+      notify-send -u critical -a rclone-bisync "$PAIR: conflict" \
+        "New conflict copies: ${names% }. A file changed on both sides: bisync kept both versions as X.conflictN copies (X itself is renamed). Merge them into one file, rename it back to X, delete the other copies."; then
+      notified+=("${fresh[@]}")
+    else
+      echo "$PROG: $PAIR: warning: could not send the conflict notification; retrying on the next run" >&2
+    fi
+  fi
+  write_state "$rc" "${#conflicts[@]}" "${conflicts[@]}" "${notified[@]}"
+  exit "$rc"
+}
+
+# compare: 0 identical, 1 differ (differences printed), 2 error, 4 identical
+# but empty: no file on either side after the filter (bisync's runs after a
+# resync of two empty sides all fail, so there is nothing to start).
+compare() {
+  local tmp rc diffs
+  tmp=$(mktemp) || return 2
+  rclone check "$LOCAL" "$REMOTE" "${LIST_FILTER_ARGS[@]}" --download --combined "$tmp"
+  rc=$?
+  if ((rc == 0)); then
+    if ! grep -q '^= ' "$tmp"; then
+      rm -f "$tmp"
+      echo "$PROG: $PAIR: nothing to sync: no file on either side (after the filter); put a file on one side first" >&2
+      return 4
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+  # --combined marks each path: = same, - only local, + only remote, * differ, ! error.
+  if grep -q '^! ' "$tmp" || ! grep -q '^[-+*] ' "$tmp"; then
+    echo "$PROG: $PAIR: could not compare (rclone check exit $rc)" >&2
+    grep '^! ' "$tmp" >&2
+    rm -f "$tmp"
+    return 2
+  fi
+  diffs=$(grep '^[-+*] ' "$tmp")
+  rm -f "$tmp"
+  echo "$PROG: $PAIR: local and remote differ (- only local, + only remote, * differ):"
+  printf '%s\n' "$diffs"
+  return 1
+}
+
+# warn_filter: warn when the filter includes a file but not its conflict copy
+# (<file>.conflict1): bisync would then not sync the copy to the other side.
+# Asks rclone itself, on an empty-file mirror of the would-be copies in a temp
+# dir, so the answer follows rclone's filter semantics exactly. Never fails setup.
+warn_filter() {
+  [[ -n $FILTER ]] || return 0
+  local files f tmp listed missing=()
+  files=$(rclone lsf -R --files-only "${LIST_FILTER_ARGS[@]}" "$LOCAL") || return 0
+  [[ -n $files ]] || return 0
+  tmp=$(mktemp -d) || return 0
+  while IFS= read -r f; do
+    [[ -n $f && ${f##*/} != *.conflict[0-9]* ]] || continue
+    mkdir -p -- "$tmp/$(dirname -- "$f")" && : >"$tmp/$f.conflict1"
+  done <<<"$files"
+  listed=$(rclone lsf -R --files-only "${LIST_FILTER_ARGS[@]}" "$tmp")
+  local rc=$?
+  if ((rc == 0)); then
+    local -A ok=()
+    while IFS= read -r f; do [[ -n $f ]] && ok[$f]=1; done <<<"$listed"
+    while IFS= read -r f; do
+      [[ -n $f && -f $tmp/$f.conflict1 && -z ${ok[$f.conflict1]:-} ]] && missing+=("$f")
+    done <<<"$files"
+  fi
+  rm -rf -- "$tmp"
+  ((${#missing[@]})) || return 0
+  echo "$PROG: $PAIR: warning: the filter $FILTER excludes the conflict copies of:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  echo "  they would not be synced (they are still listed and notified); add a '+ <pattern>.conflict*' line after each '+ <pattern>'" >&2
+}
+
+cmd_setup() {
+  local pd="$UNIT_DIR/rclone-bisync@$PAIR.path.d" td="$UNIT_DIR/rclone-bisync@$PAIR.timer.d"
+  warn_filter
+  mkdir -p "$pd" "$td" || exit 1
+  # % is a unit-file specifier: escape it. Resetting OnUnitInactiveSec= empties
+  # every timer trigger of the unit, so OnStartupSec is restated.
+  atomic_write "$pd/10-local.conf" "$(printf '[Path]\nPathChanged=%s' "${LOCAL//%/%%}")" || exit 1
+  atomic_write "$td/10-interval.conf" "$(printf '[Timer]\nOnUnitInactiveSec=\nOnStartupSec=1min\nOnUnitInactiveSec=%s' "$INTERVAL")" || exit 1
+  systemctl --user daemon-reload
+}
+
+atomic_write() {
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  if ! printf '%s\n' "$2" >"$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$1"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+cmd_teardown() {
+  local d
+  for d in "$UNIT_DIR/rclone-bisync@$PAIR.path.d:10-local.conf" "$UNIT_DIR/rclone-bisync@$PAIR.timer.d:10-interval.conf"; do
+    rm -f -- "${d%:*}/${d##*:}"
+    [[ -d ${d%:*} ]] && rmdir --ignore-fail-on-non-empty -- "${d%:*}"
+  done
+  systemctl --user daemon-reload
+}
+
+(($# == 2)) || usage
+cmd=$1
+case $cmd in
+  setup | validate)
+    load "$2"
+    guards refuse
+    ;;
+  run | check | resync | dry-run)
+    load "$2"
+    guards warn
+    ;;
+  conflicts) load "$2" ;;
+  teardown)
+    PAIR=$2
+    valid_name "$PAIR" || die64 "invalid pair name"
+    ;;
+  *) usage ;;
+esac
+
+case $cmd in
+  run)
+    lock 0
+    rclone bisync "$LOCAL" "$REMOTE" "${COMMON[@]}"
+    finish $?
+    ;;
+  check)
+    compare
+    exit $?
+    ;;
+  resync)
+    lock 75
+    compare
+    case $? in
+      0)
+        echo "$PROG: $PAIR: local and remote are identical, running --resync"
+        rclone bisync "$LOCAL" "$REMOTE" "${COMMON[@]}" --resync
+        finish $?
+        ;;
+      4)
+        echo "$PROG: $PAIR: REFUSING --resync, nothing to sync" >&2
+        exit 4
+        ;;
+      1)
+        echo "$PROG: $PAIR: REFUSING --resync, local and remote differ:" >&2
+        rclone lsl "${LIST_FILTER_ARGS[@]}" "$LOCAL" >&2
+        rclone lsl "${LIST_FILTER_ARGS[@]}" "$REMOTE" >&2
+        exit 3
+        ;;
+      *)
+        echo "$PROG: $PAIR: REFUSING --resync, the comparison failed" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  dry-run)
+    lock 75
+    rclone bisync "$LOCAL" "$REMOTE" "${COMMON[@]}" --dry-run
+    exit $?
+    ;;
+  conflicts)
+    list_conflicts
+    rc=$?
+    ((rc == 0)) || exit 2
+    exit 0
+    ;;
+  setup) cmd_setup ;;
+  teardown) cmd_teardown ;;
+  validate) exit 0 ;;
+esac
