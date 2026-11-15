@@ -80,9 +80,10 @@ fn dot(on: bool, failed: bool) -> Span<'static> {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let [top, body, status, hints] = Layout::vertical([
+    let [top, body, notice, status, hints] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
+        Constraint::Length(app.notice.is_some() as u16),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -117,6 +118,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             .block(block("Details")),
         detail_area,
     );
+
+    if let Some(n) = &app.notice {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {n}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            notice,
+        );
+    }
 
     let st = match (&app.running, &app.status) {
         (Some((label, t0)), _) => {

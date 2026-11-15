@@ -32,9 +32,16 @@ import "Model.js" as Model
 //   - show log (failed units): journalctl --user -u <unit> -n 20, bounded.
 //   - Sync now: systemctl --user start --no-block rclone-bisync@<pair>.service,
 //     only while that pair's timer or path unit is enabled.
-//   - Configure…: omarchy-launch-tui --app-id=TUI.float ~/.local/bin/omarchy-cloud
-//     (Model.configureArgv says why not launch-or-focus), only once the scan
-//     has found the binary installed.
+//   - Configure… (also a right-click on the bar icon): omarchy-launch-tui
+//     --app-id=TUI.float ~/.local/bin/omarchy-cloud (Model.configureArgv says
+//     why not launch-or-focus), only once the scan has found the binary
+//     installed; until then a right-click opens the panel, which says why.
+//   - Update installed parts (shown while the parts install.sh installed are
+//     missing, unversioned or of another version than the plugin;
+//     Model.installState): omarchy-launch-tui --app-id=TUI.float bash -c
+//     Model.INSTALL_SCRIPT with the plugin folder's install.sh as "$1", in a
+//     visible terminal that stays open on the result until Enter. The panel
+//     closes; the next opening reads the versions again.
 //
 // Every Text in this file declares textFormat: Text.PlainText (journal output
 // and file names are shown here); the model test counts them.
@@ -76,6 +83,12 @@ Panel {
   // mount (Model.problems).
   readonly property string agg: Model.aggregate(root.rows, root.pairRows, root.jobRows, root.polled)
   readonly property bool appInstalled: CloudState.scanned && CloudState.scanData.app === true
+  // The installed parts against the plugin (Model.installState): "" until
+  // read, else none | unknown | mismatch | ok. Anything but ok puts a quiet
+  // mark on the bar icon; an error still shows as the error.
+  readonly property string installState: Model.installState(CloudState.versions)
+  readonly property string installNotice: Model.installNotice(CloudState.versions)
+  readonly property bool canInstall: root.installNotice !== "" && CloudState.versions.installer === true && CloudState.pluginDir !== ""
   readonly property bool nothingSetUp: root.polled && root.rows.length === 0 && root.pairRows.length === 0 && root.jobRows.length === 0
 
   // The stop in progress (one at a time): which remote, "checking" or
@@ -105,6 +118,7 @@ Panel {
     logUnit: root.logUnit,
     pairs: root.pairRows,
     jobs: root.jobRows,
+    canInstall: root.canInstall,
     canConfigure: root.appInstalled
   })
   readonly property string cursorAt: Model.cursorKeyIn(root.cursorGroups, root.cursorKey, root.stopRemote)
@@ -240,6 +254,26 @@ Panel {
     root.close()
   }
 
+  // install.sh runs in a terminal that stays open on its result; the panel
+  // closes so the terminal gets the focus.
+  function updateInstalled() {
+    if (!root.canInstall) return
+    var argv = Model.installArgv(CloudState.pluginDir)
+    if (argv.length === 0) return
+    Quickshell.execDetached(argv)
+    root.close()
+  }
+
+  // Right-click: the TUI once installed; until then the panel, which says why.
+  function pressButton(b) {
+    if (b === Qt.RightButton) {
+      if (root.appInstalled) root.configure()
+      else if (!root.opened) root.open()
+      return
+    }
+    root.toggle()
+  }
+
   // --------------------------------------------------------------- cursor
 
   function pointAt(key) {
@@ -265,6 +299,7 @@ Panel {
     else if (a.kind === "force") root.forceStop()
     else if (a.kind === "cancel") root.cancelStop()
     else if (a.kind === "sync") root.syncNow(a.arg)
+    else if (a.kind === "install") root.updateInstalled()
     else if (a.kind === "configure") root.configure()
   }
 
@@ -406,8 +441,27 @@ Panel {
     text: Model.barIcon(root.agg)
     active: root.agg === "error"
     dimmed: root.agg === "none" || root.agg === "unknown"
-    tooltipText: Model.tooltipText(root.rows, root.pairRows, root.jobRows, root.polled, CloudState.pollError)
-    onPressed: function(b) { root.toggle() }
+    tooltipText: Model.tooltipText(root.rows, root.pairRows, root.jobRows, root.polled, CloudState.pollError,
+      root.installNotice, root.appInstalled)
+    onPressed: function(b) { root.pressButton(b) }
+
+    // The installed-parts mark: a small badge in the glyph's own colour
+    // (button.foreground, which follows the bar's transparency) with a 1 px
+    // ring in the surface colour, as the shell's Tailscale badge. It sits on
+    // the glyph box's upper-right corner, clear of the cloud, clamped inside
+    // the slot so a vertical bar does not clip it. Quieter than the error's
+    // urgent colour, which wins.
+    BorderSurface {
+      readonly property real size: Math.max(7, Math.round(Style.bar.iconSize * 0.42))
+      visible: root.installNotice !== "" && root.agg !== "error"
+      width: size
+      height: size
+      radius: size / 2
+      color: button.foreground
+      borderSpec: Border.flat(Commons.Color.popups.background, 1)
+      x: Math.max(0, Math.min(button.width - size, Math.round(button.width / 2 + Style.bar.iconSize / 2 - size / 2)))
+      y: Math.max(0, Math.min(button.height - size, Math.round(button.height / 2 - Style.bar.iconSize / 2 - size / 2)))
+    }
   }
 
   // ----------------------------------------------------------------- panel
@@ -611,6 +665,43 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // The installed parts are missing, unversioned or of another
+          // version: the line on its own, full width, and beneath it, on the
+          // right, the button that runs install.sh (hidden, not disabled,
+          // without the plugin's install.sh).
+          Column {
+            visible: root.installNotice !== ""
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              text: root.installNotice
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Button {
+              id: installButton
+              visible: root.canInstall
+              anchors.right: parent.right
+              text: Model.INSTALL_BUTTON_TEXT
+              iconText: Model.ICON.update
+              tooltipText: "Runs install.sh from the plugin folder in a terminal"
+              hasCursor: root.cursorActive && root.cursorAt === "install"
+              onHasCursorChanged: if (installButton.hasCursor) root.scrollItemIntoView(installButton)
+              onHovered: function(isHovered) { if (isHovered) root.pointAt("install") }
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              bordered: true
+              onClicked: root.updateInstalled()
+            }
+          }
+
           // Footer: Configure… opens the omarchy-cloud TUI. Disabled (and so
           // not a cursor stop) until the scan has found it installed; the
           // reason is the text beside it, since a disabled button shows no
@@ -622,7 +713,7 @@ Panel {
             Text {
               Layout.fillWidth: true
               visible: text !== ""
-              text: Model.configureHint(CloudState.scanned, root.appInstalled)
+              text: root.installNotice !== "" ? "" : Model.configureHint(CloudState.scanned, root.appInstalled)
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               color: root.dim
@@ -630,7 +721,7 @@ Panel {
               font.pixelSize: Style.font.bodySmall
             }
 
-            Item { Layout.fillWidth: true; visible: Model.configureHint(CloudState.scanned, root.appInstalled) === "" }
+            Item { Layout.fillWidth: true; visible: root.installNotice !== "" || Model.configureHint(CloudState.scanned, root.appInstalled) === "" }
 
             Button {
               id: configureButton

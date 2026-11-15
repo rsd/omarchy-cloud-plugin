@@ -420,6 +420,8 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub status: Option<(Level, String, Instant)>,
     pub running: Option<(String, Instant)>,
+    /// Persistent one-line notice (installed parts vs. plugin), set at startup.
+    pub notice: Option<String>,
     pub interactive: Option<Interactive>,
     pub quit: bool,
     tx: Sender<Outcome>,
@@ -462,6 +464,7 @@ impl App {
             jobs: Vec::new(),
             status: None,
             running: None,
+            notice: None,
             interactive: None,
             quit: false,
             tx,

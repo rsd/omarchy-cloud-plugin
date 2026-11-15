@@ -20,8 +20,25 @@
 # Every file is copied, not linked: the plugin folder can be updated, moved or
 # removed without changing what systemd runs. Each copy is atomic (a temporary
 # file in the target dir, then mv), mode 644 for units and 755 for programs,
-# and is recorded in a manifest, ~/.local/state/omarchy-cloud/installed-files,
-# one `<sha256>  <absolute path>` line per file (the TUI binary included).
+# and is recorded in a manifest, ~/.local/state/omarchy-cloud/installed-files:
+# two header lines, `#version=<manifest.json version>` and `#repo=<this
+# checkout>` (what the widget and the TUI compare their own version against),
+# then one `<sha256>  <absolute path>` line per file (the TUI binary included),
+# sorted by path. The manifest is rewritten on every install, so a rerun after
+# a pull records the new version even when no file changed; a manifest without
+# the header lines (written by 0.3.2) is read as before and gains them. A
+# version in manifest.json that is not N.N.N stops the install before any
+# change.
+#
+# Runs already in progress are waited for: while a pair's or a job's lock
+# owned by this user is held (${XDG_RUNTIME_DIR:-/tmp}/rclone-bisync-*.lock,
+# rclone-backup-*.lock), install.sh names it and waits up to
+# OMARCHY_CLOUD_INSTALL_WAIT_S seconds (default 60), then stops with exit 75
+# and nothing changed. A run may still start right after the wait; it is
+# safe because every copy is an atomic rename. The locks are only looked at
+# (in /proc/locks), not taken, so a timer run is not made to skip; only when
+# /proc/locks or findmnt is unusable does a fallback `flock -n` probe hold
+# each lock for an instant.
 #
 # An existing file in the way is replaced only when it is absent, a symlink
 # into this repo (an install by an older install.sh, which linked), identical
@@ -78,6 +95,13 @@ if ((EUID == 0)); then
   echo "$PROG: run as your user, not as root" >&2
   exit 1
 fi
+
+WAIT_S=${OMARCHY_CLOUD_INSTALL_WAIT_S:-60}
+if ! [[ $WAIT_S =~ ^[0-9]{1,4}$ ]]; then
+  echo "$PROG: OMARCHY_CLOUD_INSTALL_WAIT_S must be a number of seconds (0-9999), not '$WAIT_S'" >&2
+  exit 64
+fi
+WAIT_S=$((10#$WAIT_S))
 
 shopt -s nullglob
 
@@ -163,16 +187,94 @@ atomic_copy() {
   return 1
 }
 
-# write_manifest <lines...>: atomically, sorted by path.
+# write_manifest <lines...>: atomically, the two header lines (#version=,
+# #repo=) first, then the lines sorted by path.
 write_manifest() {
   local tmp
   mkdir -p -- "$STATE_DIR" || return 1
   tmp=$(mktemp -- "$STATE_DIR/.installed-files.XXXXXX") || return 1
-  if printf '%s\n' "$@" | sort -k 2 >"$tmp" && chmod 644 -- "$tmp" && mv -f -T -- "$tmp" "$MANIFEST"; then
+  if { printf '#version=%s\n#repo=%s\n' "$VERSION" "$REPO" && printf '%s\n' "$@" | sort -k 2; } >"$tmp" &&
+    chmod 644 -- "$tmp" && mv -f -T -- "$tmp" "$MANIFEST"; then
     return 0
   fi
   rm -f -- "$tmp"
   return 1
+}
+
+# Running syncs and backups: the per-pair and per-job locks bin/rclone-bisync
+# and bin/rclone-backup hold for a run (their lock(), an flock). Only existing
+# regular lock files owned by this user are looked at (with XDG_RUNTIME_DIR
+# unset the dir is /tmp, shared with other users), and none is ever opened or
+# locked: the helpers take theirs with flock -n, so even an instant's probe
+# lock would make a run starting in that instant skip. Instead each file's
+# device and inode are matched against the FLOCK entries in /proc/locks,
+# "<id>: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<inode> 0 EOF" (waiters
+# carry a "->" after the id). maj:min there is the superblock's device in
+# hex, which is not stat's st_dev on btrfs (a subvolume reports its own
+# anonymous device there), so it is taken from the mount table instead:
+# findmnt's MAJ:MIN (decimal), the same superblock device. Every copy is an
+# atomic rename, so a running helper keeps reading its old inode; this is
+# belt and braces against a run that starts another helper and would see a
+# mix of old and new files.
+#
+# busy_locks: prints "<kind> <name>" for each lock held right now.
+busy_locks() {
+  local dir=${XDG_RUNTIME_DIR:-/tmp} f kind name dev ino type loc maj min lino
+  local -A held=()
+  local proc=0
+  if [[ -r /proc/locks ]] && dev=$(findmnt -no MAJ:MIN -T "$dir" 2>/dev/null) &&
+    dev=${dev//[[:space:]]/} && [[ $dev =~ ^[0-9]+:[0-9]+$ ]]; then
+    proc=1
+    while read -r _ type _ _ _ loc _; do
+      [[ $type == FLOCK ]] || continue # POSIX/OFD locks, and "->" waiters
+      IFS=: read -r maj min lino <<<"$loc"
+      [[ $maj =~ ^[0-9a-f]+$ && $min =~ ^[0-9a-f]+$ && $lino =~ ^[0-9]+$ ]] || continue
+      held["$((16#$maj)):$((16#$min)):$lino"]=1
+    done </proc/locks
+  fi
+  for f in "$dir"/rclone-bisync-*.lock "$dir"/rclone-backup-*.lock; do
+    [[ -f $f && ! -L $f && -O $f ]] || continue
+    name=${f##*/}
+    name=${name%.lock}
+    case $name in
+      rclone-bisync-*) kind="offline folder" name=${name#rclone-bisync-} ;;
+      *) kind=backup name=${name#rclone-backup-} ;;
+    esac
+    if ((proc)); then
+      # A file that vanished since the glob is not busy.
+      ino=$(stat -c %i -- "$f" 2>/dev/null) || continue
+      [[ -n ${held["$dev:$ino"]:-} ]] && printf '%s %s\n' "$kind" "$name"
+    else
+      # Fallback, /proc/locks unreadable or no mount entry for the dir: a
+      # non-blocking probe lock, read-only (never creates the file). It holds
+      # the lock for an instant, so a helper starting in that instant skips
+      # its run (a timer retries later).
+      { flock -n 8 || printf '%s %s\n' "$kind" "$name"; } 2>/dev/null 8<"$f"
+    fi
+  done
+}
+
+# wait_for_runs: returns once no lock is held; after WAIT_S seconds of
+# waiting, stops the script (exit 75) with nothing changed.
+wait_for_runs() {
+  local busy l start=$SECONDS cmd=$PROG
+  busy=$(busy_locks)
+  [[ -z $busy ]] && return 0
+  echo "$PROG: waiting (up to ${WAIT_S} s) for these runs to finish before changing anything:" >&2
+  while IFS= read -r l; do echo "  $l is running" >&2; done <<<"$busy"
+  while ((SECONDS - start < WAIT_S)); do
+    sleep 1
+    busy=$(busy_locks)
+    [[ -z $busy ]] && return 0
+  done
+  echo "$PROG: stopping, nothing was changed: still running after ${WAIT_S} s:" >&2
+  while IFS= read -r l; do echo "  $l" >&2; done <<<"$busy"
+  if ((UNINSTALL)); then
+    cmd="$PROG --uninstall"
+    ((FORCE)) && cmd+=" --force"
+  fi
+  echo "  rerun $cmd when the sync or backup finishes" >&2
+  exit 75
 }
 
 if ((UNINSTALL)); then
@@ -198,6 +300,7 @@ if ((UNINSTALL)); then
     echo "systemctl --user disable <unit>, or rerun $PROG to restore the unit):" >&2
     for u in "${mounts[@]}"; do echo "  $u" >&2; done
   fi
+  wait_for_runs
   # Links from a link install, then the files the manifest (or the legacy
   # marker) records, each only while it still has the recorded content.
   declare -A seen=()
@@ -218,6 +321,18 @@ if ((UNINSTALL)); then
   reload
   echo "$PROG: uninstalled; config (~/.config/rclone-*), drop-ins, enabled-instance links, state and data were kept"
   exit 0
+fi
+
+# --- the version to record: manifest.json's, N.N.N --------------------------------
+VERSION=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' -- "$REPO/manifest.json" 2>/dev/null | head -n 1)
+if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "$PROG: stopping, nothing was changed: $REPO/manifest.json has no \"version\" of the form N.N.N (found '${VERSION}')" >&2
+  exit 1
+fi
+# The checkout's path goes into the manifest as one line.
+if [[ $REPO == *[[:cntrl:]]* ]]; then
+  echo "$PROG: stopping, nothing was changed: the checkout's path contains a control character" >&2
+  exit 1
 fi
 
 # --- the binary: the prebuilt one when it fits, else a build -----------------
@@ -350,6 +465,8 @@ if [[ -n $built ]] && [[ -e $BIN || -L $BIN ]] &&
     "move it aside (or rerun with --no-build to keep it), then run $PROG again"
 fi
 ((blocked)) && exit 1
+
+wait_for_runs
 
 # --- install --------------------------------------------------------------------
 # mkdir -p, not install -d -m 755: an existing dir keeps its mode.

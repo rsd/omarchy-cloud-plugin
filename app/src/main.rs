@@ -10,6 +10,7 @@ mod secret;
 mod sys;
 mod ui;
 mod validate;
+mod version;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -58,6 +59,7 @@ fn main() {
         xdg("XDG_CACHE_HOME"),
     );
     let mut app = App::new(paths);
+    app.notice = version::check(&app.paths);
     app.refresh();
 
     let mut terminal = ratatui::init();

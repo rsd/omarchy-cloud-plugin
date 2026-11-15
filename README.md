@@ -3,10 +3,10 @@
 Everything for rclone cloud storage on an [Omarchy](https://omarchy.org)
 desktop, kept in one repository:
 
-- **The bar plugin** (Cloud Mounts, 0.3.2, id `io.github.rsd.cloud-mounts`): a
+- **The bar plugin** (Cloud Mounts, 0.3.3, id `io.github.rsd.cloud-mounts`): a
   shell bar widget that shows rclone remotes mounted by systemd user units, the
   offline folders kept in sync with a remote, and the scheduled backups, and has
-  a **Configure...** button.
+  a **Configure...** button (a right-click on the bar icon opens it too).
 - **`omarchy-cloud`**, a terminal UI (Rust, `app/`) that sets all of it up:
   remotes and their mount settings, offline folders, backups.
 - **systemd user units** (`systemd/`): `rclone-mount@`,
@@ -56,13 +56,25 @@ moving or removing the plugin folder changes nothing that systemd runs):
 | `systemd/*` (the six unit templates) | `~/.config/systemd/user/` | 644 |
 | `bin/rclone-bisync`, `bin/rclone-backup` | `~/.local/bin/` | 755 |
 | the `omarchy-cloud` TUI | `~/.local/bin/omarchy-cloud` | 755 |
-| (a record of the above) | `~/.local/state/omarchy-cloud/installed-files` | 644 |
+| (a record of the above, with the version) | `~/.local/state/omarchy-cloud/installed-files` | 644 |
 
 It also creates `~/.config/rclone-bisync` and `~/.config/rclone-backup`
 (mode 700), runs `systemctl --user daemon-reload`, and enables and starts
 nothing. Each file is copied atomically (a temporary file in the target
-directory, then `mv`), and the record lists one `<sha256>  <path>` line per
-installed file.
+directory, then `mv`). The record starts with two header lines,
+`#version=<the plugin's version>` and `#repo=<the checkout install.sh ran
+from>`, then lists one `<sha256>  <path>` line per installed file, sorted by
+path. It is rewritten on every run, so a rerun after an update records the new
+version even when no file changed. The widget and the TUI compare that version
+with the plugin's (see "After an update").
+
+**Running syncs and backups.** Before changing anything, `install.sh` (and
+`--uninstall`) looks at the locks of the offline-folder syncs and backups
+(`$XDG_RUNTIME_DIR/rclone-{bisync,backup}-*.lock`, read from `/proc/locks`, never
+taken, so a scheduled run is not made to skip). While one is held it names it
+and waits up to `OMARCHY_CLOUD_INSTALL_WAIT_S` seconds (default 60, 0-9999;
+`0` does not wait). If it is still running then, it exits 75 with nothing
+changed; rerun it when the sync or backup has finished.
 
 **The TUI binary.** On x86_64, a release commit carries a prebuilt static
 (musl) binary in `dist/`: `omarchy-cloud-x86_64-linux-musl`, its `.sha256`, and
@@ -99,8 +111,21 @@ instance drop-ins (`*.d/`) are not touched, nothing is restarted, and the
 running timers and path units read the new unit files at the daemon-reload. The
 old `installed-binary.sha256` marker is moved into the record.
 
-**After an update** (`omarchy plugin update`, or `git pull` in a checkout),
-run `./install.sh` again: the installed copies change only then.
+**After an update.** The plugin (the bar widget) runs from its folder, but the
+units, scripts and TUI are copies, so `omarchy plugin update` (or `git pull` in
+a checkout) does not change them. Run `./install.sh` again, or press **Update
+installed parts** in the panel: it opens `install.sh` in a floating terminal,
+which waits for Enter at the end so the result stays readable. The panel
+re-checks the next time it opens.
+
+**Version check.** The bar widget compares the version in the record's header
+with its own. It shows a small badge on the bar icon (quieter than the error
+colour, which wins) and a notice in the panel, with the **Update installed
+parts** button, when the installed parts are of another version, have no
+recorded version (installed by 0.3.2 or older, whose record has no header), or
+are not installed. It reads the record at shell start and on each panel open,
+never on a timer, so the badge updates when a panel is opened. The TUI shows a
+one-line notice on a mismatch.
 
 A pair or a job works only after `rclone-bisync setup <pair>` /
 `rclone-backup setup <job>` has written its systemd drop-ins; the TUI does that.
@@ -184,7 +209,7 @@ There is no symlink in the repository (checked by `tests/install-test.sh` and
 
 1. Bump the version in `app/Cargo.toml` (and `app/Cargo.lock`),
    `manifest.json`, `tests/manifest-test.js` and this README; commit to `main`.
-2. `git tag v0.3.2 && git push origin main v0.3.2`.
+2. `git tag v0.3.3 && git push origin main v0.3.3`.
 3. `.github/workflows/release.yml` runs two jobs. **build** (token
    `contents: read`, not kept in the checkout) checks that the tag equals both
    versions, digests the tagged `app/` sources (`src_sha256`, the same pipeline
@@ -204,7 +229,9 @@ There is no symlink in the repository (checked by `tests/install-test.sh` and
 
 ## The panel
 
-Plugin id `io.github.rsd.cloud-mounts`, click the widget.
+Plugin id `io.github.rsd.cloud-mounts`, click the widget. A left-click opens
+the panel; a right-click opens the TUI (Configure...), or the panel until the
+TUI is installed.
 
 - **Bar.** A cloud glyph from the bar's icon font: a cloud with a check when
   every remote is mounted, a plain cloud when some are, a crossed-out cloud
@@ -242,6 +269,10 @@ Plugin id `io.github.rsd.cloud-mounts`, click the widget.
   second click opens a second window). When the binary is missing the footer
   shows a dim hint: "Run install.sh from the plugin folder to install
   omarchy-cloud."
+- **Installed parts.** When they differ from the plugin, are unversioned or
+  missing (see "Version check"), a line says so, with an **Update installed
+  parts** button that runs `install.sh` in a floating terminal and closes the
+  panel.
 - The panel is capped in height and scrolls past it.
 - **Keyboard.** Opened from a keybinding, the first arrow key shows a cursor;
   Up/Down step between rows (a remote, the confirm box, Sync now, a log), Left/

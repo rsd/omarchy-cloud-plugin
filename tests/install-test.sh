@@ -23,7 +23,13 @@
 #      message; a foreign ~/.local/bin/omarchy-cloud stops it.
 #   6. --uninstall: the refusals while instances are enabled, then only the
 #      manifest's files that still match (and an old install's links).
-#   7. The repository holds no symlinks and gets no build output.
+#   7. The installed-version record: the manifest's #version= / #repo=
+#      header lines (from manifest.json), a 0.3.2 manifest without them
+#      upgraded, a version-only change recorded, an invalid version refused.
+#   8. Running syncs and backups: a held bisync or backup lock (in a scratch
+#      XDG_RUNTIME_DIR) makes install.sh wait, then stop with exit 75 and
+#      nothing changed; a released one lets it install.
+#   9. The repository holds no symlinks and gets no build output.
 #
 # The checks are eval'd single-quoted strings, expanded when they run.
 # shellcheck disable=SC2016,SC2034
@@ -34,7 +40,8 @@ PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 INSTALL=$PLUGIN_DIR/install.sh
 FAILURES=0
 SCRATCH=$(mktemp -d) || exit 1
-trap 'rm -rf "$SCRATCH"' EXIT
+HOLDER= # the PID of a background lock holder (section 8), stopped on exit
+trap '[[ -n $HOLDER ]] && kill "$HOLDER" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; FAILURES=$((FAILURES + 1)); }
@@ -75,10 +82,11 @@ N=0
 fresh() {
   N=$((N + 1))
   T=$SCRATCH/t$N
-  mkdir -p "$T/home/.config" "$T/state" "$T/cache" "$T/log"
+  mkdir -p "$T/home/.config" "$T/state" "$T/cache" "$T/log" "$T/run"
+  # XDG_RUNTIME_DIR too: the real one may hold the locks of real runs.
   export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_STATE_HOME=$T/state \
-    XDG_CACHE_HOME=$T/cache FAKE_LOG=$T/log
-  unset FAKE_BUILD FAKE_ARCH
+    XDG_CACHE_HOME=$T/cache FAKE_LOG=$T/log XDG_RUNTIME_DIR=$T/run
+  unset FAKE_BUILD FAKE_ARCH OMARCHY_CLOUD_INSTALL_WAIT_S
   UD=$XDG_CONFIG_HOME/systemd/user BD=$HOME/.local/bin
   MAN=$XDG_STATE_HOME/omarchy-cloud/installed-files
   MARK=$XDG_STATE_HOME/omarchy-cloud/installed-binary.sha256
@@ -104,13 +112,22 @@ copies_ok() {
   done
 }
 # manifest_ok <path...>: the manifest lists exactly these paths, each with
-# the sha256 the file has now.
+# the sha256 the file has now (after the two header lines, checked by
+# header_ok).
 manifest_ok() {
   local want got p
   want=$(for p; do printf '%s  %s\n' "$(sha "$p")" "$p"; done | sort -k 2)
-  got=$(cat "$MAN" 2>/dev/null)
+  got=$(tail -n +3 "$MAN" 2>/dev/null)
   [[ -n $want && $got == "$want" ]] || { diff <(echo "$want") <(echo "$got") | sed "s/^/     /" | head -6; return 1; }
 }
+# header_ok [repo] [version]: the manifest's first two lines are the version
+# record (default: this checkout and its manifest.json version).
+header_ok() {
+  local want
+  want=$(printf '#version=%s\n#repo=%s' "${2:-$PLUGIN_VERSION}" "${1:-$PLUGIN_DIR}")
+  [[ $(head -n 2 "$MAN" 2>/dev/null) == "$want" ]] || { head -n 2 "$MAN" 2>/dev/null | sed "s/^/     got /"; return 1; }
+}
+PLUGIN_VERSION=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/manifest.json" | head -n 1)
 all_files() { # the paths install.sh installs from a repo, besides the binary
   local r=${1:-$PLUGIN_DIR} f
   for f in "$r"/systemd/*; do echo "$UD/${f##*/}"; done
@@ -160,6 +177,7 @@ check "install: exit 0" rc_is 0
 check "install: every systemd/ and bin/ file copied (regular files, 644 / 755), none linked" \
   eval 'copies_ok && [[ -z $(find "$UD" "$BD" -type l) ]]'
 check "install: the manifest records each installed file with its sha256" manifest_all "$PLUGIN_DIR"
+check "install: the manifest starts with #version=<manifest.json version> and #repo=<checkout>" header_ok
 check "install: no temporary file left behind" eval '[[ -z $(find "$UD" "$BD" "$XDG_STATE_HOME" -name ".*") ]]'
 check "install: config dirs created 700" \
   eval '[[ $(stat -c %a "$XDG_CONFIG_HOME/rclone-bisync") == 700 && $(stat -c %a "$XDG_CONFIG_HOME/rclone-backup") == 700 ]]'
@@ -282,7 +300,7 @@ check "install: a binary that is not the one the legacy marker names stops it" \
 # A scratch copy of the repo with a dist/ (the real repo never gets one here).
 R2=$SCRATCH/repo
 mkdir -p "$R2/app" "$R2/dist"
-cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R2/"
+cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R2/"
 cp -r "$PLUGIN_DIR/app/Cargo.toml" "$PLUGIN_DIR/app/Cargo.lock" "$PLUGIN_DIR/app/src" "$R2/app/"
 VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' "$R2/app/Cargo.toml" | head -n 1)
 PB=omarchy-cloud-x86_64-linux-musl
@@ -491,7 +509,197 @@ printf '%s  %s\n' "$(sha "$HOME/elsewhere/file")" "$BD/../elsewhere/file" >>"$MA
 runc "$INSTALL" --uninstall
 check "uninstall: a manifest line naming a file elsewhere is ignored" eval 'rc_is 0 && [[ -f $HOME/elsewhere/file ]]'
 
-# --- 7. the repository ---------------------------------------------------------------
+# --- 7. the installed-version record ---------------------------------------------------
+check "fixture: manifest.json has an N.N.N version" eval '[[ $PLUGIN_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+# A scratch checkout whose manifest.json can be edited.
+R3=$SCRATCH/repo3
+mkdir -p "$R3"
+cp -r "$PLUGIN_DIR/install.sh" "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/systemd" "$PLUGIN_DIR/bin" "$R3/"
+R3=$(cd "$R3" && pwd -P)
+set_version() { # set_version <version|->: the version line of R3's manifest.json ("-": none)
+  if [[ $1 == - ]]; then
+    sed -i '/^ *"version":/d' "$R3/manifest.json"
+  else
+    sed -i "s/^\( *\"version\": *\"\)[^\"]*\"/\1$1\"/; t; /^ *\"name\":/a\\  \"version\": \"$1\"," "$R3/manifest.json"
+  fi
+}
+
+# A manifest written by 0.3.2 (no header lines), with a recorded file whose
+# source has changed since: still ours, replaced, and the header is added.
+fresh
+runc "$INSTALL" --no-build
+sed -i '/^#/d' "$MAN"
+printf '# an older version\n' >"$UD/rclone-bisync@.timer"
+sed -i "s|^[0-9a-f]\{64\}  $UD/rclone-bisync@.timer\$|$(sha "$UD/rclone-bisync@.timer")  $UD/rclone-bisync@.timer|" "$MAN"
+check "fixture: a 0.3.2-format manifest (no # line)" eval '! grep -q "^#" "$MAN" && [[ -s $MAN ]]'
+runc "$INSTALL" --no-build
+check "0.3.2 manifest: read as before (the recorded file is still ours and updated)" \
+  eval 'rc_is 0 && copies_ok && [[ $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && manifest_all "$PLUGIN_DIR"'
+check "0.3.2 manifest: rewritten with the version header" header_ok
+snapshot >"$T/before"
+runc "$INSTALL" --no-build
+check "0.3.2 manifest upgraded, again: idempotent" eval 'rc_is 0 && [[ $OUT != *installed\ /* ]] && cmp -s <(snapshot) "$T/before"'
+
+# A pull that changed only manifest.json: nothing is reinstalled, the new
+# version is recorded.
+fresh
+set_version 1.2.3
+runc "$R3/install.sh" --no-build
+check "install from another checkout: header names it and its version" eval 'rc_is 0 && header_ok "$R3" 1.2.3 && manifest_all "$R3"'
+set_version 1.2.4
+runc "$R3/install.sh" --no-build
+check "a version-only change: nothing reinstalled, the new version recorded" \
+  eval 'rc_is 0 && [[ $OUT != *installed\ /* ]] && header_ok "$R3" 1.2.4 && manifest_all "$R3"'
+check "a version-only change: no temporary file left behind" eval '[[ -z $(find "$XDG_STATE_HOME" -name ".*") ]]'
+
+# An invalid version: refused before any change, installed or not.
+for v in 1.2 1.2.3-rc1 v1.2.3 "1.2.3 " -; do
+  for state in fresh installed; do
+    fresh
+    if [[ $state == installed ]]; then
+      set_version 1.2.3
+      runc "$R3/install.sh" --no-build
+      : >"$FAKE_LOG/systemctl"
+    fi
+    set_version "$v"
+    snapshot >"$T/before"
+    runc "$R3/install.sh" --no-build
+    check "invalid version '$v' ($state): exit 1, says why, nothing changed" \
+      eval 'rc_is 1 && [[ $OUT == *"nothing was changed"*"N.N.N"* ]] && cmp -s <(snapshot) "$T/before" && [[ ! -s $FAKE_LOG/systemctl ]]'
+    [[ $v == - ]] && cp "$PLUGIN_DIR/manifest.json" "$R3/manifest.json"
+  done
+done
+cp "$PLUGIN_DIR/manifest.json" "$R3/manifest.json"
+
+# --- 8. running syncs and backups ------------------------------------------------------
+# hold <lock file>: an exclusive flock on it, held by a background process
+# (the subshell execs into sleep, so HOLDER is the holder's own PID).
+hold() {
+  (exec 9>"$1" && flock 9 && exec sleep 300) &
+  HOLDER=$!
+  local i
+  for ((i = 0; i < 50; i++)); do
+    flock -n "$1" true || return 0
+    sleep 0.1
+  done
+  echo "     the lock holder did not take $1"
+  return 1
+}
+release() {
+  kill "$HOLDER" 2>/dev/null
+  wait "$HOLDER" 2>/dev/null
+  HOLDER=
+}
+runs() { find "$XDG_RUNTIME_DIR" -mindepth 1 | sort; }
+
+fresh
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=abc "$INSTALL" --no-build
+check "OMARCHY_CLOUD_INSTALL_WAIT_S not a number: exit 64, nothing written" eval 'rc_is 64 && [[ ! -e $UD && ! -e $BD && ! -e $MAN ]]'
+
+fresh
+runc "$INSTALL" --no-build
+printf '# an older version\n' >"$UD/rclone-bisync@.timer"
+sed -i "s|^[0-9a-f]\{64\}  $UD/rclone-bisync@.timer\$|$(sha "$UD/rclone-bisync@.timer")  $UD/rclone-bisync@.timer|" "$MAN"
+: >"$XDG_RUNTIME_DIR/rclone-backup-idle.lock" # a lock file nobody holds
+check "fixture: a bisync lock is held" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+snapshot >"$T/before"
+runs >"$T/runs"
+: >"$FAKE_LOG/systemctl"
+start=$SECONDS
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
+check "bisync lock held, wait 1: exit 75, names the pair, says nothing changed" \
+  eval 'rc_is 75 && [[ $OUT == *"offline folder vault-A is running"*"nothing was changed"*"rerun install.sh when the sync or backup finishes"* ]]'
+check "bisync lock held: waited about the bound (1-4 s)" eval '((SECONDS - start >= 1 && SECONDS - start <= 4))'
+check "bisync lock held: nothing changed (files, manifest, no reload)" \
+  eval 'cmp -s <(snapshot) "$T/before" && [[ ! -s $FAKE_LOG/systemctl ]]'
+check "bisync lock held: an idle lock file is not named; no lock file created" \
+  eval '[[ $OUT != *idle* ]] && cmp -s <(runs) "$T/runs"'
+release
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
+check "bisync lock released: installs (the update goes in)" \
+  eval 'rc_is 0 && [[ $OUT != *waiting* && $OUT == *"installed $UD/rclone-bisync@.timer"* ]] && copies_ok && manifest_all "$PLUGIN_DIR" && header_ok'
+
+# Released while install.sh waits: it goes on.
+fresh
+check "fixture: a bisync lock is held" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+(sleep 1 && kill "$HOLDER") &
+killer=$!
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=20 "$INSTALL" --no-build
+wait "$killer"
+release
+check "bisync lock released during the wait: waited, then installed" \
+  eval 'rc_is 0 && [[ $OUT == *waiting*"vault-A is running"* ]] && copies_ok && header_ok'
+
+fresh
+check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+snapshot >"$T/before"
+start=$SECONDS
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "backup lock held, wait 0: exit 75 at once, names the job, nothing changed" \
+  eval 'rc_is 75 && ((SECONDS - start <= 2)) && [[ $OUT == *"backup team-vaults is running"*"nothing was changed"* ]] && cmp -s <(snapshot) "$T/before" && [[ ! -s $FAKE_LOG/systemctl ]]'
+release
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
+check "backup lock released: installs" eval 'rc_is 0 && copies_ok && manifest_all "$PLUGIN_DIR" && header_ok'
+
+# --uninstall waits the same way.
+check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+snapshot >"$T/before"
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --uninstall
+check "uninstall with a backup lock held: exit 75, removes nothing, hint says --uninstall" \
+  eval 'rc_is 75 && [[ $OUT == *"backup team-vaults is running"*"rerun install.sh --uninstall when the sync or backup finishes"* ]] && cmp -s <(snapshot) "$T/before"'
+release
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --uninstall
+check "uninstall with the lock released: exit 0, removed" eval 'rc_is 0 && [[ ! -e $MAN && ! -e $BD/rclone-bisync ]]'
+
+# The locks are read from /proc/locks, never taken: with a flock on PATH
+# that records each call and always "gets" the lock, a held lock is still
+# named, an idle one is not, and flock is never run.
+NOFLOCK=$SCRATCH/noflock
+mkdir -p "$NOFLOCK"
+cat >"$NOFLOCK/flock" <<'EOF'
+#!/bin/bash
+echo "flock $*" >>"$FAKE_LOG/flock"
+exit 0
+EOF
+chmod +x "$NOFLOCK/flock"
+fresh
+: >"$XDG_RUNTIME_DIR/rclone-bisync-idle.lock"
+check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+snapshot >"$T/before"
+runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "/proc/locks: the held lock is named, the idle one is not, no lock is taken" \
+  eval 'rc_is 75 && [[ $OUT == *"backup team-vaults is running"* && $OUT != *idle* && ! -e $FAKE_LOG/flock ]] && cmp -s <(snapshot) "$T/before"'
+# The fallback (no mount entry for the dir, so /proc/locks cannot be
+# matched): the probe flock, which also sees the held lock.
+NOMNT=$SCRATCH/nomnt
+mkdir -p "$NOMNT"
+printf '#!/bin/sh\nexit 1\n' >"$NOMNT/findmnt"
+chmod +x "$NOMNT/findmnt"
+runc env PATH="$NOMNT:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "fallback probe (findmnt fails): the held lock is named, the idle one is not" \
+  eval 'rc_is 75 && [[ $OUT == *"backup team-vaults is running"* && $OUT != *idle* ]] && cmp -s <(snapshot) "$T/before"'
+release
+runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "/proc/locks: released, installs without running flock" eval 'rc_is 0 && copies_ok && [[ ! -e $FAKE_LOG/flock ]]'
+# The same on tmpfs (the usual /run/user/<uid>), when /dev/shm is one: there
+# stat's device and /proc/locks' agree, on btrfs ($SCRATCH here, often) not.
+if [[ $(findmnt -no FSTYPE -T /dev/shm 2>/dev/null) == tmpfs ]] && SHMRUN=$(mktemp -d /dev/shm/install-test.XXXXXX); then
+  fresh
+  export XDG_RUNTIME_DIR=$SHMRUN
+  check "fixture: a bisync lock is held on tmpfs" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+  runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+  check "/proc/locks on tmpfs: the held lock is named, no lock is taken" \
+    eval 'rc_is 75 && [[ $OUT == *"offline folder vault-A is running"* && ! -e $FAKE_LOG/flock ]]'
+  release
+  rm -rf -- "$SHMRUN"
+else
+  echo "skip /proc/locks on tmpfs (/dev/shm is not a writable tmpfs)"
+fi
+
+# A lock file owned by another user (with XDG_RUNTIME_DIR unset the dir is
+# the shared /tmp) is ignored: not tested, a foreign owner needs root.
+
+# --- 9. the repository ---------------------------------------------------------------
 if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   check "repo: no symlink is tracked (git ls-files mode 120000)" \
     eval '[[ -z $(git -C "$PLUGIN_DIR" ls-files -s | awk "\$1 == 120000") ]]'

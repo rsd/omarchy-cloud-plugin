@@ -26,6 +26,12 @@
 #      systemctl's template listing (a stand-in) is content, the TUI binary
 #      found only when executable, nothing runs, and a hung read is cut by
 #      timeout and refused.
+#   6. Model.VERSIONS_SCRIPT on a crafted plugin folder and state dir: the
+#      plugin's manifest.json version and install.sh's header read, a FIFO
+#      skipped, a symlink to a regular file followed, the legacy record and
+#      install.sh found, nothing runs, a hung read cut by timeout and refused;
+#      and Model.INSTALL_SCRIPT (without the terminal) runs a stand-in
+#      install.sh given as "$1", prints its exit status and waits for Enter.
 #
 # Nothing here touches the real cache, a mount, a unit or the real config.
 
@@ -343,6 +349,96 @@ out=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null)
 status=$?
 ((status == 124 && SECONDS - start < 5)) && pass "a hung read is cut by timeout (status $status)" || fail "hung scan: status $status after $((SECONDS - start)) s"
 [[ $(parse_scan "$SHOME" "$SSTATE" "$TOKEN" <<<"$out") == *'"ok":false'* ]] && pass "a scan without its end line is refused" || fail "a cut scan was accepted"
+
+# --- 6. the installed-parts read and the install terminal script -------------
+# versions_argv <plugin dir> <state dir> <token>: Model.versionsArgv, NUL-separated.
+versions_argv() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { versionsArgv }")()
+    process.stdout.write(m.versionsArgv(process.argv[2], process.argv[3], process.argv[4]).map(a => a + "\0").join(""))
+  ' "$PLUGIN_DIR/Model.js" "$1" "$2" "$3"
+}
+# parse_versions <token>: Model.parseVersions over stdin, with its state, as JSON.
+parse_versions() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { parseVersions, installState }")()
+    const r = m.parseVersions(fs.readFileSync(0, "utf8"), process.argv[2])
+    r.state = m.installState(r)
+    process.stdout.write(JSON.stringify(r))
+  ' "$PLUGIN_DIR/Model.js" "$1"
+}
+# install_argv <plugin dir>: Model.installArgv, NUL-separated.
+install_argv() {
+  node -e '
+    const fs = require("fs")
+    const src = fs.readFileSync(process.argv[1], "utf8")
+    const m = new Function(src + "\nreturn { installArgv }")()
+    process.stdout.write(m.installArgv(process.argv[2]).map(a => a + "\0").join(""))
+  ' "$PLUGIN_DIR/Model.js" "$1"
+}
+VPLUG="$SCRATCH/ver/\$(touch PWNED) a'b \"c\" \`touch PWNED\`/plugin"
+VSTATE="$SCRATCH/ver/state \$(touch PWNED)"
+mkdir -p "$VPLUG" "$VSTATE/omarchy-cloud" "$SCRATCH/cwd"
+printf '{\n  "id": "x",\n  "version": "0.3.3"\n}\n' >"$VPLUG/manifest.json"
+printf '#version=0.3.2\n#repo=/src/x\n%064d  /home/u/.local/bin/x\n' 0 >"$SCRATCH/installed-target"
+ln -s "$SCRATCH/installed-target" "$VSTATE/omarchy-cloud/installed-files"
+mapfile -d '' -t argv < <(versions_argv "$VPLUG" "$VSTATE" "$TOKEN")
+[[ ${argv[0]} == timeout && ${argv[4]} == sh && ${argv[5]} == -c && ${argv[8]} == "$TOKEN" && ${argv[11]} == "$VPLUG/manifest.json" &&
+  ${argv[12]} == "$VSTATE/omarchy-cloud/installed-files" && ${argv[14]} == "$VPLUG/install.sh" ]] &&
+  pass "the versions read runs under timeout -k through sh, paths positional" || fail "versions argv: ${argv[*]}"
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+status=$?
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the plugin or state path ran" || pass "nothing in the plugin or state path ran"
+got=$(parse_versions "$TOKEN" <<<"$out")
+want='{"ok":true,"plugin":"0.3.3","installedPresent":true,"installedVersion":"0.3.2","installedRepo":"/src/x","legacy":false,"installer":false,"state":"mismatch"}'
+((status == 0)) && [[ $got == "$want" ]] && pass "manifest.json and the header read through a symlink: mismatch" || {
+  fail "versions parsed (status $status)"
+  echo "     want: $want"
+  echo "     got:  $got"
+}
+printf 'x\n' >"$VSTATE/omarchy-cloud/installed-binary.sha256"
+printf '#!/bin/sh\n' >"$VPLUG/install.sh"
+rm "$VSTATE/omarchy-cloud/installed-files"
+mkfifo "$VSTATE/omarchy-cloud/installed-files"
+start=$SECONDS
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+status=$?
+got=$(parse_versions "$TOKEN" <<<"$out")
+((status == 0 && SECONDS - start < 5)) && [[ $got == *'"installedPresent":false,'*'"legacy":true,"installer":true,"state":"unknown"}' ]] &&
+  pass "a FIFO manifest is skipped; the legacy record and install.sh are found: unknown" || fail "FIFO / legacy: status $status, $got"
+rm "$VSTATE/omarchy-cloud/installed-files" "$VSTATE/omarchy-cloud/installed-binary.sha256"
+out=$(cd "$SCRATCH/cwd" && "${argv[@]}")
+[[ $(parse_versions "$TOKEN" <<<"$out") == *'"state":"none"}' ]] && pass "nothing installed: none" || fail "none: $(parse_versions "$TOKEN" <<<"$out")"
+cut=("${argv[@]}")
+cut[3]=1
+start=$SECONDS
+out=$(cd "$SCRATCH/cwd" && PATH=$HANGBIN:$PATH "${cut[@]}" 2>/dev/null)
+status=$?
+((status == 124 && SECONDS - start < 5)) && [[ $(parse_versions "$TOKEN" <<<"$out") == *'"ok":false'* ]] &&
+  pass "a hung versions read is cut by timeout and refused" || fail "hung versions read: status $status after $((SECONDS - start)) s"
+# The install terminal's script, run as the terminal would run it (the argv
+# after omarchy-launch-tui --app-id=TUI.float), Enter on stdin.
+printf 'echo "stand-in install.sh ran with $# args"\nexit "${CM_EXIT:-0}"\n' >"$VPLUG/install.sh"
+mapfile -d '' -t argv < <(install_argv "$VPLUG")
+[[ ${argv[0]} == omarchy-launch-tui && ${argv[1]} == --app-id=TUI.float && ${argv[2]} == bash && ${argv[3]} == -c && ${argv[6]} == "$VPLUG/install.sh" && ${#argv[@]} == 7 ]] &&
+  pass "install argv: the floating terminal, a fixed script, install.sh as its own argument" || fail "install argv: ${argv[*]}"
+out=$(cd "$SCRATCH/cwd" && printf '\n' | "${argv[@]:2}")
+status=$?
+((status == 0)) && grep -q '^stand-in install.sh ran with 0 args$' <<<"$out" && grep -q 'finished (exit status 0)' <<<"$out" && grep -q 'Press Enter to close' <<<"$out" &&
+  pass "install.sh runs from \"\$1\", its exit status is shown, then Enter closes" || fail "install script: status $status, $out"
+out=$(cd "$SCRATCH/cwd" && printf '\n' | CM_EXIT=3 "${argv[@]:2}")
+grep -q 'failed (exit status 3)' <<<"$out" && pass "a failed install.sh shows its exit status" || fail "failed install: $out"
+[[ -e $SCRATCH/cwd/PWNED || -e PWNED ]] && fail "a command in the plugin path ran" || pass "nothing in the plugin path ran"
+# Without Enter the terminal stays: the script is still waiting.
+coproc WAITER { cd "$SCRATCH/cwd" && "${argv[@]:2}"; }
+sleep 1
+kill -0 "$WAITER_PID" 2>/dev/null && pass "the script waits for Enter after install.sh exits" || fail "the script did not wait"
+kill "$WAITER_PID" 2>/dev/null
+wait "$WAITER_PID" 2>/dev/null
 
 if ((FAILURES)); then
   echo "FAILED $FAILURES shell-string tests"

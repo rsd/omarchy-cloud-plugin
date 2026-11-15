@@ -29,6 +29,12 @@ import "Model.js" as Model
 //     changed, and on a panel opening. Conflict copies the user deletes by hand
 //     therefore stay listed until the next sync run rewrites the state file
 //     (the timer's interval at most, while it is enabled) or a panel opens.
+//   - versions (one `sh` reading the plugin's own manifest.json version, the
+//     header of install.sh's installed-files manifest and whether the legacy
+//     installed-binary.sha256 and the plugin's install.sh exist; see
+//     Model.VERSIONS_SCRIPT): never on a timer. When the first widget
+//     attaches and on a panel opening, so a run of "Update installed parts"
+//     shows on the next opening.
 //   - The env-file listing is a FolderListModel: a directory listing watched
 //     by Qt, no process and no timer. A directory that does not exist when the
 //     shell starts is not watched until the next restart.
@@ -39,6 +45,8 @@ Singleton {
 
   readonly property string home: Model.cleanHome(Quickshell.env("HOME"))
   readonly property string stateDir: Model.stateHome(root.home, Quickshell.env("XDG_STATE_HOME"))
+  // This file's own folder, the plugin's (manifest.json, install.sh).
+  readonly property string pluginDir: Model.pluginDirFromUrl(Qt.resolvedUrl("manifest.json"))
 
   // parseShow's map of the last good poll, and whether one arrived. units is
   // reassigned only when the answer changed, so a quiet poll wakes no
@@ -70,6 +78,9 @@ Singleton {
   property bool scanned: false
   property string scanError: ""
   property string scanKey: ""
+  // The last good versions read (Model.parseVersions); its ok stays false
+  // until one arrives, so nothing is claimed before that.
+  property var versions: Model.emptyVersions()
   readonly property var pairs: Model.mergePairs(Model.scanPairs(root.scanData), Model.unitPairs(root.units))
   readonly property var jobs: Model.mergeJobs(Model.scanJobs(root.scanData), Model.unitJobs(root.units))
   // A panel opened before the first answer had no remotes to size; the slot
@@ -83,6 +94,7 @@ Singleton {
   property bool pollPending: false
   property bool sizesPending: false
   property bool scanPending: false
+  property bool versionsPending: false
 
   function refresh() {
     if (poll.running) { root.pollPending = true; return }
@@ -100,6 +112,24 @@ Singleton {
     scan.token = token
     scan.command = argv
     scan.running = true
+  }
+
+  // Same token scheme as the scan.
+  function recheckVersions() {
+    if (versionsProc.running) { root.versionsPending = true; return }
+    var token = Model.scanToken()
+    var argv = Model.versionsArgv(root.pluginDir, root.stateDir, token)
+    if (argv.length === 0) return
+    versionsProc.token = token
+    versionsProc.command = argv
+    versionsProc.running = true
+  }
+
+  // A failed read keeps the last good one.
+  function applyVersions(text, token) {
+    var parsed = Model.parseVersions(text, token)
+    if (!parsed.ok) return
+    if (JSON.stringify(parsed) !== JSON.stringify(root.versions)) root.versions = parsed
   }
 
   // The poll never names a pair's or job's units (Model.showArgv), so a scan
@@ -130,8 +160,10 @@ Singleton {
 
   function attach(owner) {
     if (!owner || root.attached.indexOf(owner) !== -1) return
+    var first = root.attached.length === 0
     root.attached = root.attached.concat([owner])
     root.refresh()
+    if (first) root.recheckVersions()
   }
   function detach(owner) { root.attached = without(root.attached, owner) }
   function holdOpen(owner) {
@@ -140,6 +172,7 @@ Singleton {
     root.refresh()
     root.refreshSizes(false)
     root.rescan()
+    root.recheckVersions()
   }
   function releaseOpen(owner) { root.openPanels = without(root.openPanels, owner) }
   function without(list, owner) {
@@ -208,6 +241,24 @@ Singleton {
       if (scan.running || !root.scanPending) return
       root.scanPending = false
       Qt.callLater(root.rescan)
+    }
+  }
+
+  // Bounded like the scan: two files, the first Model.INSTALL_HEADER_MAX_BYTES
+  // and Model.PLUGIN_MANIFEST_MAX_BYTES of each, under `timeout -k`;
+  // parseVersions refuses an answer over Model.VERSIONS_MAX_CHARS or without
+  // its end line.
+  Process {
+    id: versionsProc
+    property string token: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyVersions(text, versionsProc.token)
+    }
+    onRunningChanged: {
+      if (versionsProc.running || !root.versionsPending) return
+      root.versionsPending = false
+      Qt.callLater(root.recheckVersions)
     }
   }
 

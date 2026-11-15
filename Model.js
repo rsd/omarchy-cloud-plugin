@@ -173,6 +173,52 @@ var SCAN_SCRIPT = [
   "printf '%s end\\n' \"$t\""
 ].join("\n")
 
+// The installed-parts check: which version install.sh last recorded against
+// the plugin's own. One small process, read when the first bar attaches and
+// on a panel opening, never on the poll's timer. It reads the first "$3"
+// bytes of the plugin's manifest.json "$4" and the first "$2" of install.sh's
+// manifest "$5" (each preceded by its byte size, -1 when it cannot be sized;
+// regular files only, a symlink followed), says whether the legacy record
+// "$6" and the plugin's install.sh "$7" are regular files,
+// and ends with an "end" line. Marker lines start with the token "$1", as in
+// SCAN_SCRIPT; nothing is interpolated into the script.
+var INSTALLED_FILES = "omarchy-cloud/installed-files"
+var INSTALLED_LEGACY = "omarchy-cloud/installed-binary.sha256"
+var INSTALL_HEADER_MAX_BYTES = 4096
+var INSTALL_HEADER_LINE_MAX = 1024
+var PLUGIN_MANIFEST_MAX_BYTES = 16384
+var VERSIONS_MAX_CHARS = INSTALL_HEADER_MAX_BYTES + PLUGIN_MANIFEST_MAX_BYTES + 2048
+// install.sh refuses any other shape (the shared contract).
+var VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/
+var VERSIONS_SCRIPT = [
+  "t=$1 c=$2 d=$3 p=$4 m=$5 l=$6 i=$7",
+  "r() {",
+  "  [ -f \"$2\" ] || return 0",
+  "  s=$(wc -c <\"$2\" 2>/dev/null) || s=-1",
+  "  printf '%s %s %s\\n' \"$t\" \"$1\" \"$s\"",
+  "  head -c \"$3\" -- \"$2\" 2>/dev/null",
+  "  printf '\\n%s eof\\n' \"$t\"",
+  "}",
+  "r plugin \"$p\" \"$d\"",
+  "r installed \"$m\" \"$c\"",
+  "[ -f \"$l\" ] && printf '%s legacy\\n' \"$t\"",
+  "[ -f \"$i\" ] && printf '%s installer\\n' \"$t\"",
+  "printf '%s end\\n' \"$t\""
+].join("\n")
+
+// Update installed parts: install.sh in a floating terminal that stays open
+// once it exits, so its output can be read. The path is "$1", never part of
+// the script; bash runs it, so it needs no execute bit.
+var INSTALL_SCRIPT = [
+  "printf 'Running %s\\n\\n' \"$1\"",
+  "bash -- \"$1\"",
+  "s=$?",
+  "echo",
+  "if [ \"$s\" -eq 0 ]; then echo 'install.sh finished (exit status 0).'; else echo \"install.sh failed (exit status $s).\"; fi",
+  "printf 'Press Enter to close. '",
+  "read -r _"
+].join("\n")
+
 // Nerd Font (Material Design) glyphs, the bar's own icon font.
 var ICON = {
   all: "󰅠",      // md-cloud_check
@@ -186,6 +232,7 @@ var ICON = {
   sync: "󰓦",     // md-sync
   backup: "󰁯",   // md-backup_restore
   settings: "󰒓", // md-cog
+  update: "󰚰",   // md-update
   close: "󰅖"     // md-close
 }
 
@@ -427,6 +474,39 @@ function syncNowArgv(pair) {
 function configureArgv(home) {
   var bin = appPath(home)
   return bin === "" ? [] : ["omarchy-launch-tui", "--app-id=TUI.float", bin]
+}
+
+// The plugin's own folder from the file:// URL of a file in it (CloudState
+// resolves "manifest.json"): percent-decoded, then held to the same rule as
+// $HOME (absolute, no "." or ".." segment, no control character); "" for
+// anything else.
+function pluginDirFromUrl(url) {
+  var u = String(url === undefined || url === null ? "" : url)
+  var tail = "/manifest.json"
+  if (u.indexOf("file://") !== 0 || u.length > 4096) return ""
+  var path
+  try { path = decodeURIComponent(u.slice(7)) } catch (e) { return "" }
+  if (path.length <= tail.length || path.slice(-tail.length) !== tail) return ""
+  return cleanHome(path.slice(0, -tail.length))
+}
+
+// Update installed parts: the plugin folder's install.sh through
+// INSTALL_SCRIPT, as its "$1", in the same floating terminal as Configure….
+function installArgv(pluginDir) {
+  var dir = cleanHome(pluginDir)
+  return dir === "" ? [] : ["omarchy-launch-tui", "--app-id=TUI.float", "bash", "-c", INSTALL_SCRIPT,
+    "omarchy-cloud-install", dir + "/install.sh"]
+}
+
+// VERSIONS_SCRIPT for the plugin folder and the state dir; [] without both.
+function versionsArgv(pluginDir, stateDir, token) {
+  if (typeof token !== "string" || !SCAN_TOKEN_RE.test(token)) return []
+  var dir = cleanHome(pluginDir)
+  var st = cleanHome(stateDir)
+  if (dir === "" || st === "") return []
+  return timeoutArgv().concat(["sh", "-c", VERSIONS_SCRIPT, "cloud-mounts-versions", token,
+    String(INSTALL_HEADER_MAX_BYTES), String(PLUGIN_MANIFEST_MAX_BYTES), dir + "/manifest.json",
+    st + "/" + INSTALLED_FILES, st + "/" + INSTALLED_LEGACY, dir + "/install.sh"])
 }
 
 // A scan token: the marker prefix SCAN_SCRIPT puts on its own lines, drawn at
@@ -880,12 +960,12 @@ function sameList(a, b) {
 
 // The panel's keyboard cursor stands on one control, named by a key:
 //   switch|<remote>  folder|<remote>  log|<unit>  force  cancel  sync|<pair>
-//   configure
+//   install  configure
 // The stops form groups, one per panel row, each in screen order left to
 // right with the one a vertical move lands on (primary): a remote row
 // [log?, folder?, switch], the confirm box [force, cancel] under its row, an
-// offline-folder row [log?, sync?], a backup row [log?], and the footer's
-// Configure… [configure?]. Disabled controls are not stops, and a row with
+// offline-folder row [log?, sync?], a backup row [log?], the footer's
+// Update installed parts [install?] and its Configure… [configure?]. Disabled controls are not stops, and a row with
 // none is skipped. Up/Down step between groups, Left/Right inside one.
 function cursorKey(kind, arg) {
   return arg === undefined || arg === "" ? String(kind) : String(kind) + "|" + String(arg)
@@ -896,11 +976,11 @@ function cursorAction(key) {
   var bar = k.indexOf("|")
   var kind = bar === -1 ? k : k.slice(0, bar)
   var arg = bar === -1 ? "" : k.slice(bar + 1)
-  if (["switch", "folder", "log", "force", "cancel", "sync", "configure"].indexOf(kind) === -1) return { kind: "", arg: "" }
+  if (["switch", "folder", "log", "force", "cancel", "sync", "install", "configure"].indexOf(kind) === -1) return { kind: "", arg: "" }
   return { kind: kind, arg: arg }
 }
 
-// o: { stopRemote, confirm, logUnit, pairs (pairRows), jobs (jobRows), canConfigure }
+// o: { stopRemote, confirm, logUnit, pairs (pairRows), jobs (jobRows), canInstall, canConfigure }
 function cursorGroups(rows, o) {
   var opt = o || {}
   var groups = []
@@ -930,6 +1010,7 @@ function cursorGroups(rows, o) {
     var jr = jobs[j]
     if (jr && (jr.failed || opt.logUnit === jr.unit)) groups.push({ keys: [cursorKey("log", jr.unit)], primary: 0 })
   }
+  if (opt.canInstall === true) groups.push({ keys: ["install"], primary: 0 })
   if (opt.canConfigure === true) groups.push({ keys: ["configure"], primary: 0 })
   return groups
 }
@@ -1051,8 +1132,10 @@ function summary(rows, polled, pairs, jobs) {
 }
 
 // The bar's tooltip. Every name in it passed isValidRemote (the tooltip is a
-// shell component with no plain-text setting).
-function tooltipText(rows, pairs, jobs, polled, pollError) {
+// shell component with no plain-text setting). notice: installNotice's line,
+// or "", shortened here to installTipLine's pointer to the panel; canConfigure: right-click opens
+// the TUI (BarWidget falls back to the panel without it).
+function tooltipText(rows, pairs, jobs, polled, pollError, notice, canConfigure) {
   var lines = ["Cloud Mounts: " + summary(rows, polled, pairs, jobs)]
   if (pollError !== "") lines.push(pollError)
   var p = problems(rows, pairs, jobs)
@@ -1065,7 +1148,9 @@ function tooltipText(rows, pairs, jobs, polled, pollError) {
     var pr = list[p]
     if (pr && pr.conflictCount > 0 && isValidRemote(pr.name)) lines.push(pr.name + ": " + conflictCountText(pr))
   }
-  lines.push("Click to manage")
+  var tip = installTipLine(notice)
+  if (tip !== "") lines.push(tip)
+  lines.push(canConfigure === true ? "Click to manage · Right-click: Configure…" : "Click to manage")
   return lines.join("\n")
 }
 
@@ -1325,6 +1410,124 @@ function configureHint(scanned, appInstalled) {
   if (!scanned) return ""
   return appInstalled ? "" : "Run install.sh from the plugin folder to install omarchy-cloud."
 }
+
+// --------------------------------------------------------- installed parts
+
+function emptyVersions() {
+  return { ok: false, plugin: "", installedPresent: false, installedVersion: "", installedRepo: "",
+    legacy: false, installer: false }
+}
+
+// The header lines install.sh writes before its `<sha256>  <path>` lines
+// (#version=, #repo=). Only the first INSTALL_HEADER_MAX_BYTES are looked at;
+// a line longer than INSTALL_HEADER_LINE_MAX is no header line. The first
+// line of a key decides it, valid or not (a later duplicate is ignored).
+// version: N.N.N or ""; repo: absolute, no control character, or "".
+function parseInstallHeader(text) {
+  var out = { version: "", repo: "" }
+  var s = String(text === undefined || text === null ? "" : text).slice(0, INSTALL_HEADER_MAX_BYTES)
+  var lines = s.split("\n")
+  var seen = {}
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].replace(/\r$/, "")
+    if (line.length > INSTALL_HEADER_LINE_MAX) continue
+    var m = /^#(version|repo)=(.*)$/.exec(line)
+    if (!m || seen[m[1]] === true) continue
+    seen[m[1]] = true
+    var v = m[2]
+    if (m[1] === "version") out.version = VERSION_RE.test(v) ? v : ""
+    else out.repo = v.charAt(0) === "/" && !/[\u0000-\u001f\u007f-\u009f]/.test(v) ? v : ""
+  }
+  return out
+}
+
+// The "version" of the plugin's manifest.json, when it is N.N.N; else "".
+function parsePluginVersion(text) {
+  var s = String(text === undefined || text === null ? "" : text)
+  if (s.length > PLUGIN_MANIFEST_MAX_BYTES) return ""
+  var j
+  try { j = JSON.parse(s) } catch (e) { return "" }
+  var v = j && typeof j === "object" ? j.version : undefined
+  return typeof v === "string" && VERSION_RE.test(v) ? v : ""
+}
+
+// VERSIONS_SCRIPT's output for `token`. ok only for a run that finished (its
+// "end" line) within VERSIONS_MAX_CHARS; lines that do not start with the
+// token are file content. A file larger than the bytes read loses its last,
+// cut line.
+function parseVersions(text, token) {
+  var res = emptyVersions()
+  if (typeof token !== "string" || !SCAN_TOKEN_RE.test(token)) return res
+  var s = String(text === undefined || text === null ? "" : text)
+  if (s.length > VERSIONS_MAX_CHARS) return res
+  var lines = s.split("\n")
+  var head = token + " "
+  var cur = null
+  var bodies = {}
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line.indexOf(head) === 0) {
+      var rest = line.slice(head.length)
+      if (rest === "end") { res.ok = true; break }
+      if (rest === "legacy") { res.legacy = true; continue }
+      if (rest === "installer") { res.installer = true; continue }
+      if (rest === "eof") {
+        if (cur !== null) {
+          var body = cur.lines
+          if (body.length > 0 && body[body.length - 1] === "") body.pop()
+          if (cur.truncated && body.length > 0) body.pop()
+          if (!Object.prototype.hasOwnProperty.call(bodies, cur.what)) bodies[cur.what] = body.join("\n")
+        }
+        cur = null
+        continue
+      }
+      var m = /^(plugin|installed) (-1|\d{1,12})$/.exec(rest)
+      cur = m ? { what: m[1], truncated: Number(m[2]) > (m[1] === "plugin" ? PLUGIN_MANIFEST_MAX_BYTES : INSTALL_HEADER_MAX_BYTES), lines: [] } : null
+      if (m && m[1] === "installed") res.installedPresent = true
+      continue
+    }
+    if (cur !== null) cur.lines.push(line)
+  }
+  if (!res.ok) return emptyVersions()
+  if (Object.prototype.hasOwnProperty.call(bodies, "plugin")) res.plugin = parsePluginVersion(bodies.plugin)
+  if (Object.prototype.hasOwnProperty.call(bodies, "installed")) {
+    var h = parseInstallHeader(bodies.installed)
+    res.installedVersion = h.version
+    res.installedRepo = h.repo
+  }
+  return res
+}
+
+// none (nothing installed) | unknown (installed, no version recorded: by
+// install.sh 0.3.2 or older) | mismatch (either direction) | ok; "" when the
+// read failed or the plugin's own version is unknown, so nothing is claimed.
+function installState(v) {
+  if (!v || v.ok !== true || typeof v.plugin !== "string" || v.plugin === "") return ""
+  if (!v.installedPresent && !v.legacy) return "none"
+  if (!v.installedPresent || v.installedVersion === "") return "unknown"
+  return v.installedVersion === v.plugin ? "ok" : "mismatch"
+}
+
+// The notice for that state (the shared contract's wording), or "".
+function installNotice(v) {
+  var state = installState(v)
+  if (state === "mismatch") return "Installed parts are " + v.installedVersion + ", plugin is " + v.plugin + " — run install.sh"
+  if (state === "unknown") return "Installed parts are older than " + v.plugin + " (no version recorded) — run install.sh"
+  if (state === "none") return INSTALL_NOTICE_NONE
+  return ""
+}
+
+var INSTALL_NOTICE_NONE = "Installed parts: not installed — run install.sh"
+
+// The tooltip's short form of an installNotice line: the panel has the
+// versions and the button.
+function installTipLine(notice) {
+  if (typeof notice !== "string" || notice === "") return ""
+  if (notice === INSTALL_NOTICE_NONE) return "Installed parts: not installed — open the panel"
+  return "Installed parts out of date — open the panel"
+}
+
+var INSTALL_BUTTON_TEXT = "Update installed parts"
 
 // ------------------------------------------------------------- formatting
 

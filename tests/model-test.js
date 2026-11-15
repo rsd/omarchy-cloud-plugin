@@ -917,6 +917,199 @@ test("icons are single Nerd Font glyphs", () => {
 const qmlFiles = fs.readdirSync(pluginDir).filter(f => f.endsWith(".qml"))
 const qmlCode = file => fs.readFileSync(path.join(pluginDir, file), "utf8").replace(/\/\/.*$/gm, "")
 
+// --------------------------------------------------------- installed parts
+
+// VERSIONS_SCRIPT's answer, built the way the script prints it.
+const versionsOut = (o) => {
+  const t = o.token || TOKEN
+  const out = []
+  const file = (what, body, size) => {
+    if (body === undefined) return
+    out.push(t + " " + what + " " + (size !== undefined ? size : Buffer.byteLength(body)))
+    out.push(body + "\n" + t + " eof")
+  }
+  file("plugin", o.plugin, o.pluginSize)
+  file("installed", o.installed, o.installedSize)
+  if (o.legacy) out.push(t + " legacy")
+  if (o.installer !== false) out.push(t + " installer")
+  if (o.end !== false) out.push(t + " end")
+  return out.join("\n") + "\n"
+}
+const MANIFEST = (v) => JSON.stringify({ schemaVersion: 1, id: "io.github.rsd.cloud-mounts", version: v }, null, 2) + "\n"
+const SHA = "0".repeat(64) + "  /home/u/.local/bin/rclone-bisync\n"
+
+test("installed parts: header lines, first of each key wins, bounded", () => {
+  const h = model.parseInstallHeader
+  assert.deepStrictEqual(h("#version=0.3.3\n#repo=/src/omarchy-cloud-plugin\n" + SHA), { version: "0.3.3", repo: "/src/omarchy-cloud-plugin" })
+  // Missing: a 0.3.2 manifest has no header lines.
+  assert.deepStrictEqual(h(SHA), { version: "", repo: "" })
+  assert.deepStrictEqual(h(""), { version: "", repo: "" })
+  assert.deepStrictEqual(h(null), { version: "", repo: "" })
+  // Malformed versions and repos.
+  for (const bad of ["0.3", "0.3.3.1", "v0.3.3", "0.3.3 ", " 0.3.3", "0.3.x", "", "0.3.3\u0000", "0..3", "1.2.3-rc1", "１.２.３"])
+    assert.strictEqual(h("#version=" + bad + "\n").version, "", JSON.stringify(bad))
+  for (const bad of ["relative/path", "", "/a\u001bb", "/a\tb", "/a\u0085b", "~/x"])
+    assert.strictEqual(h("#repo=" + bad + "\n").repo, "", JSON.stringify(bad))
+  assert.strictEqual(h("# version=0.3.3\n#Version=0.3.3\nversion=0.3.3\n").version, "", "only the exact key")
+  assert.strictEqual(h("#version=0.3.3\r\n").version, "0.3.3", "a CRLF line")
+  // Duplicates: the first line of a key decides, even when it is malformed.
+  assert.strictEqual(h("#version=0.3.3\n#version=9.9.9\n").version, "0.3.3")
+  assert.strictEqual(h("#version=bad\n#version=0.3.3\n").version, "")
+  assert.strictEqual(h("#repo=/a\n#repo=/b\n").repo, "/a")
+  // Only the first INSTALL_HEADER_MAX_BYTES count; an oversized line is no header.
+  assert.strictEqual(h(SHA.repeat(80) + "#version=0.3.3\n").version, "")
+  assert.strictEqual(h("#repo=/" + "x".repeat(model.INSTALL_HEADER_LINE_MAX) + "\n#version=0.3.3\n").repo, "")
+  assert.strictEqual(h("#repo=/" + "x".repeat(model.INSTALL_HEADER_LINE_MAX) + "\n#version=0.3.3\n").version, "0.3.3")
+  assert.ok(model.INSTALL_HEADER_MAX_BYTES <= 4096)
+})
+
+test("installed parts: the plugin's manifest.json version", () => {
+  const v = model.parsePluginVersion
+  assert.strictEqual(v(MANIFEST("0.3.3")), "0.3.3")
+  assert.strictEqual(v(fs.readFileSync(path.join(pluginDir, "manifest.json"), "utf8")), JSON.parse(fs.readFileSync(path.join(pluginDir, "manifest.json"), "utf8")).version)
+  for (const bad of ["", "{", "null", "[]", '"0.3.3"', '{"version":3}', '{"version":"0.3"}', '{"version":"0.3.3\\n"}', '{"Version":"0.3.3"}', null])
+    assert.strictEqual(v(bad), "", String(bad))
+  assert.strictEqual(v('{"version":"0.3.3","pad":"' + "x".repeat(model.PLUGIN_MANIFEST_MAX_BYTES) + '"}'), "", "oversized")
+})
+
+test("installed parts: the read, its bounds and its token", () => {
+  const p = model.parseVersions
+  const r = p(versionsOut({ plugin: MANIFEST("0.3.3"), installed: "#version=0.3.3\n#repo=/src/x\n" + SHA }), TOKEN)
+  assert.deepStrictEqual(r, { ok: true, plugin: "0.3.3", installedPresent: true, installedVersion: "0.3.3", installedRepo: "/src/x", legacy: false, installer: true })
+  // No end line, another token, too long, a bad token: nothing at all.
+  assert.deepStrictEqual(p(versionsOut({ plugin: MANIFEST("0.3.3"), end: false }), TOKEN), model.emptyVersions())
+  assert.deepStrictEqual(p(versionsOut({ plugin: MANIFEST("0.3.3") }), "cmscan-zzzzzzzzzzzz"), model.emptyVersions())
+  assert.deepStrictEqual(p(versionsOut({ plugin: MANIFEST("0.3.3") }), "bad"), model.emptyVersions())
+  assert.strictEqual(p("x".repeat(model.VERSIONS_MAX_CHARS + 1) + "\n" + TOKEN + " end\n", TOKEN).ok, false)
+  // Marker lines of any other token inside a file are content (each run
+  // draws a fresh token, so a file cannot carry the live one).
+  const other = "cmscan-zzzzzzzzzzzz"
+  const forged = p(versionsOut({ plugin: MANIFEST("0.3.3"), installed: "#version=0.3.3\n" + other + " legacy\n" + other + " end", installer: false }), TOKEN)
+  assert.strictEqual(forged.ok, true)
+  assert.strictEqual(forged.legacy, false)
+  assert.strictEqual(forged.installer, false)
+  assert.strictEqual(forged.installedVersion, "0.3.3")
+  // Missing files; a manifest that could not be sized still counts as present.
+  assert.deepStrictEqual(p(versionsOut({ plugin: MANIFEST("0.3.3") }), TOKEN).installedPresent, false)
+  const unsized = p(versionsOut({ plugin: MANIFEST("0.3.3"), installed: "", installedSize: -1 }), TOKEN)
+  assert.strictEqual(unsized.installedPresent, true)
+  assert.strictEqual(unsized.installedVersion, "")
+  assert.strictEqual(p(versionsOut({ plugin: MANIFEST("0.3.3"), legacy: true }), TOKEN).legacy, true)
+  // A file larger than the read loses its cut last line.
+  const big = p(versionsOut({ plugin: MANIFEST("0.3.3"), installed: "#version=0.3.3\n#repo=/src/x", installedSize: 99999 }), TOKEN)
+  assert.strictEqual(big.installedVersion, "0.3.3")
+  assert.strictEqual(big.installedRepo, "", "the cut line is dropped")
+  // Control characters in a file never reach a field.
+  const ctl = p(versionsOut({ plugin: MANIFEST("0.3.3"), installed: "#version=0.3.3\u001b[2J\n#repo=/a\u0007b\n" }), TOKEN)
+  assert.strictEqual(ctl.installedVersion, "")
+  assert.strictEqual(ctl.installedRepo, "")
+})
+
+test("installed parts: none, unknown, mismatch both ways, ok; the notice texts", () => {
+  const v = (o) => model.parseVersions(versionsOut(Object.assign({ plugin: MANIFEST("0.3.3") }, o)), TOKEN)
+  const cases = [
+    [{}, "none", "Installed parts: not installed — run install.sh"],
+    [{ legacy: true }, "unknown", "Installed parts are older than 0.3.3 (no version recorded) — run install.sh"],
+    [{ installed: SHA }, "unknown", "Installed parts are older than 0.3.3 (no version recorded) — run install.sh"],
+    [{ installed: "#version=garbage\n" + SHA }, "unknown", "Installed parts are older than 0.3.3 (no version recorded) — run install.sh"],
+    [{ installed: "#version=0.3.2\n" + SHA }, "mismatch", "Installed parts are 0.3.2, plugin is 0.3.3 — run install.sh"],
+    [{ installed: "#version=0.4.0\n" + SHA }, "mismatch", "Installed parts are 0.4.0, plugin is 0.3.3 — run install.sh"],
+    [{ installed: "#version=0.3.3\n" + SHA }, "ok", ""],
+    [{ installed: "#version=0.3.3\n" + SHA, legacy: true }, "ok", ""]
+  ]
+  for (const [o, state, text] of cases) {
+    assert.strictEqual(model.installState(v(o)), state, JSON.stringify(o))
+    assert.strictEqual(model.installNotice(v(o)), text, JSON.stringify(o))
+  }
+  // Nothing is claimed before a read, after a failed one, or without the
+  // plugin's own version.
+  for (const bad of [null, undefined, model.emptyVersions(), v({ plugin: '{"version":"x"}', installed: "#version=0.3.2\n" }), v({ plugin: undefined })]) {
+    assert.strictEqual(model.installState(bad), "")
+    assert.strictEqual(model.installNotice(bad), "")
+  }
+  assert.strictEqual(model.INSTALL_BUTTON_TEXT, "Update installed parts")
+})
+
+test("installed parts: the plugin folder, the read argv and the install argv", () => {
+  assert.strictEqual(model.pluginDirFromUrl("file:///opt/plugins/cloud/manifest.json"), "/opt/plugins/cloud")
+  assert.strictEqual(model.pluginDirFromUrl("file:///opt/my%20plugins/cloud/manifest.json"), "/opt/my plugins/cloud")
+  for (const bad of ["", null, "/opt/cloud/manifest.json", "qrc:/cloud/manifest.json", "file:///opt/cloud/other.json",
+    "file:///opt/../cloud/manifest.json", "file:///opt/./cloud/manifest.json", "file://relative/manifest.json",
+    "file:///opt/a%0Ab/manifest.json", "file:///opt/%E0%A4%A/manifest.json", "file:///manifest.json", "file:///opt//x/manifest.json"])
+    assert.strictEqual(model.pluginDirFromUrl(bad), "", String(bad))
+
+  const argv = model.versionsArgv("/opt/cloud", "/home/u/.local/state", TOKEN)
+  assert.deepStrictEqual(argv, ["timeout", "-k", "2", "10", "sh", "-c", model.VERSIONS_SCRIPT, "cloud-mounts-versions", TOKEN,
+    String(model.INSTALL_HEADER_MAX_BYTES), String(model.PLUGIN_MANIFEST_MAX_BYTES), "/opt/cloud/manifest.json",
+    "/home/u/.local/state/omarchy-cloud/installed-files", "/home/u/.local/state/omarchy-cloud/installed-binary.sha256", "/opt/cloud/install.sh"])
+  for (const [dir, st, tok] of [["", "/s", TOKEN], ["/opt/cloud", "", TOKEN], ["/a/../b", "/s", TOKEN], ["/opt/cloud", "/s", "bad"]])
+    assert.deepStrictEqual(model.versionsArgv(dir, st, tok), [], dir + " " + st + " " + tok)
+  // Bounded at the source; values positional, nothing interpolated.
+  assert.ok(/head -c "\$3" -- "\$2"/.test(model.VERSIONS_SCRIPT))
+  assert.ok(/\[ -f "\$2" \] \|\| return 0/.test(model.VERSIONS_SCRIPT), "regular files only")
+
+  // Install: the same floating terminal as Configure…, install.sh's path as
+  // its own argument after a fixed script.
+  const weird = "/tmp/$(touch x) `y`; z'q"
+  const ia = model.installArgv(weird)
+  assert.deepStrictEqual(ia, ["omarchy-launch-tui", "--app-id=TUI.float", "bash", "-c", model.INSTALL_SCRIPT, "omarchy-cloud-install", weird + "/install.sh"])
+  assert.deepStrictEqual(ia.slice(0, 2), model.configureArgv(HOME).slice(0, 2))
+  assert.ok(!model.INSTALL_SCRIPT.includes(weird))
+  assert.ok(/bash -- "\$1"/.test(model.INSTALL_SCRIPT) && /read -r _/.test(model.INSTALL_SCRIPT), "runs $1, then waits for Enter")
+  assert.ok(/exit status \$s/.test(model.INSTALL_SCRIPT), "prints the exit status")
+  for (const bad of ["", null, "relative", "/a/../b", "/a\nb"]) assert.deepStrictEqual(model.installArgv(bad), [], String(bad))
+})
+
+test("installed parts: the tooltip carries the notice and the right-click hint", () => {
+  const notice = "Installed parts are 0.3.2, plugin is 0.3.3 — run install.sh"
+  assert.strictEqual(model.tooltipText([], null, null, true, "", notice, true),
+    "Cloud Mounts: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage · Right-click: Configure…")
+  assert.strictEqual(model.tooltipText([], null, null, true, "", "Installed parts are older than 0.3.3 (no version recorded) — run install.sh", false),
+    "Cloud Mounts: No rclone-mount units found\nInstalled parts out of date — open the panel\nClick to manage")
+  assert.strictEqual(model.tooltipText([], null, null, true, "", model.installNotice({ ok: true, plugin: "0.3.3", installedPresent: false, legacy: false, installedVersion: "" }), false),
+    "Cloud Mounts: No rclone-mount units found\nInstalled parts: not installed — open the panel\nClick to manage")
+  assert.strictEqual(model.installTipLine(""), "")
+  assert.strictEqual(model.installTipLine(undefined), "")
+  // Without the TUI a right-click opens the panel: no hint.
+  assert.strictEqual(model.tooltipText([], null, null, true, "", "", false), "Cloud Mounts: No rclone-mount units found\nClick to manage")
+  assert.strictEqual(model.tooltipText([], null, null, true, ""), "Cloud Mounts: No rclone-mount units found\nClick to manage")
+  // The cursor: Update installed parts is a footer stop before Configure….
+  assert.deepStrictEqual(model.cursorGroups([], { canInstall: true, canConfigure: true }).map(x => x.keys), [["install"], ["configure"]])
+  assert.ok(!model.cursorGroups([], { canInstall: false }).some(x => x.keys.includes("install")))
+  assert.deepStrictEqual(model.cursorAction("install"), { kind: "install", arg: "" })
+})
+
+test("installed parts: read on attach and opening only, launched visibly, quiet mark", () => {
+  const state = qmlCode("CloudState.qml")
+  const bar = qmlCode("BarWidget.qml")
+  assert.ok(/readonly property string pluginDir: Model\.pluginDirFromUrl\(Qt\.resolvedUrl\("manifest\.json"\)\)/.test(state))
+  assert.ok(/if \(versionsProc\.running\) \{ root\.versionsPending = true; return \}/.test(state))
+  assert.ok(/onStreamFinished: root\.applyVersions\(text, versionsProc\.token\)/.test(state))
+  assert.ok(/function attach\(owner\) \{[\s\S]{0,250}if \(first\) root\.recheckVersions\(\)/.test(state), "on the first attach")
+  assert.ok(/function holdOpen[\s\S]{0,300}root\.recheckVersions\(\)/.test(state), "on a panel opening")
+  assert.strictEqual((state.match(/recheckVersions\(\)/g) || []).length, 3, "the definition, attach and holdOpen only")
+  assert.ok(!/function (applyPoll|refresh|refreshSizes)\([^)]*\) \{[^}]*recheckVersions/.test(state), "never from the poll")
+  // Launched like Configure…: detached, the panel closes.
+  assert.ok(/function updateInstalled\(\) \{\s*if \(!root\.canInstall\) return\s*var argv = Model\.installArgv\(CloudState\.pluginDir\)\s*if \(argv\.length === 0\) return\s*Quickshell\.execDetached\(argv\)\s*root\.close\(\)/.test(bar))
+  assert.ok(/else if \(a\.kind === "install"\) root\.updateInstalled\(\)/.test(bar))
+  assert.ok(/text: Model\.INSTALL_BUTTON_TEXT/.test(bar) && /hasCursor: root\.cursorActive && root\.cursorAt === "install"/.test(bar))
+  assert.ok(/canInstall: root\.canInstall,/.test(bar))
+  // Right-click: Configure… once installed, else the panel; left toggles.
+  assert.ok(/onPressed: function\(b\) \{ root\.pressButton\(b\) \}/.test(bar))
+  assert.ok(/function pressButton\(b\) \{\s*if \(b === Qt\.RightButton\) \{\s*if \(root\.appInstalled\) root\.configure\(\)\s*else if \(!root\.opened\) root\.open\(\)\s*return\s*\}\s*root\.toggle\(\)/.test(bar))
+  // The mark never replaces the error, and is not the urgent colour.
+  assert.ok(/visible: root\.installNotice !== "" && root\.agg !== "error"\s*width: size\s*height: size\s*radius: size \/ 2\s*color: button\.foreground\s*borderSpec: Border\.flat\(Commons\.Color\.popups\.background, 1\)/.test(bar))
+  assert.ok(/readonly property real size: Math\.max\(7, /.test(bar), "a legible badge")
+  assert.ok(/x: Math\.max\(0, Math\.min\(button\.width - size, /.test(bar) && /y: Math\.max\(0, Math\.min\(button\.height - size, /.test(bar), "kept inside the slot")
+  // The notice is its own line; the button beneath it, right-aligned; the
+  // Configure hint does not repeat "run install.sh" beside it.
+  assert.ok(/text: root\.installNotice\s*textFormat: Text\.PlainText\s*wrapMode: Text\.Wrap/.test(bar))
+  assert.ok(/id: installButton\s*visible: root\.canInstall\s*anchors\.right: parent\.right/.test(bar))
+  assert.ok(/text: root\.installNotice !== "" \? "" : Model\.configureHint\(/.test(bar))
+  assert.ok(/active: root\.agg === "error"\n/.test(bar), "only an error turns the glyph urgent")
+})
+
+
 test("every Model.<name> the QML calls exists in Model.js", () => {
   for (const file of qmlFiles) {
     const qml = qmlCode(file).replace(/^import\s+.*$/gm, "")
@@ -1007,14 +1200,14 @@ test("panel: stable rows, theme tokens, capped height, dim hero, no dead tooltip
   assert.ok(/Repeater \{\s*model: root\.pairNames/.test(bar) && /Repeater \{\s*model: root\.jobNames/.test(bar))
   assert.ok(/visible: root\.pairNames\.length > 0/.test(bar) && /visible: root\.jobNames\.length > 0/.test(bar))
   assert.ok(/agg: Model\.aggregate\(root\.rows, root\.pairRows, root\.jobRows, root\.polled\)/.test(bar), "failed syncs, backups and conflicts alert the bar")
-  assert.ok(/tooltipText: Model\.tooltipText\(root\.rows, root\.pairRows, root\.jobRows, root\.polled, CloudState\.pollError\)/.test(bar))
+  assert.ok(/tooltipText: Model\.tooltipText\(root\.rows, root\.pairRows, root\.jobRows, root\.polled, CloudState\.pollError,\s*root\.installNotice, root\.appInstalled\)/.test(bar))
   assert.ok(/meta: Model\.summary\(root\.rows, root\.polled, root\.pairRows, root\.jobRows\)/.test(bar), "the hero counts the same problems")
   // Remotes are capped like the other sections, and say so.
   assert.ok(/Repeater \{\s*model: root\.rowNames[\s\S]{0,300}\}\s*\}\s*Text \{\s*visible: text !== ""\s*width: parent\.width\s*text: Model\.capText\(root\.rows\.length, CloudState\.remotesFound, "remotes"\)/.test(bar),
     "Showing N of M remotes under the remote rows")
   assert.ok(/readonly property int remotesFound: Model\.remotesFound\(root\.knownRemotes, root\.units, root\.envFiles\)/.test(qmlCode("CloudState.qml")))
   // The install hint is a hint, not an alarm.
-  assert.ok(/text: Model\.configureHint\(CloudState\.scanned, root\.appInstalled\)\s*textFormat: Text\.PlainText\s*wrapMode: Text\.Wrap\s*color: root\.dim/.test(bar), "install hint in the dim colour")
+  assert.ok(/text: root\.installNotice !== "" \? "" : Model\.configureHint\(CloudState\.scanned, root\.appInstalled\)\s*textFormat: Text\.PlainText\s*wrapMode: Text\.Wrap\s*color: root\.dim/.test(bar), "install hint in the dim colour")
   // The poll is armed with the remotes only (pairs and jobs are globbed).
   assert.ok(/poll\.command = Model\.showArgv\(root\.remotes\)/.test(qmlCode("CloudState.qml")))
   assert.ok(/function configure\(\) \{\s*if \(!root\.appInstalled\) return/.test(bar))
