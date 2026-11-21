@@ -75,7 +75,7 @@ STRIP_PREFIX=acme/
 |---|---|
 | `REMOTE` | Required. `<remote>:` or `<remote>:<prefix>` (no trailing `/`) |
 | `FILES` | Optional. Default `~/.config/rclone-backup/<name>.files`; one path per line relative to `REMOTE`, `#` comments, no `..` segment, no leading `/` |
-| `DEST` | Required. Created with mode 700; must not overlap the `LOCAL` of any offline folder nor the `DEST` of another backup, nor overlap a cloud location |
+| `DEST` | Required. Created with mode 700 (so are missing folders above it); must not overlap the `LOCAL` of any offline folder nor the `DEST` of another backup, nor overlap a cloud location. Safety: once resolved, an existing `DEST` must be a folder you own and not writable by group or others (mode & 022 = 0), and every folder above it must be owned by root or you and not group- or other-writable unless it has the sticky bit (as `/tmp`, 1777); a component that cannot be checked within 5 s is refused. A folder shared with a group (775/770) or a USB drive mounted with `umask=000` is refused; a normally mounted drive (yours, 755) is fine. Fix: `chmod go-w <folder>` or a private folder |
 | `KEEP` | Optional. 1 to 365, default 14 |
 | `SCHEDULE` | Optional. An `OnCalendar` value (`^[A-Za-z0-9*:,./ -]{1,64}$`), default `daily` |
 | `STRIP_PREFIX` | Optional. Removed from the front of each path when naming copies |
@@ -163,7 +163,10 @@ setup-time guard, writes nothing and runs no `rclone` or `systemctl`; exit 0 val
 
 0 ok; 1 when any file failed (the others are still copied); 64 as above (a guard
 hit, such as `DEST` overlapping an offline folder's `LOCAL` or another backup's
-`DEST`: 64 for `setup` and `validate` only, a warning for `run`).
+`DEST`: 64 for `setup` and `validate` only, a warning for `run`). A `DEST` that
+is not safe (see the `DEST` row above) is different: `setup`, `validate` and `run`
+all exit 64. For `run`, it sends the notification "Invalid configuration: …", records
+`exit=64` in the state file and copies nothing.
 
 ## State files
 
@@ -191,5 +194,5 @@ All under your home folder; the `XDG_*` variables are ignored (see
 | Mount folder setting | `~/.config/omarchy-cloud/cloud.env` |
 | State | `~/.local/state/rclone-bisync/`, `rclone-backup/`, `omarchy-cloud/` |
 | Cache | `~/.cache/rclone/` (VFS cache in `vfs/<remote>`, upload metadata in `vfsMeta/<remote>`, bisync work files in `bisync/`); build cache `~/.cache/omarchy-cloud/target` |
-| Run locks | `$XDG_RUNTIME_DIR` (else `/tmp`): `rclone-bisync-<name>.lock`, `rclone-backup-<name>.lock` |
+| Run locks | `~/.local/state/omarchy-cloud/locks` (700; it and `~/.local/state/omarchy-cloud` must be yours, not symlinks, not group/other-writable), whatever `XDG_RUNTIME_DIR` is, never `/tmp`: `rclone-bisync-<name>.lock`, `rclone-backup-<name>.lock` |
 | rclone's own config | wherever rclone keeps it (`rclone config file` prints the path); not managed by this plugin, except the Google client edit in [remotes.md](remotes.md#your-own-google-drive-client-usually-not-needed) |

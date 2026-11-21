@@ -279,6 +279,11 @@ original name after merging.
     Choose a different folder.
 - **A sync seems stuck after a crash or power loss:** wait about two minutes; its lock
   expires by itself.
+- **A sync or a backup stops with "the run lock folder … is a symlink / not owned by
+  you / writable by other accounts":** that is `~/.local/state/omarchy-cloud` or its
+  `locks` folder. For "writable", run the `chmod go-w` it names; otherwise remove the
+  `locks` folder (or replace the symlink with a real folder), and the next run creates
+  it again with mode 700.
 
 ## A backup did not run
 
@@ -293,6 +298,42 @@ original name after merging.
   `/`, has `//`, `.` or `..` parts, or two entries make the same copy name); fix it
   with Enter or remove it with `d`, then `s` saves. Saving is refused while the list
   is empty. See [backups.md](backups.md#add-one).
+
+## A backup is refused: "Invalid configuration" or "DEST is writable by other accounts"
+
+A backup refuses to run, or the app refuses to save it, when its destination folder
+is not private to you. Another account on the computer could otherwise trick a
+backup into overwriting one of your files. A scheduled run shows a notification
+"Invalid configuration: …", copies nothing and the panel shows it as failed. The
+message names the problem, for example:
+
+```
+documents-backup: DEST /home/you/Backups/documents is writable by other accounts (mode 0775); run chmod go-w /home/you/Backups/documents or choose a private folder
+```
+
+Other forms of the same refusal say that the folder "is not owned by you", "is not a
+folder", that a folder above it is "owned by another account" or "writable by other
+accounts without the sticky bit", or "cannot check" a folder (it did not answer within
+5 seconds, as a stuck mount does).
+
+What to do:
+
+1. If the folder is yours and the message says it is writable by other accounts, run
+   the command it gives, with your folder:
+
+   ```bash
+   chmod go-w ~/Backups/documents
+   ```
+
+   This stops the group and everyone else writing in it; you keep full access.
+2. Otherwise choose another destination: a new folder under your home, such as
+   `~/Backups/documents`. The backup creates it private. (A folder shared with a group,
+   for example mode 775 or 770, is refused on purpose; so is a USB drive mounted with
+   `umask=000`. A normally mounted USB drive that belongs to you, mode 755, is fine.)
+3. "Cannot check": a drive or mount above the folder is not responding. Wait for it
+   or reconnect it, then run the backup again.
+4. In the app press `e` on the backup to change its destination, save, then press
+   Enter on the backup to run it again. Copies already made in the old folder stay there.
 
 ## Unmounting says files are open
 

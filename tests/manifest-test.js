@@ -23,7 +23,7 @@ test("manifest identity", () => {
   assert.strictEqual(manifest.schemaVersion, 1)
   assert.strictEqual(manifest.id, "io.github.rsd.cloud-mounts")
   assert.strictEqual(manifest.name, "Omarchy Cloud")
-  assert.strictEqual(manifest.version, "0.3.6")
+  assert.strictEqual(manifest.version, "0.3.7")
   assert.strictEqual(manifest.author, "Raul Dias")
   assert.strictEqual(manifest.license, "MIT")
   assert.ok(manifest.description)

@@ -21,8 +21,18 @@
 # (<stem>.<date><ext>, written up to 0.3.1) are left as they are: never
 # pruned, renamed or deleted.
 # DEST is created 700 when missing; an existing DEST keeps its mode.
-# One run per job at a time (flock on ${XDG_RUNTIME_DIR:-/tmp}/rclone-backup-<job>.lock):
-# a run that finds another one active says so and exits 0.
+# DEST must be safe from other local accounts (check_dest_safe): resolved, it
+# is yours and not group/other-writable, and every folder above it is root's
+# or yours and not group/other-writable unless sticky. run, setup and
+# validate all refuse an unsafe DEST with exit 64 (run notifies and records
+# exit=64, before any copy). A run writes each copy in a private staging
+# folder inside DEST (.rclone-backup@<job>@XXXXXX, removed on exit) and
+# renames it into place.
+# One run per job at a time (flock on
+# ~/.local/state/omarchy-cloud/locks/rclone-backup-<job>.lock, whatever
+# XDG_RUNTIME_DIR is, never /tmp; see lock_dir): a run that finds another one
+# active says so and exits 0; an unusable lock folder is notified, recorded
+# (exit=1) and exits 1.
 # Guards, as written and with symlinks resolved: DEST must not overlap (equal,
 # contain or be inside) the LOCAL folder of any offline folder
 # (~/.config/rclone-bisync/*.conf; the copies, and their pruning, would be
@@ -181,6 +191,51 @@ root_outside_home() {
   return 0
 }
 # --- end root_outside_home ---
+
+# --- lock_dir (shared: bin/rclone-bisync, bin/rclone-backup, install.sh) ---
+# lock_dir VAR [create]: sets VAR to the folder of the run locks
+# (rclone-bisync-<pair>.lock, rclone-backup-<job>.lock):
+# ~/.local/state/omarchy-cloud/locks, HOME-fixed like every other path (a
+# timer run and a shell run of the same job must lock the same file, whatever
+# XDG_RUNTIME_DIR each has). Never a shared folder such as /tmp, where another
+# account could plant a symlink at the predictable name. Both
+# ~/.local/state/omarchy-cloud and its locks folder must be real folders (not
+# symlinks, never followed) you own and not writable by group or others; with
+# "create" a missing one is made 700 (install -d). Otherwise status 1, VAR
+# empty and LOCK_WHY the reason.
+# shellcheck disable=SC2034 # LOCK_WHY is read by the callers (not install.sh)
+lock_dir() {
+  local LC_ALL=C _p _st _uid _m
+  printf -v "$1" '%s' ''
+  LOCK_WHY=''
+  for _p in "$HOME/.local/state/omarchy-cloud" "$HOME/.local/state/omarchy-cloud/locks"; do
+    if [[ ${2:-} == create && ! -e $_p && ! -L $_p ]]; then
+      install -d -m 700 -- "$_p" 2>/dev/null
+    fi
+    # stat without -L: a symlink is seen as one, never followed.
+    _st=$(stat -c '%u %f' -- "$_p" 2>/dev/null)
+    if ! [[ $_st =~ ^([0-9]+)\ ([0-9a-f]+)$ ]]; then
+      LOCK_WHY="the run lock folder $_p is missing and could not be created"
+      return 1
+    fi
+    _uid=${BASH_REMATCH[1]} _m=$((16#${BASH_REMATCH[2]}))
+    if (((_m & 8#170000) == 8#120000)); then
+      LOCK_WHY="the run lock folder $_p is a symlink; remove it (it is made again, private)"
+      return 1
+    elif (((_m & 8#170000) != 8#040000)); then
+      LOCK_WHY="the run lock folder $_p is not a folder; remove it (it is made again, private)"
+      return 1
+    elif ((_uid != EUID)); then
+      LOCK_WHY="the run lock folder $_p is not owned by you (owner uid $_uid)"
+      return 1
+    elif ((_m & 8#022)); then
+      printf -v LOCK_WHY 'the run lock folder %s is writable by other accounts (mode %04o); run chmod go-w %s' "$_p" "$((_m & 8#7777))" "$_p"
+      return 1
+    fi
+  done
+  printf -v "$1" '%s' "$_p"
+}
+# --- end lock_dir ---
 
 # cloud_root: the mount root of $CLOUD_ENV (OMARCHY_CLOUD_ROOT=<path>, systemd
 # EnvironmentFile syntax), printed when it passes valid_root, else nothing.
@@ -484,6 +539,90 @@ guards() {
   guard_cloud "$1"
 }
 
+# check_dest_safe: 0 when DEST is a destination no other local account can
+# redirect, with DEST_REAL set to it resolved (canon); 1 with DEST_WHY (one
+# clause, ready for die64) when it is not. Another account that can write a
+# folder on the path could plant a symlink at a name the run writes (the copy,
+# rclone's own temporary name) or swap DEST itself, and the run, writing as
+# the desktop user, would overwrite a file of theirs through it. So, on the
+# resolved path (no symlink left in it; a path canon does not resolve, inside a
+# FUSE mount or when realpath fails, is refused if a component is a symlink):
+#   DEST, when it exists: a folder, owned by you, not writable by group or
+#     others (mode & 022 == 0);
+#   every existing folder above it, up to /: owned by root or by you, and
+#     either not writable by group or others, or sticky (/tmp, 1777: others
+#     can neither rename nor delete what is yours there).
+# A missing DEST is judged by its nearest existing ancestor and those above
+# it; cmd_run creates it (and the missing folders above it) 700 and judges it
+# again, whether it created it or found it there. stat runs under timeout 5 s;
+# a component counts as missing only when stat answers ENOENT (or ENOTDIR: a
+# file above it, judged next); a stat that hangs or fails otherwise is a
+# refusal.
+check_dest_safe() {
+  local LC_ALL=C r p st rc uid mode type perm found='' where
+  DEST_REAL='' DEST_WHY=''
+  r=$(canon "$DEST")
+  while [[ $r == *//* ]]; do r=${r//\/\//\/}; done
+  [[ $r != / ]] && r=${r%/}
+  if [[ $r != /* || $r/ == */./* || $r/ == */../* ]]; then
+    DEST_WHY="$JOB: DEST $DEST could not be resolved to a plain path; choose another folder"
+    return 1
+  fi
+  where="DEST $DEST"
+  [[ $r != "${DEST%/}" ]] && where+=" (resolves to $r)"
+  p=$r
+  while :; do
+    st=$(LC_ALL=C timeout -k 1 5 stat -c '%u %f' -- "$p" 2>&1)
+    rc=$?
+    if ((rc == 0)) && [[ $st =~ ^([0-9]+)\ ([0-9a-f]+)$ ]]; then
+      uid=${BASH_REMATCH[1]} mode=$((16#${BASH_REMATCH[2]}))
+      type=$((mode & 8#170000)) perm=$((mode & 8#7777))
+      if ((type == 8#120000)); then
+        DEST_WHY="$JOB: $where: $p is a symlink that could not be resolved; give DEST as the folder it points to"
+        return 1
+      fi
+      if ((type != 8#040000)); then
+        DEST_WHY="$JOB: $where: $p is not a folder"
+        return 1
+      fi
+      if [[ $p == "$r" ]]; then
+        if ((uid != EUID)); then
+          DEST_WHY="$JOB: $where is not owned by you (owner uid $uid); choose a folder of your own"
+          return 1
+        fi
+        if ((perm & 8#022)); then
+          printf -v DEST_WHY '%s: %s is writable by other accounts (mode %04o); run chmod go-w %s or choose a private folder' "$JOB" "$where" "$perm" "$r"
+          return 1
+        fi
+      else
+        if ((uid != 0 && uid != EUID)); then
+          DEST_WHY="$JOB: $where: the folder $p above it is owned by another account (uid $uid), which could replace DEST; choose a folder under your home"
+          return 1
+        fi
+        if ((perm & 8#022 && !(perm & 8#1000))); then
+          printf -v DEST_WHY '%s: %s: the folder %s above it is writable by other accounts without the sticky bit (mode %04o), so they could replace DEST; run chmod go-w %s or choose another folder' "$JOB" "$where" "$p" "$perm" "$p"
+          return 1
+        fi
+      fi
+      found=1
+    elif [[ -n $found || $rc == 0 || $rc == 124 || $rc == 137 ||
+      ($st != *": No such file or directory" && $st != *": Not a directory") ]]; then
+      DEST_WHY="$JOB: $where: cannot check $p (stat failed or did not answer within 5 s)"
+      return 1
+    fi
+    [[ $p == / ]] && break
+    p=${p%/*}
+    [[ -n $p ]] || p=/
+  done
+  DEST_REAL=$r
+}
+
+# dest_safe: check_dest_safe, refusing (die64: in run, notified and recorded
+# as exit=64 too, before any copy).
+dest_safe() {
+  check_dest_safe || die64 "$DEST_WHY"
+}
+
 # check_schedule: SCHEDULE must parse as OnCalendar (when systemd-analyze is
 # there; read-only).
 check_schedule() {
@@ -516,24 +655,59 @@ run_invalid() {
   write_state 64 0 0
 }
 
+# STAGE: this run's private staging folder in DEST (removed on exit).
+STAGE=
+cleanup_stage() {
+  [[ -n $STAGE ]] && rm -rf -- "$STAGE"
+}
+
+# cmd_run: DEST already passed dest_safe; every file operation below uses
+# DEST_REAL, the resolved path, so no symlink on the way is followed later.
 cmd_run() {
-  local today i path stem ext out tmp ok=0 failed=0 old
+  local today i path stem ext out tmp ok=0 failed=0 old d dest
   today=$(date +%F)
+  dest=$DEST_REAL
   # Only a DEST created here is made 700: an existing folder keeps its mode.
-  if [[ ! -d $DEST ]] && { ! install -d -m 700 "$DEST" || ! chmod 700 "$DEST"; }; then
-    echo "$PROG: cannot create $DEST" >&2
-    notify_failure "Cannot create $DEST"
+  # The missing folders above it are made under umask 077 (700); mkdir -m
+  # never follows a name already there.
+  if [[ ! -d $dest ]]; then
+    if [[ $dest == / ]] || ! mkdir -p -- "${dest%/*}/" || ! mkdir -m 700 -- "$dest"; then
+      echo "$PROG: cannot create $dest" >&2
+      notify_failure "Cannot create $dest"
+      write_state 1 0 "${#PATHS[@]}"
+      exit 1
+    fi
+  fi
+  # Judged again unconditionally: a DEST missing at the first check may have
+  # been made (or symlinked) by another account since, while the lock waited.
+  dest_safe
+  dest=$DEST_REAL
+  shopt -s nullglob
+  # A private staging folder per run, named .rclone-backup@<job>@XXXXXX: a job
+  # name has no @, so job a never matches job a.b's. rclone writes the copy,
+  # and its own temporary names, only there; each copy is chmod 600 there and
+  # renamed into DEST (rename(2) replaces whatever has that name, never
+  # follows it). Leftovers of an interrupted run of this job are removed.
+  for d in "$dest"/.rclone-backup@"$JOB"@??????; do
+    [[ -d $d && ! -L $d && -O $d ]] && rm -rf -- "$d"
+  done
+  trap cleanup_stage EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if ! STAGE=$(mktemp -d -- "$dest/.rclone-backup@$JOB@XXXXXX"); then
+    STAGE=
+    echo "$PROG: cannot create a staging folder in $dest" >&2
+    notify_failure "Cannot create a staging folder in $dest"
     write_state 1 0 "${#PATHS[@]}"
     exit 1
   fi
-  shopt -s nullglob
   for i in "${!PATHS[@]}"; do
     path=${PATHS[i]} stem=$JOB@${STEMS[i]} ext=${EXTS[i]}
-    out="$DEST/$stem.$today$ext"
-    tmp="$out.part"
-    # Leftovers of an interrupted run of this file (any day).
+    out="$dest/$stem.$today$ext"
+    tmp="$STAGE/$stem.$today$ext"
+    # Leftovers of an interrupted run of this file, up to 0.3.6 (any day).
     # shellcheck disable=SC2086 # DATE_GLOB is a glob on purpose
-    rm -f -- "$DEST/$stem".$DATE_GLOB"$ext".part
+    rm -f -- "$dest/$stem".$DATE_GLOB"$ext".part
     if ! rclone copyto "$REMOTE_BASE$path" "$tmp" --retries 3 --log-level ERROR; then
       rm -f -- "$tmp"
       echo "$PROG: FAILED $path" >&2
@@ -542,7 +716,7 @@ cmd_run() {
     fi
     # A copy that could not be put in place is a failure too, and its older
     # copies are not pruned: nothing new replaces them.
-    if ! mv -f -- "$tmp" "$out" || ! chmod 600 "$out"; then
+    if ! chmod 600 -- "$tmp" || ! mv -fT -- "$tmp" "$out"; then
       rm -f -- "$tmp"
       echo "$PROG: FAILED $path (cannot put ${out##*/} in place)" >&2
       failed=$((failed + 1))
@@ -552,7 +726,7 @@ cmd_run() {
     ok=$((ok + 1))
     # Dated names sort chronologically: keep the newest $KEEP.
     # shellcheck disable=SC2086 # DATE_GLOB is a glob on purpose
-    mapfile -t old < <(printf '%s\n' "$DEST/$stem".$DATE_GLOB"$ext" | LC_ALL=C sort | head -n -"$KEEP")
+    mapfile -t old < <(printf '%s\n' "$dest/$stem".$DATE_GLOB"$ext" | LC_ALL=C sort | head -n -"$KEEP")
     ((${#old[@]})) && rm -f -- "${old[@]}"
   done
   if ((failed)); then
@@ -564,13 +738,28 @@ cmd_run() {
   exit 0
 }
 
-# lock: per-job flock; busy -> message and exit 0.
+# lock: per-job flock in the private lock folder (lock_dir); busy -> message
+# and exit 0. No private folder, a symlink as the lock or a lock that cannot
+# be opened -> said, notified and recorded (exit=1), before any copy; exit 1.
+# Opened for append, never truncated.
 lock() {
-  local file="${XDG_RUNTIME_DIR:-/tmp}/rclone-backup-$JOB.lock"
-  exec 9>"$file" || {
-    echo "$PROG: cannot open lock $file" >&2
+  local dir file why=''
+  if ! lock_dir dir create; then
+    why=$LOCK_WHY
+  else
+    file=$dir/rclone-backup-$JOB.lock
+    if [[ -L $file ]]; then
+      why="the run lock $file is a symlink; remove it"
+    elif ! exec 9>>"$file"; then
+      why="cannot open the run lock $file"
+    fi
+  fi
+  if [[ -n $why ]]; then
+    echo "$PROG: $JOB: $why" >&2
+    notify_failure "Not run: $why"
+    write_state 1 0 0
     exit 1
-  }
+  fi
   flock -n 9 || {
     echo "$PROG: $JOB: another run is active, skipping"
     exit 0
@@ -605,17 +794,20 @@ case $1 in
     valid_name "$JOB" && ON_INVALID=run_invalid
     load "$2"
     guards warn
+    dest_safe
     lock
     cmd_run
     ;;
   setup)
     load "$2"
     guards refuse
+    dest_safe
     cmd_setup
     ;;
   validate)
     load "$2"
     guards refuse
+    dest_safe
     check_schedule
     ;;
   list)

@@ -53,8 +53,9 @@
 # change.
 #
 # Runs already in progress are waited for: while a pair's or a job's lock
-# owned by this user is held (${XDG_RUNTIME_DIR:-/tmp}/rclone-bisync-*.lock,
-# rclone-backup-*.lock), install.sh names it and waits up to
+# owned by this user is held (rclone-bisync-*.lock, rclone-backup-*.lock in
+# the helpers' private lock folder ~/.local/state/omarchy-cloud/locks,
+# whatever XDG_RUNTIME_DIR is; never /tmp), install.sh names it and waits up to
 # OMARCHY_CLOUD_INSTALL_WAIT_S seconds (default 60), then stops with exit 75
 # and nothing changed. A run may still start right after the wait; it is
 # safe because every copy is an atomic rename. Normally the locks are only
@@ -305,6 +306,51 @@ root_outside_home() {
 }
 # --- end root_outside_home ---
 
+# --- lock_dir (shared: bin/rclone-bisync, bin/rclone-backup, install.sh) ---
+# lock_dir VAR [create]: sets VAR to the folder of the run locks
+# (rclone-bisync-<pair>.lock, rclone-backup-<job>.lock):
+# ~/.local/state/omarchy-cloud/locks, HOME-fixed like every other path (a
+# timer run and a shell run of the same job must lock the same file, whatever
+# XDG_RUNTIME_DIR each has). Never a shared folder such as /tmp, where another
+# account could plant a symlink at the predictable name. Both
+# ~/.local/state/omarchy-cloud and its locks folder must be real folders (not
+# symlinks, never followed) you own and not writable by group or others; with
+# "create" a missing one is made 700 (install -d). Otherwise status 1, VAR
+# empty and LOCK_WHY the reason.
+# shellcheck disable=SC2034 # LOCK_WHY is read by the callers (not install.sh)
+lock_dir() {
+  local LC_ALL=C _p _st _uid _m
+  printf -v "$1" '%s' ''
+  LOCK_WHY=''
+  for _p in "$HOME/.local/state/omarchy-cloud" "$HOME/.local/state/omarchy-cloud/locks"; do
+    if [[ ${2:-} == create && ! -e $_p && ! -L $_p ]]; then
+      install -d -m 700 -- "$_p" 2>/dev/null
+    fi
+    # stat without -L: a symlink is seen as one, never followed.
+    _st=$(stat -c '%u %f' -- "$_p" 2>/dev/null)
+    if ! [[ $_st =~ ^([0-9]+)\ ([0-9a-f]+)$ ]]; then
+      LOCK_WHY="the run lock folder $_p is missing and could not be created"
+      return 1
+    fi
+    _uid=${BASH_REMATCH[1]} _m=$((16#${BASH_REMATCH[2]}))
+    if (((_m & 8#170000) == 8#120000)); then
+      LOCK_WHY="the run lock folder $_p is a symlink; remove it (it is made again, private)"
+      return 1
+    elif (((_m & 8#170000) != 8#040000)); then
+      LOCK_WHY="the run lock folder $_p is not a folder; remove it (it is made again, private)"
+      return 1
+    elif ((_uid != EUID)); then
+      LOCK_WHY="the run lock folder $_p is not owned by you (owner uid $_uid)"
+      return 1
+    elif ((_m & 8#022)); then
+      printf -v LOCK_WHY 'the run lock folder %s is writable by other accounts (mode %04o); run chmod go-w %s' "$_p" "$((_m & 8#7777))" "$_p"
+      return 1
+    fi
+  done
+  printf -v "$1" '%s' "$_p"
+}
+# --- end lock_dir ---
+
 # The mount-root setting (cloud.env), parsed, never sourced: at most 4096
 # bytes; empty and # lines skipped; one trailing \r dropped; the value of the
 # last OMARCHY_CLOUD_ROOT= line, verbatim. ROOT_STATE: absent (no file or no
@@ -418,7 +464,9 @@ atomic_copy() {
 # lines sorted by path.
 write_manifest() {
   local tmp
-  mkdir -p -- "$STATE_DIR" || return 1
+  # 700 when made here: it also holds the helpers' run locks (lock_dir), which
+  # refuse a folder writable by other accounts (a umask of 002).
+  [[ -d $STATE_DIR ]] || install -d -m 700 -- "$STATE_DIR" || return 1
   tmp=$(mktemp -- "$STATE_DIR/.installed-files.XXXXXX") || return 1
   if { printf '#version=%s\n#repo=%s\n' "$VERSION" "$REPO" &&
     { [[ ! -f $CLOUD_ENV ]] || printf '#config=%s\n' "$CLOUD_ENV"; } &&
@@ -432,8 +480,8 @@ write_manifest() {
 
 # Running syncs and backups: the per-pair and per-job locks bin/rclone-bisync
 # and bin/rclone-backup hold for a run (their lock(), an flock). Only existing
-# regular lock files owned by this user are looked at (with XDG_RUNTIME_DIR
-# unset the dir is /tmp, shared with other users). The primary path never
+# regular lock files owned by this user, in the folder lock_dir gives (never
+# created here; none usable: no lock is held), are looked at. The primary path never
 # opens or locks them: the helpers take theirs with flock -n, so even an
 # instant's probe lock would make a run starting in that instant skip.
 # Instead each file's device and inode are matched against the FLOCK entries
@@ -450,9 +498,10 @@ write_manifest() {
 #
 # busy_locks: prints "<kind> <name>" for each lock held right now.
 busy_locks() {
-  local dir=${XDG_RUNTIME_DIR:-/tmp} f kind name dev ino type loc maj min lino
+  local dir f kind name dev ino type loc maj min lino
   local -A held=()
   local proc=0
+  lock_dir dir || return 0
   if [[ -r /proc/locks ]] && dev=$(findmnt -no MAJ:MIN -T "$dir" 2>/dev/null) &&
     dev=${dev//[[:space:]]/} && [[ $dev =~ ^[0-9]+:[0-9]+$ ]]; then
     proc=1

@@ -187,6 +187,51 @@ root_outside_home() {
 }
 # --- end root_outside_home ---
 
+# --- lock_dir (shared: bin/rclone-bisync, bin/rclone-backup, install.sh) ---
+# lock_dir VAR [create]: sets VAR to the folder of the run locks
+# (rclone-bisync-<pair>.lock, rclone-backup-<job>.lock):
+# ~/.local/state/omarchy-cloud/locks, HOME-fixed like every other path (a
+# timer run and a shell run of the same job must lock the same file, whatever
+# XDG_RUNTIME_DIR each has). Never a shared folder such as /tmp, where another
+# account could plant a symlink at the predictable name. Both
+# ~/.local/state/omarchy-cloud and its locks folder must be real folders (not
+# symlinks, never followed) you own and not writable by group or others; with
+# "create" a missing one is made 700 (install -d). Otherwise status 1, VAR
+# empty and LOCK_WHY the reason.
+# shellcheck disable=SC2034 # LOCK_WHY is read by the callers (not install.sh)
+lock_dir() {
+  local LC_ALL=C _p _st _uid _m
+  printf -v "$1" '%s' ''
+  LOCK_WHY=''
+  for _p in "$HOME/.local/state/omarchy-cloud" "$HOME/.local/state/omarchy-cloud/locks"; do
+    if [[ ${2:-} == create && ! -e $_p && ! -L $_p ]]; then
+      install -d -m 700 -- "$_p" 2>/dev/null
+    fi
+    # stat without -L: a symlink is seen as one, never followed.
+    _st=$(stat -c '%u %f' -- "$_p" 2>/dev/null)
+    if ! [[ $_st =~ ^([0-9]+)\ ([0-9a-f]+)$ ]]; then
+      LOCK_WHY="the run lock folder $_p is missing and could not be created"
+      return 1
+    fi
+    _uid=${BASH_REMATCH[1]} _m=$((16#${BASH_REMATCH[2]}))
+    if (((_m & 8#170000) == 8#120000)); then
+      LOCK_WHY="the run lock folder $_p is a symlink; remove it (it is made again, private)"
+      return 1
+    elif (((_m & 8#170000) != 8#040000)); then
+      LOCK_WHY="the run lock folder $_p is not a folder; remove it (it is made again, private)"
+      return 1
+    elif ((_uid != EUID)); then
+      LOCK_WHY="the run lock folder $_p is not owned by you (owner uid $_uid)"
+      return 1
+    elif ((_m & 8#022)); then
+      printf -v LOCK_WHY 'the run lock folder %s is writable by other accounts (mode %04o); run chmod go-w %s' "$_p" "$((_m & 8#7777))" "$_p"
+      return 1
+    fi
+  done
+  printf -v "$1" '%s' "$_p"
+}
+# --- end lock_dir ---
+
 # cloud_root: the mount root of $CLOUD_ENV (OMARCHY_CLOUD_ROOT=<path>, systemd
 # EnvironmentFile syntax), printed when it passes valid_root, else nothing.
 # Its only reader is the cloud guard (cloud_targets), so it fails closed: a
@@ -463,13 +508,35 @@ guards() {
   guard_cloud "$1"
 }
 
-# lock <busy rc>: per-pair flock; busy -> message and exit <busy rc>.
+# lock <busy rc>: per-pair flock in the private lock folder (lock_dir); busy
+# -> message and exit <busy rc>. No private folder, a symlink as the lock or
+# a lock that cannot be opened -> said and exit 1, before any rclone call; a
+# run or a resync also notifies it and records exit=1 (the previous state's
+# conflict copies kept, as finish does when they cannot be listed).
+# Opened for append, never truncated.
 lock() {
-  local busy_rc=$1 file="${XDG_RUNTIME_DIR:-/tmp}/rclone-bisync-$PAIR.lock"
-  exec 9>"$file" || {
-    echo "$PROG: cannot open lock $file" >&2
+  local busy_rc=$1 dir file why='' conflicts=() notified=()
+  if ! lock_dir dir create; then
+    why=$LOCK_WHY
+  else
+    file=$dir/rclone-bisync-$PAIR.lock
+    if [[ -L $file ]]; then
+      why="the run lock $file is a symlink; remove it"
+    elif ! exec 9>>"$file"; then
+      why="cannot open the run lock $file"
+    fi
+  fi
+  if [[ -n $why ]]; then
+    echo "$PROG: $PAIR: $why" >&2
+    if [[ $cmd == run || $cmd == resync ]]; then
+      command -v notify-send >/dev/null &&
+        notify-send -u normal -a rclone-bisync "Offline folder $(plain "$PAIR")" "Not synced: $(plain "$why"); see: journalctl --user -u rclone-bisync@$(plain "$PAIR")"
+      mapfile -t conflicts < <(state_lines conflict)
+      mapfile -t notified < <(state_lines notified)
+      write_state 1 "${#conflicts[@]}" "${conflicts[@]}" "${notified[@]}"
+    fi
     exit 1
-  }
+  fi
   flock -n 9 || {
     echo "$PROG: $PAIR: another run is active, skipping"
     exit "$busy_rc"

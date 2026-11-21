@@ -44,7 +44,16 @@
 #   4. rclone-backup: the copy names follow the reference naming rule (job@
 #      prefix) on representative path shapes; prune keeps the newest KEEP per
 #      file and never touches legacy (unprefixed) copies; modes (only a new DEST
-#      is made 700); .part handling; a failure (copy or mv) notifies and does
+#      is made 700, the missing folders above it too); a DEST other accounts
+#      could redirect (group/other-writable, under a non-sticky
+#      group/other-writable folder, a file) refused by run (exit 64, notified
+#      with the fix, before any copy; planted symlinks never written through;
+#      a missing DEST made 0777, or a symlink, by another account while the
+#      run waits for its lock; a stat that hangs or fails other than ENOENT),
+#      setup and validate, a sticky parent and a DEST symlinked to a private
+#      folder accepted (written resolved); the per-run private staging folder
+#      (never left behind, an interrupted run's removed, another job's kept)
+#      and the legacy .part cleanup; a failure (copy or mv) notifies and does
 #      not prune; a busy job lock exits 0; only `rclone copyto <remote> <local>`;
 #      validate; the guards (pairs' LOCAL, other jobs' DEST, cloud locations,
 #      both directions), the same hung-mount cases; a hostile path in the
@@ -75,6 +84,10 @@
 # shellcheck disable=SC2016,SC2034,SC2088
 
 set -o pipefail
+# The folders made here are 755: rclone-backup refuses a DEST (or a folder
+# above it) that other accounts can write, so a permissive umask in the
+# caller's shell must not change the verdicts.
+umask 022
 
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 BISYNC=$PLUGIN_DIR/bin/rclone-bisync
@@ -135,7 +148,9 @@ case $1 in
     if [[ -n ${FAKE_COPY_FAIL:-} && $2 == "$FAKE_COPY_FAIL" ]]; then
       echo partial >"$3"; exit 1
     fi
-    printf 'copy of %s\n' "$2" >"$3"; exit 0 ;;
+    # As rclone does: written at a temporary name next to the target, then
+    # renamed onto it (a symlink planted at that name would be written through).
+    printf 'copy of %s\n' "$2" >"$3.a1b2c3d4.partial" && /usr/bin/mv -f -- "$3.a1b2c3d4.partial" "$3"; exit ;;
   *) exit 99 ;;
 esac
 EOF
@@ -162,6 +177,39 @@ cat >"$MVSTUB/mv" <<'EOF'
 exec /usr/bin/mv "$@"
 EOF
 chmod +x "$MVSTUB/mv"
+# A flock that, before locking, does what another account could do while a
+# backup run waits for its lock: makes FAKE_FLOCK_DEST a 0777 folder, or (with
+# FAKE_FLOCK_LINK) a symlink to that folder; only on PATH where asked.
+FLOCKSTUB=$SCRATCH/flockstub
+mkdir -p "$FLOCKSTUB"
+cat >"$FLOCKSTUB/flock" <<'EOF'
+#!/bin/bash
+if [[ -n ${FAKE_FLOCK_DEST:-} && ! -e $FAKE_FLOCK_DEST && ! -L $FAKE_FLOCK_DEST ]]; then
+  if [[ -n ${FAKE_FLOCK_LINK:-} ]]; then
+    /usr/bin/mkdir -p -m 777 -- "$FAKE_FLOCK_LINK" && /usr/bin/chmod 777 -- "$FAKE_FLOCK_LINK" &&
+      /usr/bin/ln -s -- "$FAKE_FLOCK_LINK" "$FAKE_FLOCK_DEST"
+  else
+    /usr/bin/mkdir -m 777 -- "$FAKE_FLOCK_DEST" && /usr/bin/chmod 777 -- "$FAKE_FLOCK_DEST"
+  fi
+fi
+exec /usr/bin/flock "$@"
+EOF
+chmod +x "$FLOCKSTUB/flock"
+# A stat that hangs (sleep 30, a hung FUSE mount) on FAKE_STAT_HANG and fails
+# with EACCES on FAKE_STAT_EACCES; only on PATH where asked.
+STATSTUB=$SCRATCH/statstub
+mkdir -p "$STATSTUB"
+cat >"$STATSTUB/stat" <<'EOF'
+#!/bin/bash
+p=${*: -1}
+[[ -n ${FAKE_STAT_HANG:-} && $p == "$FAKE_STAT_HANG" ]] && exec sleep 30
+if [[ -n ${FAKE_STAT_EACCES:-} && $p == "$FAKE_STAT_EACCES" ]]; then
+  echo "stat: cannot statx '$p': Permission denied" >&2
+  exit 1
+fi
+exec /usr/bin/stat "$@"
+EOF
+chmod +x "$STATSTUB/stat"
 # A realpath that records each path it is asked to resolve ($FAKE_LOG/realpath)
 # and hangs (sleep 30, like a hung FUSE mount) on a path at or under one of
 # FAKE_HUNG (space-separated); only on PATH where asked.
@@ -653,9 +701,10 @@ check "FILTER that does not exist: exit 64" rc_is 64
 
 fresh
 pair vault-A
-flock "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock" sleep 10 &
+mkdir -p "$HOME/.local/state/omarchy-cloud/locks"
+flock "$HOME/.local/state/omarchy-cloud/locks/rclone-bisync-vault-A.lock" sleep 10 &
 holder=$!
-for _ in {1..50}; do flock -n "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock" true || break; sleep 0.05; done
+for _ in {1..50}; do flock -n "$HOME/.local/state/omarchy-cloud/locks/rclone-bisync-vault-A.lock" true || break; sleep 0.05; done
 runc "$BISYNC" run vault-A
 check "lock busy: run exits 0 without calling rclone" eval 'rc_is 0 && no_rclone && [[ $OUT == *"another run is active"* ]]'
 runc "$BISYNC" resync vault-A
@@ -1236,6 +1285,12 @@ job() { # job <name> [extra conf lines...]; files list from LIST_SHAPES
   { echo "# admin databases"; printf '%s\n' "${LIST_SHAPES[@]}"; } >"$HOME/.config/rclone-backup/$name.files"
 }
 
+# staged_log: the rclone log with the random part of each staging folder name
+# (.rclone-backup@<job>@XXXXXX) written as XXXXXX.
+staged_log() { sed 's/\(\.rclone-backup@[A-Za-z0-9_.-]*@\)[A-Za-z0-9]\{6\}\//\1XXXXXX\//g' "$FAKE_LOG/rclone"; }
+# no_stage <dir>: no staging folder of any job left in dir.
+no_stage() { [[ -z $(find "$1" -maxdepth 1 -name '.rclone-backup@*') ]]; }
+
 fresh
 job archive-vaults "KEEP=3"
 DEST=$HOME/Backups/vaults
@@ -1273,10 +1328,11 @@ check "a stale .part of an earlier run is removed; only the legacy .part left" \
   eval '[[ $(find "$DEST" -name "*.part") == "$DEST/Admin__Segurança__Team.2026-10-06.kdbx.part" ]]'
 check "modes: an existing DEST keeps its mode (755), copies 600" \
   eval '[[ $(stat -c %a "$DEST") == 755 && $(stat -c %a "$DEST/$(live_name "${LIST_SHAPES[1]}")") == 600 ]]'
-check "copyto <remote path> <local .part>, with retries" \
-  eval 'grep -qxF "rclone$(q copyto "work_drive:${LIST_SHAPES[0]}" "$DEST/$J.$TODAY.kdbx.part" --retries 3 --log-level ERROR)" "$FAKE_LOG/rclone"'
-check "read-only toward the remote: every rclone call is copyto <remote> <local DEST>" \
-  eval '! grep -v "^rclone copyto work_drive:[^ ]* $(printf %q "$DEST")/[^ ]*\.part --retries 3 --log-level ERROR$" "$FAKE_LOG/rclone" | grep -q .'
+check "copyto <remote path> <this run's private staging folder in DEST>/<copy name>, with retries" \
+  eval 'staged_log | grep -qxF "rclone$(q copyto "work_drive:${LIST_SHAPES[0]}" "$DEST/.rclone-backup@archive-vaults@XXXXXX/$J.$TODAY.kdbx" --retries 3 --log-level ERROR)"'
+check "read-only toward the remote: every rclone call is copyto <remote> <staging folder in DEST>" \
+  eval '! grep -v "^rclone copyto work_drive:[^ ]* $(printf %q "$DEST")/\.rclone-backup@archive-vaults@[A-Za-z0-9]\{6\}/[^/ ]* --retries 3 --log-level ERROR$" "$FAKE_LOG/rclone" | grep -q .'
+check "no staging folder left after a successful run" no_stage "$DEST"
 check "state: exit=0 ok=5 failed=0" \
   eval 'grep -qx exit=0 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx ok=5 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx failed=0 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
 check "no notification on success" eval '[[ ! -s $FAKE_LOG/notify-send ]]'
@@ -1294,8 +1350,8 @@ job archive-vaults
 DEST=$HOME/Backups/vaults
 FAKE_COPY_FAIL="work_drive:${LIST_SHAPES[2]}" runc "$BACKUP" run archive-vaults
 check "a failed copy: exit 1, the others still copied" eval 'rc_is 1 && [[ $(find "$DEST" -name "*.$TODAY.kdbx" | wc -l) == 4 ]]'
-check "a failed copy: its .part removed, no copy under its name" \
-  eval '[[ -z $(find "$DEST" -name "*.part") && ! -e $DEST/$(live_name "${LIST_SHAPES[2]}") ]]'
+check "a failed copy: no partial file left, no copy under its name, no staging folder" \
+  eval '[[ -z $(find "$DEST" -name "*.part") && ! -e $DEST/$(live_name "${LIST_SHAPES[2]}") ]] && no_stage "$DEST"'
 check "a failed copy: one normal notification from rclone-backup" \
   eval '[[ $(log notify-send | wc -l) == 1 && $(log notify-send) == "notify-send -u normal -a rclone-backup "* ]]'
 check "a failed copy: state exit=1 ok=4 failed=1" \
@@ -1311,21 +1367,144 @@ echo old2 >"$DEST/$J.2026-11-02.kdbx"
 PATH="$MVSTUB:$PATH" FAKE_MV_FAIL="$DEST/$J.$TODAY.kdbx" runc "$BACKUP" run archive-vaults
 check "a failed mv: exit 1, counted failed (state ok=4 failed=1)" \
   eval 'rc_is 1 && grep -qx ok=4 "$HOME/.local/state/rclone-backup/archive-vaults.state" && grep -qx failed=1 "$HOME/.local/state/rclone-backup/archive-vaults.state"'
-check "a failed mv: its .part removed, its older copies not pruned" \
-  eval '[[ -z $(find "$DEST" -name "*.part") && -f $DEST/$J.2026-11-01.kdbx && -f $DEST/$J.2026-11-02.kdbx && ! -e $DEST/$J.$TODAY.kdbx ]]'
+check "a failed mv: no staging folder left, its older copies not pruned" \
+  eval 'no_stage "$DEST" && [[ -f $DEST/$J.2026-11-01.kdbx && -f $DEST/$J.2026-11-02.kdbx && ! -e $DEST/$J.$TODAY.kdbx ]]'
 check "a failed mv: notified" eval '[[ $(log notify-send) == *"$(printf %q "1 of 5 files failed")"* ]]'
 
 fresh
 job archive-vaults
-flock "$XDG_RUNTIME_DIR/rclone-backup-archive-vaults.lock" sleep 10 &
+mkdir -p "$HOME/.local/state/omarchy-cloud/locks"
+flock "$HOME/.local/state/omarchy-cloud/locks/rclone-backup-archive-vaults.lock" sleep 10 &
 holder=$!
-for _ in {1..50}; do flock -n "$XDG_RUNTIME_DIR/rclone-backup-archive-vaults.lock" true || break; sleep 0.05; done
+for _ in {1..50}; do flock -n "$HOME/.local/state/omarchy-cloud/locks/rclone-backup-archive-vaults.lock" true || break; sleep 0.05; done
 runc "$BACKUP" run archive-vaults
 check "backup lock busy: run exits 0 without rclone or state" \
   eval 'rc_is 0 && no_rclone && [[ $OUT == *"another run is active"* && ! -e $HOME/.local/state/rclone-backup/archive-vaults.state ]]'
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 
+# The run locks (lock_dir, one bash function copied byte for byte between its
+# marker lines into both helpers and install.sh): always
+# ~/.local/state/omarchy-cloud/locks, whatever XDG_RUNTIME_DIR is (a timer
+# run and a shell run must lock the same file), never a predictable name in a
+# shared folder. With XDG_RUNTIME_DIR unset the helpers used to open
+# /tmp/rclone-<kind>-<name>.lock with truncation, so another account's
+# symlink there truncated the file it pointed to. The only writes outside the
+# scratch dir: those /tmp symlinks, under a name unique to this run, removed.
+LD_BEGIN='# --- lock_dir (shared: bin/rclone-bisync, bin/rclone-backup, install.sh) ---'
+LD_END='# --- end lock_dir ---'
+ld_block() { awk -v b="$LD_BEGIN" -v e="$LD_END" '$0 == b { p = 1 } p { print } p && $0 == e { exit }' "$1"; }
+LD_REF=$(ld_block "$BISYNC")
+for f in "$BISYNC" "$BACKUP" "$PLUGIN_DIR/install.sh"; do
+  blk=$(ld_block "$f")
+  check "lock_dir: ${f#"$PLUGIN_DIR"/} has the marker block, byte-identical to bin/rclone-bisync's" \
+    eval '[[ $blk == "$LD_BEGIN"$'"'"'\n'"'"'*lock_dir\(\)*"$LD_END" && $blk == "$LD_REF" ]]'
+done
+LKD_REL=.local/state/omarchy-cloud/locks
+LK=lk-$$-$RANDOM
+LK_TMP=("/tmp/rclone-backup-$LK.lock" "/tmp/rclone-bisync-$LK.lock")
+# unset_run <tag> <cmd...>: runc with XDG_RUNTIME_DIR unset (a subshell);
+# RC and OUT copied back.
+unset_run() {
+  local tag=$1
+  shift
+  (unset XDG_RUNTIME_DIR && runc "$@" && printf '%s' "$RC" >"$T/$tag.rc" && printf '%s' "$OUT" >"$T/$tag.out")
+  RC=$(cat "$T/$tag.rc" 2>/dev/null || echo 255) OUT=$(cat "$T/$tag.out" 2>/dev/null)
+}
+# lk_run <script> <kind>: a run of job/pair $LK with XDG_RUNTIME_DIR unset and
+# another account's symlink planted at the old /tmp name, aimed at $T/victim.
+lk_run() {
+  printf 'keep\n' >"$T/victim"
+  rm -f -- "/tmp/rclone-$2-$LK.lock"
+  ln -s -- "$T/victim" "/tmp/rclone-$2-$LK.lock" || return 1
+  unset_run "$2" "$1" run "$LK"
+  rm -f -- "/tmp/rclone-$2-$LK.lock"
+}
+fresh
+job "$LK"
+lk_run "$BACKUP" backup
+check "backup lock, XDG_RUNTIME_DIR unset: a symlink planted at /tmp/rclone-backup-<job>.lock is never written through; the run uses ~/$LKD_REL (700)" \
+  eval '[[ $(cat "$T/victim") == keep && -f $HOME/$LKD_REL/rclone-backup-$LK.lock && $(stat -c %a "$HOME/$LKD_REL") == 700 ]] && rc_is 0'
+fresh
+pair "$LK"
+lk_run "$BISYNC" bisync
+check "bisync lock, XDG_RUNTIME_DIR unset: a symlink planted at /tmp/rclone-bisync-<pair>.lock is never written through; the run uses ~/$LKD_REL" \
+  eval '[[ $(cat "$T/victim") == keep && -f $HOME/$LKD_REL/rclone-bisync-$LK.lock ]] && rc_is 0'
+rm -f -- "${LK_TMP[@]}"
+
+# XDG_RUNTIME_DIR set or unset: the same lock file, opened without truncation.
+fresh
+job j
+pair p
+mkdir -p "$HOME/$LKD_REL"
+printf 'held\n' >"$HOME/$LKD_REL/rclone-backup-j.lock"
+printf 'held\n' >"$HOME/$LKD_REL/rclone-bisync-p.lock"
+runc "$BACKUP" run j
+rc_b=$RC
+runc "$BISYNC" run p
+check "locks with XDG_RUNTIME_DIR set: in ~/$LKD_REL, not truncated, nothing in XDG_RUNTIME_DIR" \
+  eval '((rc_b == 0)) && rc_is 0 && [[ $(cat "$HOME/$LKD_REL/rclone-backup-j.lock") == held && $(cat "$HOME/$LKD_REL/rclone-bisync-p.lock") == held && -z $(ls -A "$XDG_RUNTIME_DIR") ]]'
+flock "$HOME/$LKD_REL/rclone-backup-j.lock" sleep 10 &
+holder=$!
+for _ in {1..50}; do flock -n "$HOME/$LKD_REL/rclone-backup-j.lock" true || break; sleep 0.05; done
+: >"$FAKE_LOG/rclone"
+unset_run b "$BACKUP" run j
+check "backup lock held by a run with XDG_RUNTIME_DIR set: a run with it unset sees it (exit 0, skipped)" \
+  eval 'rc_is 0 && no_rclone && [[ $OUT == *"another run is active"* ]]'
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
+# An unusable lock folder: refused, said, notified, recorded (exit=1), no rclone.
+# lk_bad <description> <setup command>: both helpers on a fresh tree.
+lk_bad() {
+  fresh
+  job j
+  pair p
+  mkdir -p "$HOME/.local/state" "$T/elsewhere"
+  eval "$2"
+  runc "$BACKUP" run j
+  rc_b=$RC out_b=$OUT
+  runc "$BISYNC" run p
+  check "lock folder $1: backup and bisync exit 1, say why, notify, record exit=1, no rclone, nothing written through it" \
+    eval '((rc_b == 1)) && rc_is 1 && [[ $out_b == *"the run lock folder"* && $OUT == *"the run lock folder"* ]] && no_rclone &&
+      grep -qx exit=1 "$HOME/.local/state/rclone-backup/j.state" && grep -qx exit=1 "$HOME/.local/state/rclone-bisync/p.state" &&
+      [[ $(log notify-send) == *rclone-backup*rclone-bisync* && -z $(ls -A "$T/elsewhere") ]]'
+}
+lk_bad "a symlink" 'mkdir -p "$HOME/.local/state/omarchy-cloud" && ln -s "$T/elsewhere" "$HOME/$LKD_REL"'
+lk_bad "writable by other accounts (777)" 'mkdir -p "$HOME/$LKD_REL" && chmod 777 "$HOME/$LKD_REL"'
+lk_bad "under a group-writable omarchy-cloud folder (775)" 'mkdir -p "$HOME/$LKD_REL" && chmod 775 "$HOME/.local/state/omarchy-cloud"'
+lk_bad "under a symlinked omarchy-cloud folder" 'ln -s "$T/elsewhere" "$HOME/.local/state/omarchy-cloud"'
+fresh
+job j
+mkdir -p "$HOME/$LKD_REL"
+chmod 777 "$HOME/$LKD_REL"
+runc "$BACKUP" run j
+check "lock folder writable by other accounts: the reason names the mode and the fix" eval 'rc_is 1 && [[ $OUT == *"writable by other accounts (mode 0777); run chmod go-w"* ]]'
+# A conflict list kept: a lock failure does not drop the previous state's copies.
+fresh
+pair p
+mkdir -p "$HOME/.local/state/rclone-bisync" "$HOME/.local/state/omarchy-cloud"
+printf 'time=1\nexit=0\nconflict=a.conflict1\nnotified=a.conflict1\n' >"$HOME/.local/state/rclone-bisync/p.state"
+ln -s "$T" "$HOME/$LKD_REL"
+runc "$BISYNC" run p
+check "bisync lock folder refused: the state keeps the previous conflict copies" \
+  eval 'rc_is 1 && grep -qx exit=1 "$HOME/.local/state/rclone-bisync/p.state" && grep -qx conflict=a.conflict1 "$HOME/.local/state/rclone-bisync/p.state" && grep -qx notified=a.conflict1 "$HOME/.local/state/rclone-bisync/p.state"'
+: >"$FAKE_LOG/notify-send"
+runc "$BISYNC" dry-run p
+check "bisync dry-run, lock folder refused: exit 1, no rclone, not notified" eval 'rc_is 1 && no_rclone && [[ ! -s $FAKE_LOG/notify-send ]]'
+
+# A symlink as the lock file: refused (exit 1), never followed.
+fresh
+job j
+pair p
+mkdir -p "$HOME/$LKD_REL"
+ln -s "$T/victim2" "$HOME/$LKD_REL/rclone-backup-j.lock"
+ln -s "$T/victim3" "$HOME/$LKD_REL/rclone-bisync-p.lock"
+runc "$BACKUP" run j
+rc_b=$RC out_b=$OUT
+runc "$BISYNC" run p
+check "a symlink as the lock file: backup and bisync refuse (exit 1), never follow it" \
+  eval '((rc_b == 1)) && rc_is 1 && no_rclone && [[ ! -e $T/victim2 && ! -e $T/victim3 && $out_b == *"is a symlink"* && $OUT == *"is a symlink"* ]]'
 fresh
 mkdir -p "$HOME/.config/rclone-backup"
 printf 'REMOTE=gd:Shared/docs\nDEST=%s/out\nFILES=~/list\n' "$T" >"$HOME/.config/rclone-backup/j.conf"
@@ -1659,6 +1838,188 @@ export FAKE_HUNG=$HOME/slow
 runhung "$BACKUP" run archive-vaults
 check "backup run: a realpath that hangs outside the FUSE mounts is cut off (timeout 5), the backup completes" \
   eval 'rc_is 0 && grep -q "^rclone copyto " "$FAKE_LOG/rclone" && resolved_under "$HOME/slow"'
+
+# DEST safe from other local accounts: an existing DEST is yours and not
+# group/other-writable, every folder above it root's or yours and not
+# group/other-writable unless sticky; run, setup and validate refuse (exit 64;
+# run notifies with the fix and records exit=64, before any copy). Another
+# uid as owner needs root to set up: not tested here.
+# refused_run <what>: the last run was refused before any copy.
+refused_run() {
+  rc_is 64 && no_rclone && [[ $OUT == *"$1"* && $(notify_arg 5) == *"$1"* ]] &&
+    grep -qx exit=64 "$HOME/.local/state/rclone-backup/archive-vaults.state"
+}
+for m in 775 757 777; do
+  fresh
+  job archive-vaults
+  DEST=$HOME/Backups/vaults
+  mkdir -p "$DEST"
+  chmod "$m" "$DEST"
+  for sub in setup validate; do
+    runc "$BACKUP" "$sub" archive-vaults
+    check "backup $sub: an existing DEST of mode $m is refused (exit 64, no drop-in), naming the fix" \
+      eval 'rc_is 64 && no_rclone && [[ $OUT == *"DEST $DEST is writable by other accounts (mode 0$m); run chmod go-w $DEST or choose a private folder"* && ! -e $HOME/.config/systemd/user/rclone-backup@archive-vaults.timer.d ]]'
+  done
+  runc "$BACKUP" run archive-vaults
+  check "backup run: an existing DEST of mode $m is refused before any copy (exit 64, notified with the fix, state exit=64)" \
+    eval 'refused_run "run chmod go-w $DEST or choose a private folder" && [[ -z $(ls -A "$DEST") ]]'
+done
+
+# A symlink planted in a shared DEST at a name a run would write (the legacy
+# .part, the copy itself), pointing at a private file outside DEST: refused
+# before any copy, so never written through.
+fresh
+job archive-vaults
+DEST=$HOME/Backups/vaults
+mkdir -p "$DEST" "$T/private"
+chmod 777 "$DEST"
+chmod 700 "$T/private"
+echo secret >"$T/private/keep"
+chmod 600 "$T/private/keep"
+J=archive-vaults@Admin__Segurança__Team
+ln -s "$T/private/keep" "$DEST/$J.$TODAY.kdbx.part"
+ln -s "$T/private/keep" "$DEST/$J.$TODAY.kdbx"
+runc "$BACKUP" run archive-vaults
+check "backup run: symlinks planted in a shared DEST at the predicted names: refused, the private file outside untouched" \
+  eval 'refused_run "chmod go-w" && [[ $(cat "$T/private/keep") == secret && $(stat -c %a "$T/private/keep") == 600 ]]'
+
+# Stale symlinks in a DEST of your own (700, left over), at the copy name,
+# the legacy .part and the temporary name the stand-in rclone (like rclone)
+# writes next to its target: rclone's target is in the staging folder, so
+# none is written through; the copy replaces the link at its name, the legacy
+# .part link is removed, the temporary-name link left alone.
+chmod 700 "$DEST"
+ln -s "$T/private/keep" "$DEST/$J.$TODAY.kdbx.a1b2c3d4.partial"
+runc "$BACKUP" run archive-vaults
+check "backup run: in a private DEST, stale symlinks at the copy, .part and rclone temporary names are never written through" \
+  eval 'rc_is 0 && [[ $(cat "$T/private/keep") == secret && $(stat -c %a "$T/private/keep") == 600 && -f $DEST/$J.$TODAY.kdbx && ! -L $DEST/$J.$TODAY.kdbx && ! -e $DEST/$J.$TODAY.kdbx.part && ! -L $DEST/$J.$TODAY.kdbx.part && -L $DEST/$J.$TODAY.kdbx.a1b2c3d4.partial ]] && no_stage "$DEST"'
+
+# A folder above DEST that others can write without the sticky bit could
+# have DEST swapped for a symlink: refused, DEST existing or not. Sticky
+# (/tmp's 1777) is fine.
+for state in existing missing; do
+  fresh
+  job archive-vaults
+  mkdir -p "$T/shared"
+  chmod 777 "$T/shared"
+  set_dest archive-vaults "$T/shared/vaults"
+  [[ $state == existing ]] && mkdir -m 700 "$T/shared/vaults"
+  for sub in setup validate; do
+    runc "$BACKUP" "$sub" archive-vaults
+    check "backup $sub: DEST ($state) under a 0777 non-sticky folder is refused (exit 64), naming the folder and the fix" \
+      eval 'rc_is 64 && [[ $OUT == *"the folder $T/shared above it is writable by other accounts without the sticky bit (mode 0777)"*"run chmod go-w $T/shared or choose another folder"* ]]'
+  done
+  runc "$BACKUP" run archive-vaults
+  check "backup run: DEST ($state) under a 0777 non-sticky folder is refused before any copy, nothing created" \
+    eval 'refused_run "chmod go-w $T/shared" && [[ $state == existing || ! -e $T/shared/vaults ]]'
+done
+for state in existing missing; do
+  fresh
+  job archive-vaults
+  mkdir -p "$T/shared"
+  chmod 1777 "$T/shared"
+  set_dest archive-vaults "$T/shared/vaults"
+  [[ $state == existing ]] && mkdir -m 700 "$T/shared/vaults"
+  runc "$BACKUP" validate archive-vaults
+  check "backup validate: DEST ($state) under a sticky 1777 folder is accepted" eval 'rc_is 0 && [[ -z $OUT ]]'
+  runc "$BACKUP" run archive-vaults
+  check "backup run: DEST ($state) under a sticky 1777 folder backs up (exit 0), DEST 700" \
+    eval 'rc_is 0 && [[ $(stat -c %a "$T/shared/vaults") == 700 && -f $T/shared/vaults/$(live_name "${LIST_SHAPES[0]}") ]]'
+done
+
+# A DEST that is a file is refused, as is a DEST under a file.
+fresh
+job archive-vaults
+mkdir -p "$HOME/Backups"
+echo x >"$HOME/Backups/vaults"
+runc "$BACKUP" validate archive-vaults
+check "backup validate: a DEST that is a file is refused (exit 64)" eval 'rc_is 64 && [[ $OUT == *"$HOME/Backups/vaults is not a folder"* ]]'
+runc "$BACKUP" run archive-vaults
+check "backup run: a DEST that is a file is refused before any copy" eval 'refused_run "is not a folder"'
+
+# DEST given as a symlink to a private folder: accepted, judged and written
+# resolved (the copies, the staging folder, rclone's target).
+fresh
+job archive-vaults
+mkdir -p "$HOME/Backups" "$T/real"
+chmod 700 "$T/real"
+ln -s "$T/real" "$HOME/Backups/vaults"
+runc "$BACKUP" validate archive-vaults
+check "backup validate: a DEST symlinked to a private folder is accepted" eval 'rc_is 0 && [[ -z $OUT ]]'
+runc "$BACKUP" run archive-vaults
+check "backup run: a DEST symlinked to a private folder: the copies land in the resolved folder, rclone given the resolved path" \
+  eval 'rc_is 0 && [[ $(find "$T/real" -name "*.$TODAY.kdbx" | wc -l) == 5 ]] && ! grep -qF "$HOME/Backups/vaults" "$FAKE_LOG/rclone" && grep -qF " $T/real/.rclone-backup@archive-vaults@" "$FAKE_LOG/rclone" && no_stage "$T/real"'
+fresh
+job archive-vaults
+mkdir -p "$HOME/Backups" "$T/real"
+chmod 775 "$T/real"
+ln -s "$T/real" "$HOME/Backups/vaults"
+runc "$BACKUP" run archive-vaults
+check "backup run: a DEST symlinked to a group-writable folder is refused, naming where it resolves" \
+  eval 'refused_run "DEST $HOME/Backups/vaults (resolves to $T/real) is writable by other accounts (mode 0775); run chmod go-w $T/real"'
+
+# A DEST missing at the first check that another account makes before the
+# run creates it (while the lock waits; a sticky folder above it, as /tmp,
+# lets them): judged again, refused before any copy, nothing written into it.
+for how in folder symlink; do
+  fresh
+  job archive-vaults
+  mkdir -p "$T/shared"
+  chmod 1777 "$T/shared"
+  set_dest archive-vaults "$T/shared/vaults"
+  if [[ $how == folder ]]; then
+    PATH="$FLOCKSTUB:$PATH" FAKE_FLOCK_DEST=$T/shared/vaults runc "$BACKUP" run archive-vaults
+    theirs=$T/shared/vaults
+  else
+    PATH="$FLOCKSTUB:$PATH" FAKE_FLOCK_DEST=$T/shared/vaults FAKE_FLOCK_LINK=$T/shared/theirs runc "$BACKUP" run archive-vaults
+    theirs=$T/shared/theirs
+  fi
+  check "backup run: a missing DEST made a 0777 $how by another account before the run creates it: refused (exit 64, state exit=64), nothing written into it" \
+    eval 'refused_run "is writable by other accounts (mode 0777)" && [[ -d $theirs && $(stat -c %a "$theirs") == 777 && -z $(ls -A "$theirs") ]]'
+done
+
+# A stat that hangs (or fails other than "no such file") on a missing DEST is
+# a refusal, never a fall-through to an untimed existence test.
+fresh
+job archive-vaults
+set_dest archive-vaults "~/Backups/vaults"
+PATH="$STATSTUB:$PATH" FAKE_STAT_HANG=$HOME/Backups/vaults runc timeout 20 "$BACKUP" validate archive-vaults
+check "backup validate: a stat that hangs on a missing DEST is cut off (timeout 5) and refused (exit 64)" \
+  eval 'rc_is 64 && [[ $OUT == *"cannot check $HOME/Backups/vaults (stat failed or did not answer within 5 s)"* ]]'
+PATH="$STATSTUB:$PATH" FAKE_STAT_EACCES=$HOME/Backups/vaults runc "$BACKUP" run archive-vaults
+check "backup run: a stat failing with EACCES on a missing DEST is refused before any copy, nothing created" \
+  eval 'refused_run "cannot check $HOME/Backups/vaults" && [[ ! -e $HOME/Backups/vaults ]]'
+
+# A private existing DEST works; a missing one is created 700, the missing
+# folders above it too.
+fresh
+job archive-vaults
+mkdir -p "$HOME/Backups/vaults"; chmod 700 "$HOME/Backups/vaults"
+runc "$BACKUP" run archive-vaults
+check "backup run: an existing 700 DEST backs up (exit 0), stays 700" \
+  eval 'rc_is 0 && [[ $(stat -c %a "$HOME/Backups/vaults") == 700 && $(find "$HOME/Backups/vaults" -name "*.$TODAY.kdbx" | wc -l) == 5 ]] && no_stage "$HOME/Backups/vaults"'
+fresh
+job archive-vaults
+set_dest archive-vaults "~/a/b/vaults"
+runc "$BACKUP" run archive-vaults
+check "backup run: a missing DEST and the missing folders above it are created 700" \
+  eval 'rc_is 0 && [[ $(stat -c %a "$HOME/a") == 700 && $(stat -c %a "$HOME/a/b") == 700 && $(stat -c %a "$HOME/a/b/vaults") == 700 && $(find "$HOME/a/b/vaults" -name "*.$TODAY.kdbx" | wc -l) == 5 ]]'
+
+# Leftovers of an interrupted run: this job's staging folders go, another
+# job's stay (job a never matches job a.b: a job name has no @), and the
+# legacy (<= 0.3.6) .part is still removed.
+fresh
+job a
+job a.b
+DEST=$HOME/Backups/vaults
+mkdir -p "$DEST"; chmod 700 "$DEST"
+mkdir "$DEST/.rclone-backup@a@Ab12Cd" "$DEST/.rclone-backup@a.b@Ab12Cd"
+echo partial >"$DEST/.rclone-backup@a@Ab12Cd/a@Admin__Segurança__Team.2026-11-13.kdbx"
+echo partial >"$DEST/.rclone-backup@a.b@Ab12Cd/a.b@Admin__Segurança__Team.2026-11-13.kdbx"
+echo stale >"$DEST/a@Admin__Segurança__Team.2026-11-13.kdbx.part"
+runc "$BACKUP" run a
+check "backup run: an interrupted run's staging folder of this job is removed, another job's (a.b) untouched, the legacy .part removed" \
+  eval 'rc_is 0 && [[ ! -e $DEST/.rclone-backup@a@Ab12Cd && -f $DEST/.rclone-backup@a.b@Ab12Cd/a.b@Admin__Segurança__Team.2026-11-13.kdbx && ! -e $DEST/a@Admin__Segurança__Team.2026-11-13.kdbx.part ]] && [[ $(find "$DEST" -maxdepth 1 -name ".rclone-backup@*") == "$DEST/.rclone-backup@a.b@Ab12Cd" ]]'
 
 # A CRLF conf is invalid.
 fresh

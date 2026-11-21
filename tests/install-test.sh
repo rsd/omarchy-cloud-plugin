@@ -32,9 +32,10 @@
 #   7. The installed-version record: the manifest's #version= / #repo=
 #      header lines (from manifest.json), a 0.3.2 manifest without them
 #      upgraded, a version-only change recorded, an invalid version refused.
-#   8. Running syncs and backups: a held bisync or backup lock (in a scratch
-#      XDG_RUNTIME_DIR) makes install.sh wait, then stop with exit 75 and
-#      nothing changed; a released one lets it install.
+#   8. Running syncs and backups: a held bisync or backup lock (in the
+#      scratch HOME's ~/.local/state/omarchy-cloud/locks, whatever
+#      XDG_RUNTIME_DIR is, set or unset) makes install.sh wait, then stop with
+#      exit 75 and nothing changed; a released one lets it install.
 #   9. The repository holds no symlinks and gets no build output.
 #  10. The mount root (cloud.env): silent adoption of an owned default, the
 #      instructions without a terminal or with --no-prompt, the prompt (the
@@ -55,6 +56,9 @@
 # shellcheck disable=SC2016,SC2034
 
 set -o pipefail
+# The folders made here are 755 whatever the caller's umask: the helpers'
+# run-lock folder (lock_dir) refuses one other accounts can write.
+umask 022
 
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 FAILURES=0
@@ -670,7 +674,12 @@ release() {
   wait "$HOLDER" 2>/dev/null
   HOLDER=
 }
-runs() { find "$XDG_RUNTIME_DIR" -mindepth 1 | sort; }
+# lkd: the run-lock folder of the scratch HOME (made when missing).
+lkd() {
+  mkdir -p -- "$HOME/.local/state/omarchy-cloud/locks"
+  printf '%s' "$HOME/.local/state/omarchy-cloud/locks"
+}
+runs() { find "$(lkd)" -mindepth 1 | sort; }
 
 fresh
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=abc "$INSTALL" --no-build
@@ -680,8 +689,8 @@ fresh
 runc "$INSTALL" --no-build
 printf '# an older version\n' >"$UD/rclone-bisync@.timer"
 sed -i "s|^[0-9a-f]\{64\}  $UD/rclone-bisync@.timer\$|$(sha "$UD/rclone-bisync@.timer")  $UD/rclone-bisync@.timer|" "$MAN"
-: >"$XDG_RUNTIME_DIR/rclone-backup-idle.lock" # a lock file nobody holds
-check "fixture: a bisync lock is held" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+: >"$(lkd)/rclone-backup-idle.lock" # a lock file nobody holds
+check "fixture: a bisync lock is held" hold "$(lkd)/rclone-bisync-vault-A.lock"
 snapshot >"$T/before"
 runs >"$T/runs"
 : >"$FAKE_LOG/systemctl"
@@ -701,7 +710,7 @@ check "bisync lock released: installs (the update goes in)" \
 
 # Released while install.sh waits: it goes on.
 fresh
-check "fixture: a bisync lock is held" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+check "fixture: a bisync lock is held" hold "$(lkd)/rclone-bisync-vault-A.lock"
 (sleep 1 && kill "$HOLDER") &
 killer=$!
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=20 "$INSTALL" --no-build
@@ -711,7 +720,7 @@ check "bisync lock released during the wait: waited, then installed" \
   eval 'rc_is 0 && [[ $OUT == *waiting*"vault-A is running"* ]] && copies_ok && header_ok'
 
 fresh
-check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+check "fixture: a backup lock is held" hold "$(lkd)/rclone-backup-team-vaults.lock"
 snapshot >"$T/before"
 start=$SECONDS
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
@@ -722,7 +731,7 @@ runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --no-build
 check "backup lock released: installs" eval 'rc_is 0 && copies_ok && manifest_all "$R0" && header_ok'
 
 # --uninstall waits the same way.
-check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+check "fixture: a backup lock is held" hold "$(lkd)/rclone-backup-team-vaults.lock"
 snapshot >"$T/before"
 runc env OMARCHY_CLOUD_INSTALL_WAIT_S=1 "$INSTALL" --uninstall
 check "uninstall with a backup lock held: exit 75, removes nothing, hint says --uninstall" \
@@ -743,8 +752,8 @@ exit 0
 EOF
 chmod +x "$NOFLOCK/flock"
 fresh
-: >"$XDG_RUNTIME_DIR/rclone-bisync-idle.lock"
-check "fixture: a backup lock is held" hold "$XDG_RUNTIME_DIR/rclone-backup-team-vaults.lock"
+: >"$(lkd)/rclone-bisync-idle.lock"
+check "fixture: a backup lock is held" hold "$(lkd)/rclone-backup-team-vaults.lock"
 snapshot >"$T/before"
 runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
 check "/proc/locks: the held lock is named, the idle one is not, no lock is taken" \
@@ -761,12 +770,15 @@ check "fallback probe (findmnt fails): the held lock is named, the idle one is n
 release
 runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
 check "/proc/locks: released, installs without running flock" eval 'rc_is 0 && copies_ok && [[ ! -e $FAKE_LOG/flock ]]'
-# The same on tmpfs (the usual /run/user/<uid>), when /dev/shm is one: there
-# stat's device and /proc/locks' agree, on btrfs ($SCRATCH here, often) not.
+# The same on tmpfs (a /run/user/<uid>-like folder), when /dev/shm is one:
+# there stat's device and /proc/locks' agree, on btrfs ($SCRATCH here, often)
+# not. ~/.local/state is a symlink into it (allowed: only omarchy-cloud and
+# its locks folder must be real folders).
 if [[ $(findmnt -no FSTYPE -T /dev/shm 2>/dev/null) == tmpfs ]] && SHMRUN=$(mktemp -d /dev/shm/install-test.XXXXXX); then
   fresh
-  export XDG_RUNTIME_DIR=$SHMRUN
-  check "fixture: a bisync lock is held on tmpfs" hold "$XDG_RUNTIME_DIR/rclone-bisync-vault-A.lock"
+  mkdir -p "$HOME/.local"
+  ln -s "$SHMRUN" "$HOME/.local/state"
+  check "fixture: a bisync lock is held on tmpfs" hold "$(lkd)/rclone-bisync-vault-A.lock"
   runc env PATH="$NOFLOCK:$PATH" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
   check "/proc/locks on tmpfs: the held lock is named, no lock is taken" \
     eval 'rc_is 75 && [[ $OUT == *"offline folder vault-A is running"* && ! -e $FAKE_LOG/flock ]]'
@@ -776,8 +788,27 @@ else
   echo "skip /proc/locks on tmpfs (/dev/shm is not a writable tmpfs)"
 fi
 
-# A lock file owned by another user (with XDG_RUNTIME_DIR unset the dir is
-# the shared /tmp) is ignored: not tested, a foreign owner needs root.
+# The lock folder does not depend on the environment: a held lock is named
+# with XDG_RUNTIME_DIR unset (an ssh or cron shell) and with it pointing
+# elsewhere; an unusable lock folder (writable by other accounts) means no
+# run can hold a lock: none is named, install.sh goes on.
+fresh
+check "fixture: a backup lock is held" hold "$(lkd)/rclone-backup-team-vaults.lock"
+runc env -u XDG_RUNTIME_DIR OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+rc_unset=$RC out_unset=$OUT
+runc env XDG_RUNTIME_DIR="$T/run" OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "busy_locks: the held lock is named with XDG_RUNTIME_DIR unset and set (same folder)" \
+  eval '((rc_unset == 75)) && [[ $out_unset == *"backup team-vaults is running"* ]] && rc_is 75 && [[ $OUT == *"backup team-vaults is running"* ]]'
+release
+fresh
+chmod 777 "$(lkd)"
+: >"$(lkd)/rclone-backup-team-vaults.lock"
+runc env OMARCHY_CLOUD_INSTALL_WAIT_S=0 "$INSTALL" --no-build
+check "busy_locks: a lock folder writable by other accounts is not read (installs)" eval 'rc_is 0 && copies_ok'
+
+# A lock file owned by another user is ignored (and the lock folder is a
+# private one, lock_dir, never the shared /tmp): not tested, a foreign owner
+# needs root.
 
 # --- 10. the mount root -------------------------------------------------------------
 # The default root is a scratch stand-in ($T/mnt/cloud, via

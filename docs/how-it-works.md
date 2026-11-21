@@ -148,8 +148,13 @@ services and timers run under the systemd user manager, whose environment usuall
 lacks the `XDG_*` variables of your shell, so following them would let the panel,
 the app, the scripts and a timer run disagree about where an offline folder or a
 backup lives. The units address the mount settings and the cache with `%h` (your
-home). The run locks stay in `$XDG_RUNTIME_DIR`, falling back to `/tmp`: they are
-not configuration. Every bisync call uses the work folder `~/.cache/rclone/bisync`,
+home). The run locks follow the same rule: always `~/.local/state/omarchy-cloud/locks`,
+whatever `XDG_RUNTIME_DIR` is, so a timer run and a run from an ssh, su or cron shell
+lock the same file; never `/tmp`, where another account could plant a symlink at the
+predictable name. That folder and `~/.local/state/omarchy-cloud` are created with mode
+700 and must be real folders (not symlinks) that you own and that group and others
+cannot write. Otherwise a run stops before doing anything (exit 1), names the reason,
+sends a notification and records `exit=1`. Every bisync call uses the work folder `~/.cache/rclone/bisync`,
 pinned, because the app looks for the listings there.
 
 ## How the panel reads and acts
@@ -252,7 +257,8 @@ login. The app never shows the secret.
 **Offline folder and backup guards.** See [Offline folders: the details](#offline-folders-the-details) and [Backups: the details](#backups-the-details).
 
 **Locks.** One run of an offline folder at a time: a `flock` on
-`${XDG_RUNTIME_DIR:-/tmp}/rclone-bisync-<name>.lock`. bisync's own lock file expires
+`~/.local/state/omarchy-cloud/locks/rclone-bisync-<name>.lock` (see above), opened
+without truncation; a lock file that is a symlink is refused. bisync's own lock file expires
 (`--max-lock 2m`, rclone's minimum; a running bisync keeps renewing it), so a run
 that was killed does not block every later run until its `.lck` is deleted by hand.
 A run that hangs is stopped after one hour (SIGTERM: rclone cancels and removes its
@@ -310,10 +316,11 @@ for a unit, a `diff` command).
 
 **Running syncs and backups.** Before changing anything, `install.sh` (and
 `--uninstall`) looks at the locks of the offline-folder syncs and backups
-(`$XDG_RUNTIME_DIR/rclone-{bisync,backup}-*.lock`, read from `/proc/locks`, never
+(`~/.local/state/omarchy-cloud/locks/rclone-{bisync,backup}-*.lock`, read from `/proc/locks`, never
 taken, so a scheduled run is not made to skip). While one is held it names it and
 waits up to `OMARCHY_CLOUD_INSTALL_WAIT_S` seconds (default 60, 0-9999; `0` does not
-wait). If it is still running then, it exits 75 with nothing changed.
+wait). If it is still running then, it exits 75 with nothing changed. A run started
+by an older version, whose lock is still in `$XDG_RUNTIME_DIR` or `/tmp`, is not seen.
 
 **Uninstall.** `--uninstall` removes the files in the record whose sha256 still
 matches (an edited one is left, and named), the links of an older linked install, and
@@ -422,14 +429,38 @@ is retried by the timer. `w` in the app runs `systemctl --user reset-failed`, th
   copy name. The screen is stricter than bash only in a few exotic cases (such as a line over 1024
   bytes; never the other way round), and it writes the list atomically; a list that is a symlink, is not
   UTF-8 or is over 1 MiB is not opened on the screen but in `$VISUAL` / `$EDITOR`.
-- Copies are downloaded to a `.part` file and then renamed, with umask 077 (files 600,
-  `DEST` 700). One failed file does not stop the others: the run exits 1 and sends a
-  desktop notification; a failed rename counts as failed and its older copies are not
-  pruned.
-- Pruning and the cleanup of stale `.part` files touch only the backup's own `<name>@`
-  copies (a name has no `@`), so backups that share a destination do not overwrite or
-  prune each other's copies (before 0.3.2 they did; overlapping destinations are now
-  refused).
+- Each run downloads into a private staging folder inside `DEST`,
+  `.rclone-backup@<name>@XXXXXX` (created with `mktemp -d`, so 700), sets each copy to
+  600 there and then renames it into place (`mv -fT`: the rename replaces whatever has
+  that name and never follows a link). The staging folder is removed when the run
+  ends, also on an interrupt (INT or TERM); one left by a killed run is removed at the
+  next run of the same backup (only if it is a real folder you own). A missing `DEST`
+  is created 700, and so are the missing folders above it. One failed file does not
+  stop the others: the run exits 1 and sends a desktop notification; a failed rename
+  counts as failed and its older copies are not pruned.
+- `DEST` must be safe from other local accounts (`check_dest_safe`). Why: an account
+  that can write in a folder on the path could plant a symlink at a name the run
+  writes (a copy, or rclone's own temporary name) or swap `DEST` itself, and the run,
+  working as you, would overwrite a file of yours through it. `DEST` is resolved once
+  (symlinks followed) and every write uses the resolved folder. Refused when: `DEST`
+  exists but is not a folder, is not owned by you, or is writable by group or others
+  (mode & 022); any folder above it is owned by another account (not root, not you),
+  or is group- or other-writable without the sticky bit (a `/tmp`-style 1777 folder is
+  fine, since others cannot rename or delete what is yours there); or a component
+  cannot be checked (`stat` fails or takes over 5 s, as on a hung mount; a path
+  `realpath` cannot resolve, such as inside a FUSE mount, is refused if a component is a
+  symlink). A missing `DEST` is judged by its nearest existing ancestor, created, then
+  judged again right before the first copy, even if it appeared meanwhile (another
+  account may have made it while the run waited for the lock). `setup`, `validate`
+  and `run` all refuse with exit 64; the message says how to fix it (`chmod go-w
+  <folder>`, or a private folder). Existing setups can be hit: a folder shared with a
+  group (mode 775 or 770 from a umask of 002) and a USB drive mounted with
+  `umask=000` are refused; a drive mounted normally (owned by you, 755) is fine.
+- Pruning and the cleanup of leftovers (stale staging folders, and `.part` files
+  left by 0.3.6 and earlier, which are still cleaned) touch only the backup's own
+  `<name>@` copies (a name has no `@`), so backups that share a destination do not
+  overwrite or prune each other's copies (before 0.3.2 they did; overlapping
+  destinations are now refused).
 - One run per backup at a time (a lock); a run that hangs is stopped after
   `TimeoutStartSec=1h`.
 - The schedule is `rclone-backup@<name>.timer` with the drop-in `10-schedule.conf` that

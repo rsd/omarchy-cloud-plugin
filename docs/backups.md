@@ -74,6 +74,19 @@ The destination must not overlap an offline folder, another backup's destination
 the [mount folder](mount-folder.md), `~/Cloud` or a mounted drive. The app refuses
 such a destination and says which one.
 
+**The destination must also be private to you.** If it is a folder that already
+exists, it must be yours and no one else may be able to write in it. Otherwise
+another account on the computer could trick a backup into overwriting one of your
+own files. A folder the backup creates is private from the start, so the easiest
+choice is a new name under your home, such as `~/Backups/documents`. The app
+refuses a destination that is not safe and says why, and so does a scheduled run
+(you get a notification and nothing is copied). The usual cases are a folder you
+share with a group (for example permissions 775) and a USB drive mounted so that
+everyone can write to it. For a folder of yours, open a terminal and run
+`chmod go-w <folder>`; otherwise choose another folder. A normally mounted USB drive
+that belongs to you is fine. See
+[troubleshooting.md](troubleshooting.md#a-backup-is-refused-invalid-configuration-or-dest-is-writable-by-other-accounts).
+
 ## Day to day
 
 Press `3` in the app. Enter runs a backup now; `e` edits its settings; `f`
@@ -89,7 +102,9 @@ that fails because you are offline tries again at the next scheduled run.
 
 Your copies are ordinary files in the **Destination** folder. To restore one, open
 that folder in the file manager and copy the dated file you want wherever you
-like.
+like. While a backup runs, you may see a hidden folder there whose name starts with
+`.rclone-backup@`; it is where the files are downloaded first, and it is removed
+when the run ends.
 
 Each copy's name is the backup's name, an `@`, the file's path (with `/` shown as
 `__`, minus the strip prefix) and the date before the extension. For the backup
