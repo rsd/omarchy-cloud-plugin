@@ -1,5 +1,5 @@
-version=0.3.6
-commit=b9a29c965ad262ccf1cbce603674f9ea997d40f6
-src_sha256=e0e60c6f99e0ed5da973aafc3fc776bfbbe769fdb3ceace5246e7a0c49830ae8
+version=0.3.7
+commit=02c0dd37a675a74bd29ec8bf84638dfaf43f30f8
+src_sha256=3394e2e47395bd6828b1cef0782df9b59788ddabbade286b6cca6749042bd2a6
 rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
 target=x86_64-unknown-linux-musl
